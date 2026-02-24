@@ -202,9 +202,9 @@ Downscale:
 - `downscale_factor` (e.g. `0.5`) is supported for symbol, schematic, and plot image tools.
 
 LTspice screenshot behavior:
-- uses ScreenCaptureKit display-crop capture constrained to LTspice window bounds when `backend=ltspice`
-- opens targets in hidden/background mode (`open -g -j`) to reduce forced Space switches while rendering
-- designed to keep working even if LTspice is on a different macOS Space
+- uses ScreenCaptureKit direct-window capture (`SCContentFilter(desktopIndependentWindow:)`) when `backend=ltspice`
+- tries hidden/background open first (`open -g -j`) to reduce Space switching
+- captures the first frame from an `SCStream` for reliability, including LTspice windows that are off-screen/in other Spaces
 
 ## Run tests
 

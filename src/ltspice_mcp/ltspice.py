@@ -244,6 +244,9 @@ import Foundation
 import AppKit
 import ScreenCaptureKit
 import CoreGraphics
+import CoreMedia
+import CoreVideo
+import VideoToolbox
 import ImageIO
 import UniformTypeIdentifiers
 
@@ -262,6 +265,82 @@ func emitJSON(_ payload: [String: Any]) {
     if let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
        let text = String(data: data, encoding: .utf8) {
         print(text)
+    }
+}
+
+enum CaptureError: LocalizedError {
+    case timedOut
+    case conversionFailed(Int32)
+
+    var errorDescription: String? {
+        switch self {
+        case .timedOut:
+            return "Timed out waiting for first stream frame."
+        case .conversionFailed(let status):
+            return "VTCreateCGImageFromCVPixelBuffer failed (status=\(status))."
+        }
+    }
+}
+
+final class FrameSink: NSObject, SCStreamOutput {
+    private var continuation: CheckedContinuation<CGImage, Error>?
+    private let lock = NSLock()
+
+    func waitForFrame(timeoutSeconds: TimeInterval) async throws -> CGImage {
+        try await withThrowingTaskGroup(of: CGImage.self) { group in
+            group.addTask {
+                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<CGImage, Error>) in
+                    self.lock.lock()
+                    self.continuation = cont
+                    self.lock.unlock()
+                }
+            }
+            group.addTask {
+                let nanos = UInt64(max(1, Int(timeoutSeconds * 1_000_000_000)))
+                try await Task.sleep(nanoseconds: nanos)
+                throw CaptureError.timedOut
+            }
+            let frame = try await group.next()!
+            group.cancelAll()
+            return frame
+        }
+    }
+
+    func stream(
+        _ stream: SCStream,
+        didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
+        of outputType: SCStreamOutputType
+    ) {
+        guard outputType == .screen else {
+            return
+        }
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            return
+        }
+        var image: CGImage?
+        let status = VTCreateCGImageFromCVPixelBuffer(pixelBuffer, options: nil, imageOut: &image)
+        if status == noErr, let image {
+            resumeOnce(with: .success(image))
+        } else {
+            resumeOnce(with: .failure(CaptureError.conversionFailed(status)))
+        }
+    }
+
+    private func resumeOnce(with result: Result<CGImage, Error>) {
+        lock.lock()
+        guard let cont = continuation else {
+            lock.unlock()
+            return
+        }
+        continuation = nil
+        lock.unlock()
+
+        switch result {
+        case .success(let image):
+            cont.resume(returning: image)
+        case .failure(let error):
+            cont.resume(throwing: error)
+        }
     }
 }
 
@@ -295,35 +374,26 @@ Task {
             selected = candidates.max(by: { ($0.frame.width * $0.frame.height) < ($1.frame.width * $1.frame.height) })!
         }
 
-        guard let display = shareable.displays.first(where: { candidate in
-            let center = CGPoint(x: selected.frame.midX, y: selected.frame.midY)
-            return candidate.frame.contains(center)
-        }) ?? shareable.displays.first else {
-            fputs("No display found for LTspice window.\n", stderr)
-            failed = true
-            return
-        }
-
-        let filter = SCContentFilter(display: display, excludingWindows: [])
+        let filter = SCContentFilter(desktopIndependentWindow: selected)
         let configuration = SCStreamConfiguration()
-        let localRect = CGRect(
-            x: selected.frame.origin.x - display.frame.origin.x,
-            y: selected.frame.origin.y - display.frame.origin.y,
-            width: selected.frame.width,
-            height: selected.frame.height
-        )
-        let displayRect = CGRect(origin: .zero, size: display.frame.size)
-        let clippedRect = localRect.intersection(displayRect)
-        guard !clippedRect.isNull && clippedRect.width > 1 && clippedRect.height > 1 else {
-            fputs("Selected LTspice window has invalid capture rect.\n", stderr)
-            failed = true
-            return
-        }
+        configuration.width = max(1, Int(selected.frame.width))
+        configuration.height = max(1, Int(selected.frame.height))
+        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 30)
+        configuration.queueDepth = 2
+        configuration.capturesAudio = false
+        configuration.excludesCurrentProcessAudio = true
+        configuration.showsCursor = false
 
-        configuration.sourceRect = clippedRect
-        configuration.width = max(1, Int(clippedRect.width))
-        configuration.height = max(1, Int(clippedRect.height))
-        let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+        let sink = FrameSink()
+        let stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
+        try stream.addStreamOutput(
+            sink,
+            type: .screen,
+            sampleHandlerQueue: DispatchQueue(label: "ltspice.sck.output")
+        )
+        try await stream.startCapture()
+        let image = try await sink.waitForFrame(timeoutSeconds: 10.0)
+        try await stream.stopCapture()
 
         guard let destination = CGImageDestinationCreateWithURL(
             outputURL as CFURL,
@@ -353,15 +423,9 @@ Task {
                 "height": selected.frame.height
             ],
             "capture_mode": "screencapturekit_window",
-            "capture_strategy": "display_crop",
+            "capture_strategy": "desktop_independent_window",
             "captured_width": image.width,
-            "captured_height": image.height,
-            "display_frame": [
-                "x": display.frame.origin.x,
-                "y": display.frame.origin.y,
-                "width": display.frame.width,
-                "height": display.frame.height
-            ]
+            "captured_height": image.height
         ]
         emitJSON(payload)
     } catch {
