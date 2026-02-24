@@ -627,8 +627,11 @@ def renderLtspiceSymbolImage(
                     output_path=output_path,
                 ),
                 open_path=preview["asc_path"],
+                title_hint=f"symbol_preview_{symbol}",
                 settle_seconds=settle_seconds,
                 downscale_factor=downscale_factor,
+                avoid_space_switch=True,
+                prefer_screencapturekit=True,
             )
             payload = {
                 **screenshot_payload,
@@ -696,8 +699,11 @@ def renderLtspiceSchematicImage(
                     output_path=output_path,
                 ),
                 open_path=asc_resolved,
+                title_hint=asc_resolved.name,
                 settle_seconds=settle_seconds,
                 downscale_factor=downscale_factor,
+                avoid_space_switch=True,
+                prefer_screencapturekit=True,
             )
             payload = {
                 **screenshot_payload,
@@ -772,8 +778,11 @@ def renderLtspicePlotImage(
                     output_path=output_path,
                 ),
                 open_path=dataset.path,
+                title_hint=dataset.path.name,
                 settle_seconds=settle_seconds,
                 downscale_factor=downscale_factor,
+                avoid_space_switch=True,
+                prefer_screencapturekit=True,
             )
             payload = {
                 **screenshot_payload,

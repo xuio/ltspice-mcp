@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 import platform
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -192,15 +194,23 @@ def is_ltspice_ui_running() -> bool:
     return proc.returncode == 0
 
 
-def open_in_ltspice_ui(path: str | Path) -> dict[str, str | int | bool]:
+def open_in_ltspice_ui(
+    path: str | Path,
+    *,
+    background: bool = False,
+) -> dict[str, Any]:
     target = Path(path).expanduser().resolve()
     if not target.exists():
         raise FileNotFoundError(f"Cannot open missing path in LTspice UI: {target}")
     if platform.system() != "Darwin":
         raise RuntimeError("LTspice UI integration is currently implemented for macOS only.")
 
+    command = ["open"]
+    if background:
+        command.append("-g")
+    command.extend(["-a", "LTspice", str(target)])
     proc = subprocess.run(
-        ["open", "-a", "LTspice", str(target)],
+        command,
         capture_output=True,
         text=True,
         check=False,
@@ -209,48 +219,180 @@ def open_in_ltspice_ui(path: str | Path) -> dict[str, str | int | bool]:
         "opened": proc.returncode == 0,
         "return_code": proc.returncode,
         "path": str(target),
+        "background": background,
+        "command": command,
         "stdout": proc.stdout.strip(),
         "stderr": proc.stderr.strip(),
     }
 
 
-def _run_osascript(lines: list[str]) -> subprocess.CompletedProcess[str]:
-    command: list[str] = ["osascript"]
-    for line in lines:
-        command.extend(["-e", line])
-    return subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-
-def _front_ltspice_window_id() -> int | None:
+def _capture_ltspice_window_with_screencapturekit(
+    *,
+    output_path: Path,
+    title_hint: str | None = None,
+    timeout_seconds: float = 20.0,
+) -> dict[str, Any]:
     if platform.system() != "Darwin":
-        return None
+        raise RuntimeError("ScreenCaptureKit capture is currently implemented for macOS only.")
+    if shutil.which("xcrun") is None:
+        raise RuntimeError("xcrun not found; ScreenCaptureKit backend is unavailable.")
 
-    proc = _run_osascript(
-        [
-            'tell application "LTspice" to activate',
-            'tell application "System Events"',
-            '  tell process "LTspice"',
-            "    set frontmost to true",
-            "    if (count of windows) is 0 then return \"\"",
-            "    return id of front window",
-            "  end tell",
-            "end tell",
+    swift_source = r'''
+import Foundation
+import AppKit
+import ScreenCaptureKit
+import CoreGraphics
+import ImageIO
+import UniformTypeIdentifiers
+
+let args = CommandLine.arguments
+if args.count < 3 {
+    fputs("usage: <outputPath> <titleHint>\n", stderr)
+    exit(2)
+}
+
+let outputURL = URL(fileURLWithPath: args[1])
+let titleHint = args[2].trimmingCharacters(in: .whitespacesAndNewlines)
+
+let _ = NSApplication.shared
+
+func emitJSON(_ payload: [String: Any]) {
+    if let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+       let text = String(data: data, encoding: .utf8) {
+        print(text)
+    }
+}
+
+let sema = DispatchSemaphore(value: 0)
+var failed = false
+
+Task {
+    defer { sema.signal() }
+    do {
+        let shareable = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        let candidates = shareable.windows.filter {
+            ($0.owningApplication?.applicationName ?? "") == "LTspice" &&
+            $0.frame.width > 80 &&
+            $0.frame.height > 80
+        }
+
+        guard !candidates.isEmpty else {
+            fputs("No LTspice windows found.\n", stderr)
+            failed = true
+            return
+        }
+
+        let selected: SCWindow
+        if !titleHint.isEmpty {
+            if let exact = candidates.first(where: { ($0.title ?? "").localizedCaseInsensitiveContains(titleHint) }) {
+                selected = exact
+            } else {
+                selected = candidates.max(by: { ($0.frame.width * $0.frame.height) < ($1.frame.width * $1.frame.height) })!
+            }
+        } else {
+            selected = candidates.max(by: { ($0.frame.width * $0.frame.height) < ($1.frame.width * $1.frame.height) })!
+        }
+
+        let filter = SCContentFilter(desktopIndependentWindow: selected)
+        let configuration = SCStreamConfiguration()
+        configuration.width = max(1, Int(selected.frame.width))
+        configuration.height = max(1, Int(selected.frame.height))
+        let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+
+        guard let destination = CGImageDestinationCreateWithURL(
+            outputURL as CFURL,
+            UTType.png.identifier as CFString,
+            1,
+            nil
+        ) else {
+            fputs("Failed to create image destination.\n", stderr)
+            failed = true
+            return
+        }
+
+        CGImageDestinationAddImage(destination, image, nil)
+        if !CGImageDestinationFinalize(destination) {
+            fputs("Failed to finalize image destination.\n", stderr)
+            failed = true
+            return
+        }
+
+        let payload: [String: Any] = [
+            "window_id": selected.windowID,
+            "window_title": selected.title ?? "",
+            "window_frame": [
+                "x": selected.frame.origin.x,
+                "y": selected.frame.origin.y,
+                "width": selected.frame.width,
+                "height": selected.frame.height
+            ],
+            "capture_mode": "screencapturekit_window",
+            "captured_width": image.width,
+            "captured_height": image.height
         ]
-    )
-    if proc.returncode != 0:
-        return None
-    raw = proc.stdout.strip()
-    if not raw:
-        return None
+        emitJSON(payload)
+    } catch {
+        fputs("ScreenCaptureKit error: \(error)\n", stderr)
+        failed = true
+    }
+}
+
+_ = sema.wait(timeout: .now() + 25)
+if failed {
+    exit(1)
+}
+'''
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".swift",
+        prefix="ltspice_sck_",
+        delete=False,
+        encoding="utf-8",
+    ) as handle:
+        handle.write(swift_source)
+        script_path = Path(handle.name)
+
     try:
-        return int(raw)
-    except ValueError:
-        return None
+        proc = subprocess.run(
+            [
+                "xcrun",
+                "swift",
+                str(script_path),
+                str(output_path),
+                (title_hint or ""),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    finally:
+        script_path.unlink(missing_ok=True)
+
+    if proc.returncode != 0:
+        message = (proc.stderr.strip() or proc.stdout.strip() or "unknown ScreenCaptureKit failure")
+        raise RuntimeError(f"ScreenCaptureKit capture failed: {message}")
+
+    payload: dict[str, Any] = {}
+    for raw in reversed(proc.stdout.splitlines()):
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            candidate = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            payload = candidate
+            break
+
+    if not output_path.exists():
+        raise FileNotFoundError(f"ScreenCaptureKit did not produce image: {output_path}")
+
+    if payload:
+        return payload
+    return {"capture_mode": "screencapturekit_window"}
 
 
 def _downscale_image_file(path: Path, downscale_factor: float) -> dict[str, Any]:
@@ -322,38 +464,73 @@ def capture_ltspice_window_screenshot(
     open_path: str | Path | None = None,
     settle_seconds: float = 1.0,
     downscale_factor: float = 1.0,
+    title_hint: str | None = None,
+    avoid_space_switch: bool = True,
+    prefer_screencapturekit: bool = True,
 ) -> dict[str, Any]:
     target = Path(output_path).expanduser().resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
 
     open_event: dict[str, Any] | None = None
     if open_path is not None:
-        open_event = open_in_ltspice_ui(open_path)
+        open_event = open_in_ltspice_ui(
+            open_path,
+            background=avoid_space_switch,
+        )
         if not open_event.get("opened", False):
             raise RuntimeError(f"Failed to open LTspice UI target: {open_event}")
 
     if settle_seconds > 0:
         time.sleep(settle_seconds)
 
-    window_id = _front_ltspice_window_id()
-    capture_command: list[str]
-    if window_id is not None:
-        capture_command = ["screencapture", "-x", "-l", str(window_id), str(target)]
-    else:
-        capture_command = ["screencapture", "-x", str(target)]
+    if title_hint is None and open_path is not None:
+        title_hint = Path(open_path).name
 
-    capture = subprocess.run(
-        capture_command,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if capture.returncode != 0:
+    capture_command: list[str] | None = None
+    capture_backend = "screencapture"
+    window_id: int | None = None
+    window_info: dict[str, Any] = {}
+    screencapturekit_error: str | None = None
+
+    if prefer_screencapturekit:
+        try:
+            window_info = _capture_ltspice_window_with_screencapturekit(
+                output_path=target,
+                title_hint=title_hint,
+                timeout_seconds=max(10.0, settle_seconds + 20.0),
+            )
+            capture_backend = "screencapturekit"
+            raw_window_id = window_info.get("window_id")
+            if isinstance(raw_window_id, int):
+                window_id = raw_window_id
+        except Exception as exc:
+            screencapturekit_error = str(exc)
+            window_info = {"warning": screencapturekit_error}
+
+    if capture_backend != "screencapturekit" and prefer_screencapturekit:
         raise RuntimeError(
-            f"screencapture failed (rc={capture.returncode}): {capture.stderr.strip()}"
+            screencapturekit_error
+            or "ScreenCaptureKit capture failed before fallback."
         )
+
+    if capture_backend != "screencapturekit":
+        # Fallback path: capture a single LTspice window if possible.
+        capture_command = ["screencapture", "-x", str(target)]
+        capture = subprocess.run(
+            capture_command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if capture.returncode != 0:
+            raise RuntimeError(
+                f"screencapture failed (rc={capture.returncode}): {capture.stderr.strip()}"
+            )
+    else:
+        capture = None
+
     if not target.exists():
-        raise FileNotFoundError(f"screencapture did not produce file: {target}")
+        raise FileNotFoundError(f"Screenshot capture did not produce file: {target}")
 
     downscale_info = _downscale_image_file(target, downscale_factor=downscale_factor)
     width, height = _probe_image_dimensions(target)
@@ -362,11 +539,15 @@ def capture_ltspice_window_screenshot(
         "format": target.suffix.lstrip(".").lower() or "png",
         "window_id": window_id,
         "capture_command": capture_command,
+        "capture_backend": capture_backend,
+        "capture_window_info": window_info,
         "open_event": open_event,
+        "avoid_space_switch": avoid_space_switch,
         "downscale_factor": float(downscale_factor),
         "downscale": downscale_info,
         "width": width,
         "height": height,
+        "capture_stderr": (capture.stderr.strip() if capture is not None else ""),
     }
 
 
