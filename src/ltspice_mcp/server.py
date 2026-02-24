@@ -48,7 +48,7 @@ def _read_env_bool(name: str, default: bool = False) -> bool:
 _DEFAULT_WORKDIR = Path(os.getenv("LTSPICE_MCP_WORKDIR", os.getcwd()))
 _DEFAULT_TIMEOUT = int(os.getenv("LTSPICE_MCP_TIMEOUT", "120"))
 _DEFAULT_BINARY = os.getenv("LTSPICE_BINARY")
-_DEFAULT_UI_ENABLED = _read_env_bool("LTSPICE_MCP_UI_ENABLED", default=True)
+_DEFAULT_UI_ENABLED = _read_env_bool("LTSPICE_MCP_UI_ENABLED", default=False)
 
 _runner = LTspiceRunner(
     workdir=_DEFAULT_WORKDIR,

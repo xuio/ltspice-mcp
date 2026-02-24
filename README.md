@@ -9,7 +9,7 @@ This implementation is inspired by:
 ## What it provides
 
 - LTspice executable auto-discovery on macOS (`LTSPICE_BINARY` override supported)
-- Optional LTspice UI integration (enabled by default)
+- Optional LTspice UI integration (disabled by default)
 - Batch simulation from netlist text or existing netlist file
 - Run history with artifacts (`.log`, `.raw`, `.op.raw`)
 - JSON-backed run metadata persistence across server restarts (`.ltspice_mcp_runs.json`)
@@ -122,12 +122,12 @@ Responses include:
 
 ## UI integration (optional)
 
-UI is enabled by default. You can disable or override it either globally or per call.
+UI is disabled by default. You can enable or override it either globally or per call.
 
 Global:
-- default behavior is equivalent to `--ui-enabled`
-- disable with `--ui-disabled` (or `LTSPICE_MCP_UI_ENABLED=false`)
-- enable explicitly with `--ui-enabled` (or `LTSPICE_MCP_UI_ENABLED=true`)
+- default behavior is equivalent to `--ui-disabled`
+- enable with `--ui-enabled` (or `LTSPICE_MCP_UI_ENABLED=true`)
+- disable explicitly with `--ui-disabled` (or `LTSPICE_MCP_UI_ENABLED=false`)
 - change at runtime via `setLtspiceUiEnabled`
 
 Per simulation call:
