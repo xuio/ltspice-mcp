@@ -11,6 +11,7 @@ This implementation is inspired by:
 - LTspice executable auto-discovery on macOS (`LTSPICE_BINARY` override supported)
 - Optional LTspice UI integration (disabled by default)
 - Batch simulation from netlist text or existing netlist file
+- Schematic generation (`.asc`) from structured data or netlist auto-layout
 - Run history with artifacts (`.log`, `.raw`, `.op.raw`)
 - JSON-backed run metadata persistence across server restarts (`.ltspice_mcp_runs.json`)
 - RAW parser with support for:
@@ -74,6 +75,8 @@ Simulation and setup:
 - `getLtspiceUiStatus`
 - `setLtspiceUiEnabled`
 - `openLtspiceUi`
+- `createSchematic`
+- `createSchematicFromNetlist`
 - `loadCircuit`
 - `loadNetlistFromFile`
 - `runSimulation`
@@ -133,6 +136,13 @@ Global:
 Per simulation call:
 - `show_ui=true|false` (overrides default)
 - `open_raw_after_run=true` to open waveform output after batch simulation
+
+## Schematic generation
+
+- `createSchematic`: build `.asc` from explicit components/wires/labels/directives
+- `createSchematicFromNetlist`: parse a netlist and auto-place common two-pin primitives (`R`, `C`, `L`, `D`, `V`, `I`)
+
+Both tools return an `asc_path` and support `open_ui` to open the resulting schematic in LTspice.
 
 ## Run tests
 

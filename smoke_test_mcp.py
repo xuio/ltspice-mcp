@@ -68,6 +68,8 @@ async def _run_smoke_test(args: argparse.Namespace) -> None:
             tool_names = {tool.name for tool in tools_result.tools}
             required_tools = {
                 "getLtspiceStatus",
+                "createSchematic",
+                "createSchematicFromNetlist",
                 "simulateNetlist",
                 "getPlotNames",
                 "getVectorsInfo",
@@ -115,6 +117,20 @@ C1 out 0 1u
             _require(isinstance(run_id, str) and run_id, "Missing run_id in simulation result")
             _require(len(run.get("raw_files", [])) > 0, "Simulation produced no RAW files")
             print(f"Simulation passed (run_id={run_id})")
+
+            auto_schematic = _extract_call_result(
+                await session.call_tool(
+                    "createSchematicFromNetlist",
+                    {
+                        "netlist_content": netlist,
+                        "circuit_name": "smoke_auto_schematic",
+                        "open_ui": False,
+                    },
+                )
+            )
+            _require(isinstance(auto_schematic, dict), "createSchematicFromNetlist did not return an object")
+            _require(auto_schematic.get("asc_path"), "createSchematicFromNetlist missing asc_path")
+            print("Auto-schematic check passed")
 
             plots = _extract_call_result(
                 await session.call_tool("getPlotNames", {"run_id": run_id})

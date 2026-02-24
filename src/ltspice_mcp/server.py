@@ -28,6 +28,7 @@ from .ltspice import (
 )
 from .models import RawDataset, SimulationRun
 from .raw_parser import RawParseError, parse_raw_file
+from .schematic import build_schematic_from_netlist, build_schematic_from_spec
 
 
 mcp = FastMCP("ltspice-mcp-macos")
@@ -156,6 +157,10 @@ def _open_ui_target(
     if run is None:
         raise ValueError("Either run or path must be provided for UI open.")
     return open_in_ltspice_ui(_target_path_from_run(run, target))
+
+
+def _effective_open_ui(open_ui: bool | None) -> bool:
+    return _ui_enabled if open_ui is None else bool(open_ui)
 
 
 def _resolve_raw_path(raw_path: str | None, run_id: str | None) -> Path:
@@ -357,6 +362,82 @@ def openLtspiceUi(
         return _open_ui_target(path=Path(path).expanduser().resolve())
     run = _resolve_run(run_id)
     return _open_ui_target(run=run, target=target)
+
+
+@mcp.tool()
+def createSchematic(
+    components: list[dict[str, Any]],
+    wires: list[dict[str, Any]] | None = None,
+    directives: list[dict[str, Any] | str] | None = None,
+    labels: list[dict[str, Any]] | None = None,
+    circuit_name: str = "schematic",
+    output_path: str | None = None,
+    sheet_width: int = 880,
+    sheet_height: int = 680,
+    open_ui: bool | None = None,
+) -> dict[str, Any]:
+    """
+    Create an LTspice .asc schematic from structured component/wire/directive data.
+
+    Components must include: symbol, reference, x, y.
+    Optional component fields: value, orientation|rotation, attributes, pin_nets.
+    """
+    if not components:
+        raise ValueError("components must contain at least one component")
+
+    result = build_schematic_from_spec(
+        workdir=_runner.workdir,
+        components=components,
+        wires=wires,
+        directives=directives,
+        labels=labels,
+        circuit_name=circuit_name,
+        output_path=output_path,
+        sheet_width=sheet_width,
+        sheet_height=sheet_height,
+    )
+
+    should_open = _effective_open_ui(open_ui)
+    if should_open:
+        try:
+            result["ui"] = _open_ui_target(path=Path(result["asc_path"]))
+        except Exception as exc:
+            result["ui"] = {"opened": False, "error": str(exc)}
+    result["ui_enabled"] = should_open
+    return result
+
+
+@mcp.tool()
+def createSchematicFromNetlist(
+    netlist_content: str,
+    circuit_name: str = "schematic_from_netlist",
+    output_path: str | None = None,
+    sheet_width: int = 1200,
+    sheet_height: int = 900,
+    open_ui: bool | None = None,
+) -> dict[str, Any]:
+    """
+    Create an LTspice .asc schematic from a SPICE netlist using simple auto-placement/routing.
+
+    Currently supports common two-pin primitives (R, C, L, D, V, I).
+    """
+    result = build_schematic_from_netlist(
+        workdir=_runner.workdir,
+        netlist_content=netlist_content,
+        circuit_name=circuit_name,
+        output_path=output_path,
+        sheet_width=sheet_width,
+        sheet_height=sheet_height,
+    )
+
+    should_open = _effective_open_ui(open_ui)
+    if should_open:
+        try:
+            result["ui"] = _open_ui_target(path=Path(result["asc_path"]))
+        except Exception as exc:
+            result["ui"] = {"opened": False, "error": str(exc)}
+    result["ui_enabled"] = should_open
+    return result
 
 
 @mcp.tool()
