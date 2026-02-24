@@ -72,6 +72,9 @@ async def _run_smoke_test(args: argparse.Namespace) -> None:
                 "listLtspiceLibraryEntries",
                 "listLtspiceSymbols",
                 "getLtspiceSymbolInfo",
+                "renderLtspiceSymbolImage",
+                "renderLtspiceSchematicImage",
+                "renderLtspicePlotImage",
                 "setSchematicUiSingleWindow",
                 "createSchematic",
                 "createSchematicFromNetlist",
@@ -138,6 +141,26 @@ async def _run_smoke_test(args: argparse.Namespace) -> None:
             _require("source" in symbol_info, "getLtspiceSymbolInfo missing source field")
             print("Symbol info check passed")
 
+            symbol_image = _extract_call_result(
+                await session.call_tool(
+                    "renderLtspiceSymbolImage",
+                    {"symbol": "opamp2", "downscale_factor": 0.5, "backend": "auto"},
+                )
+            )
+            _require(isinstance(symbol_image, dict), "renderLtspiceSymbolImage did not return an object")
+            symbol_image_path = Path(symbol_image.get("image_path", ""))
+            _require(symbol_image_path.exists(), "renderLtspiceSymbolImage output missing")
+            _require(symbol_image.get("backend_used") in {"ltspice", "svg"}, "Unexpected symbol image backend")
+            if symbol_image.get("backend_used") == "svg":
+                _require(symbol_image.get("width", 0) < 640, "Symbol image downscale did not apply (svg)")
+            else:
+                downscale_info = symbol_image.get("downscale", {})
+                _require(
+                    isinstance(downscale_info, dict) and (downscale_info.get("downscaled") is True or symbol_image.get("downscale_factor") < 1.0),
+                    "Symbol image downscale metadata missing for ltspice backend",
+                )
+            print("Symbol image render check passed")
+
             templates = _extract_call_result(await session.call_tool("listSchematicTemplates", {}))
             _require(isinstance(templates, dict), "listSchematicTemplates did not return an object")
             template_entries = templates.get("templates", [])
@@ -165,6 +188,30 @@ async def _run_smoke_test(args: argparse.Namespace) -> None:
             _require(isinstance(template_schematic, dict), "createSchematicFromTemplate did not return an object")
             _require(template_schematic.get("asc_path"), "createSchematicFromTemplate missing asc_path")
             print("Template schematic check passed")
+
+            schematic_image = _extract_call_result(
+                await session.call_tool(
+                    "renderLtspiceSchematicImage",
+                    {
+                        "asc_path": template_schematic.get("asc_path"),
+                        "downscale_factor": 0.5,
+                        "backend": "auto",
+                    },
+                )
+            )
+            _require(isinstance(schematic_image, dict), "renderLtspiceSchematicImage did not return an object")
+            schematic_image_path = Path(schematic_image.get("image_path", ""))
+            _require(schematic_image_path.exists(), "renderLtspiceSchematicImage output missing")
+            _require(schematic_image.get("backend_used") in {"ltspice", "svg"}, "Unexpected schematic image backend")
+            if schematic_image.get("backend_used") == "svg":
+                _require(schematic_image.get("width", 0) < 1400, "Schematic image downscale did not apply (svg)")
+            else:
+                downscale_info = schematic_image.get("downscale", {})
+                _require(
+                    isinstance(downscale_info, dict) and (downscale_info.get("downscaled") is True or schematic_image.get("downscale_factor") < 1.0),
+                    "Schematic image downscale metadata missing for ltspice backend",
+                )
+            print("Schematic image render check passed")
 
             netlist = """
 * RC low-pass smoke test
@@ -273,6 +320,32 @@ C1 out 0 1u
             vout = vector_data.get("vectors", {}).get("V(out)", {})
             _require("magnitude" in vout, "V(out) magnitude data missing")
             print(f"Trace check passed ({len(vector_data['scale_points'])} sampled points)")
+
+            plot_image = _extract_call_result(
+                await session.call_tool(
+                    "renderLtspicePlotImage",
+                    {
+                        "run_id": run_id,
+                        "vectors": ["V(out)"],
+                        "y_mode": "magnitude",
+                        "downscale_factor": 0.5,
+                        "backend": "auto",
+                    },
+                )
+            )
+            _require(isinstance(plot_image, dict), "renderLtspicePlotImage did not return an object")
+            plot_image_path = Path(plot_image.get("image_path", ""))
+            _require(plot_image_path.exists(), "renderLtspicePlotImage output missing")
+            _require(plot_image.get("backend_used") in {"ltspice", "svg"}, "Unexpected plot image backend")
+            if plot_image.get("backend_used") == "svg":
+                _require(plot_image.get("width", 0) < 1280, "Plot image downscale did not apply (svg)")
+            else:
+                downscale_info = plot_image.get("downscale", {})
+                _require(
+                    isinstance(downscale_info, dict) and (downscale_info.get("downscaled") is True or plot_image.get("downscale_factor") < 1.0),
+                    "Plot image downscale metadata missing for ltspice backend",
+                )
+            print("Plot image render check passed")
 
             extrema = _extract_call_result(
                 await session.call_tool(

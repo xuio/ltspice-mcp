@@ -14,6 +14,7 @@ This implementation is inspired by:
 - Batch simulation from netlist text or existing netlist file
 - Schematic generation (`.asc`) from structured data or netlist auto-layout
 - LTspice symbol library inspection tools (lib.zip entry/symbol/pin/source queries)
+- MCP-served image rendering for symbols, schematics, and plots
 - JSON template-driven schematic generation
 - Netlist-file schematic sync/watch workflow with JSON state files
 - Run history with artifacts (`.log`, `.raw`, `.op.raw`)
@@ -83,6 +84,9 @@ Simulation and setup:
 - `listLtspiceLibraryEntries`
 - `listLtspiceSymbols`
 - `getLtspiceSymbolInfo`
+- `renderLtspiceSymbolImage`
+- `renderLtspiceSchematicImage`
+- `renderLtspicePlotImage`
 - `setLtspiceUiEnabled`
 - `setSchematicUiSingleWindow`
 - `openLtspiceUi`
@@ -180,6 +184,22 @@ Template notes:
 - `listLtspiceLibraryEntries`: list raw `.asy` zip entries (useful for path discovery)
 - `listLtspiceSymbols`: search symbols by name/category (e.g. `opamp2`, `UniversalOpAmp2`)
 - `getLtspiceSymbolInfo`: return parsed pin map and optional `.asy` source text
+
+## Image rendering (MCP-served)
+
+- `renderLtspiceSymbolImage`: returns symbol image content plus metadata
+- `renderLtspiceSchematicImage`: returns rendered `.asc` schematic image content plus metadata
+- `renderLtspicePlotImage`: returns rendered RAW plot image content plus metadata
+
+All three tools return image content blocks through MCP (not just file paths), and also include `image_path` in structured metadata for traceability.
+
+Rendering backend options:
+- `backend=auto` (default): try real LTspice UI screenshot first, fall back to SVG rendering
+- `backend=ltspice`: force LTspice UI screenshot mode
+- `backend=svg`: force deterministic SVG renderer
+
+Downscale:
+- `downscale_factor` (e.g. `0.5`) is supported for symbol, schematic, and plot image tools.
 
 ## Run tests
 

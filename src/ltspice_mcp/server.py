@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import mimetypes
 import os
 import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import mcp.types as types
 from mcp.server.fastmcp import FastMCP
 
 from .analysis import (
@@ -21,6 +25,7 @@ from .analysis import (
 )
 from .ltspice import (
     LTspiceRunner,
+    capture_ltspice_window_screenshot,
     find_ltspice_executable,
     get_ltspice_version,
     is_ltspice_ui_running,
@@ -39,6 +44,7 @@ from .schematic import (
     sync_schematic_from_netlist_file,
     watch_schematic_from_netlist_file,
 )
+from .visualization import render_plot_svg, render_schematic_svg, render_symbol_svg
 
 
 mcp = FastMCP("ltspice-mcp-macos")
@@ -184,6 +190,62 @@ def _open_ui_target(
 
 def _effective_open_ui(open_ui: bool | None) -> bool:
     return _ui_enabled if open_ui is None else bool(open_ui)
+
+
+def _guess_image_mime(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".svg":
+        return "image/svg+xml"
+    guessed, _ = mimetypes.guess_type(str(path))
+    return guessed or "application/octet-stream"
+
+
+def _safe_name(name: str) -> str:
+    cleaned = "".join(ch if (ch.isalnum() or ch in "_-") else "_" for ch in name)
+    return cleaned.strip("_") or "image"
+
+
+def _resolve_png_output_path(
+    *,
+    kind: str,
+    name: str,
+    output_path: str | None,
+) -> Path:
+    if output_path:
+        target = Path(output_path).expanduser().resolve()
+        if target.suffix.lower() in {".png", ".jpg", ".jpeg", ".tiff"}:
+            return target
+        return target.with_suffix(".png")
+    return (
+        _runner.workdir
+        / "images"
+        / kind
+        / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{_safe_name(name)}.png"
+    ).resolve()
+
+
+def _normalize_image_backend(value: str) -> str:
+    backend = value.strip().lower()
+    if backend not in {"auto", "ltspice", "svg"}:
+        raise ValueError("backend must be one of: auto, ltspice, svg")
+    return backend
+
+
+def _image_tool_result(payload: dict[str, Any]) -> types.CallToolResult:
+    image_path = payload.get("image_path")
+    if not image_path:
+        raise ValueError("image payload missing image_path")
+    path = Path(str(image_path)).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"image_path does not exist: {path}")
+
+    data_b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+    mime = _guess_image_mime(path)
+    content: list[types.TextContent | types.ImageContent] = [
+        types.ImageContent(type="image", mimeType=mime, data=data_b64),
+        types.TextContent(type="text", text=json.dumps(payload, indent=2)),
+    ]
+    return types.CallToolResult(content=content, structuredContent=payload, isError=False)
 
 
 def _resolve_symbol_library(lib_zip_path: str | None = None) -> SymbolLibrary:
@@ -515,6 +577,243 @@ def getLtspiceSymbolInfo(
         payload["source_line_count"] = len(raw_source.splitlines())
 
     return payload
+
+
+@mcp.tool()
+def renderLtspiceSymbolImage(
+    symbol: str,
+    output_path: str | None = None,
+    width: int = 640,
+    height: int = 420,
+    downscale_factor: float = 1.0,
+    backend: str = "auto",
+    settle_seconds: float = 1.0,
+    include_pins: bool = True,
+    include_pin_labels: bool = True,
+    lib_zip_path: str | None = None,
+) -> types.CallToolResult:
+    """
+    Render an LTspice symbol to an image and return the image through MCP.
+
+    The response includes both image content and structured metadata (image_path, bounds, etc.).
+    """
+    if not symbol.strip():
+        raise ValueError("symbol must be a non-empty string")
+
+    normalized_backend = _normalize_image_backend(backend)
+    warnings: list[str] = []
+
+    if normalized_backend in {"auto", "ltspice"}:
+        try:
+            preview = build_schematic_from_spec(
+                workdir=_runner.workdir,
+                components=[
+                    {
+                        "symbol": symbol,
+                        "reference": "X1",
+                        "x": 240,
+                        "y": 180,
+                        "value": symbol,
+                    }
+                ],
+                circuit_name=f"symbol_preview_{symbol}",
+                sheet_width=max(600, width),
+                sheet_height=max(420, height),
+            )
+            screenshot_payload = capture_ltspice_window_screenshot(
+                output_path=_resolve_png_output_path(
+                    kind="symbols",
+                    name=symbol,
+                    output_path=output_path,
+                ),
+                open_path=preview["asc_path"],
+                settle_seconds=settle_seconds,
+                downscale_factor=downscale_factor,
+            )
+            payload = {
+                **screenshot_payload,
+                "symbol": symbol,
+                "preview_asc_path": preview["asc_path"],
+                "backend_requested": normalized_backend,
+                "backend_used": "ltspice",
+            }
+            return _image_tool_result(payload)
+        except Exception as exc:
+            if normalized_backend == "ltspice":
+                raise
+            warnings.append(f"ltspice backend failed; fell back to svg: {exc}")
+
+    symbol_lib = _resolve_symbol_library(lib_zip_path)
+    svg_output_path = output_path
+    if output_path and Path(output_path).suffix.lower() not in {".svg"}:
+        svg_output_path = str(Path(output_path).with_suffix(".svg"))
+        warnings.append("output_path suffix adjusted to .svg for svg backend")
+    payload = render_symbol_svg(
+        workdir=_runner.workdir,
+        symbol=symbol,
+        output_path=svg_output_path,
+        width=width,
+        height=height,
+        downscale_factor=downscale_factor,
+        include_pins=include_pins,
+        include_pin_labels=include_pin_labels,
+        library=symbol_lib,
+    )
+    payload["backend_requested"] = normalized_backend
+    payload["backend_used"] = "svg"
+    if warnings:
+        payload["warnings"] = warnings
+    return _image_tool_result(payload)
+
+
+@mcp.tool()
+def renderLtspiceSchematicImage(
+    asc_path: str,
+    output_path: str | None = None,
+    width: int = 1400,
+    height: int = 900,
+    downscale_factor: float = 1.0,
+    backend: str = "auto",
+    settle_seconds: float = 1.0,
+    include_symbol_graphics: bool = True,
+    lib_zip_path: str | None = None,
+) -> types.CallToolResult:
+    """
+    Render an LTspice schematic (.asc) to an image and return it through MCP.
+
+    `downscale_factor` lets clients request smaller rendered images.
+    """
+    normalized_backend = _normalize_image_backend(backend)
+    asc_resolved = Path(asc_path).expanduser().resolve()
+    warnings: list[str] = []
+
+    if normalized_backend in {"auto", "ltspice"}:
+        try:
+            screenshot_payload = capture_ltspice_window_screenshot(
+                output_path=_resolve_png_output_path(
+                    kind="schematics",
+                    name=asc_resolved.stem,
+                    output_path=output_path,
+                ),
+                open_path=asc_resolved,
+                settle_seconds=settle_seconds,
+                downscale_factor=downscale_factor,
+            )
+            payload = {
+                **screenshot_payload,
+                "asc_path": str(asc_resolved),
+                "backend_requested": normalized_backend,
+                "backend_used": "ltspice",
+            }
+            return _image_tool_result(payload)
+        except Exception as exc:
+            if normalized_backend == "ltspice":
+                raise
+            warnings.append(f"ltspice backend failed; fell back to svg: {exc}")
+
+    symbol_lib = _resolve_symbol_library(lib_zip_path) if include_symbol_graphics else None
+    svg_output_path = output_path
+    if output_path and Path(output_path).suffix.lower() not in {".svg"}:
+        svg_output_path = str(Path(output_path).with_suffix(".svg"))
+        warnings.append("output_path suffix adjusted to .svg for svg backend")
+    payload = render_schematic_svg(
+        workdir=_runner.workdir,
+        asc_path=asc_resolved,
+        output_path=svg_output_path,
+        width=width,
+        height=height,
+        downscale_factor=downscale_factor,
+        include_symbol_graphics=include_symbol_graphics,
+        library=symbol_lib,
+    )
+    payload["backend_requested"] = normalized_backend
+    payload["backend_used"] = "svg"
+    if warnings:
+        payload["warnings"] = warnings
+    return _image_tool_result(payload)
+
+
+@mcp.tool()
+def renderLtspicePlotImage(
+    vectors: list[str],
+    plot: str | None = None,
+    run_id: str | None = None,
+    raw_path: str | None = None,
+    step_index: int | None = None,
+    output_path: str | None = None,
+    width: int = 1280,
+    height: int = 720,
+    downscale_factor: float = 1.0,
+    backend: str = "auto",
+    settle_seconds: float = 1.0,
+    max_points: int = 2000,
+    y_mode: str = "magnitude",
+    x_log: bool | None = None,
+    title: str | None = None,
+) -> types.CallToolResult:
+    """
+    Render one or more vectors from a RAW dataset to a plot image and return it through MCP.
+
+    Supports run_id/raw_path resolution and optional step filtering for stepped runs.
+    """
+    if not vectors:
+        raise ValueError("vectors must contain at least one vector name")
+    dataset = _resolve_dataset(plot=plot, run_id=run_id, raw_path=raw_path)
+    selected_step = _resolve_step_index(dataset, step_index)
+    normalized_backend = _normalize_image_backend(backend)
+    warnings: list[str] = []
+
+    if normalized_backend in {"auto", "ltspice"}:
+        try:
+            screenshot_payload = capture_ltspice_window_screenshot(
+                output_path=_resolve_png_output_path(
+                    kind="plots",
+                    name=f"{dataset.path.stem}_{vectors[0]}",
+                    output_path=output_path,
+                ),
+                open_path=dataset.path,
+                settle_seconds=settle_seconds,
+                downscale_factor=downscale_factor,
+            )
+            payload = {
+                **screenshot_payload,
+                "raw_path": str(dataset.path),
+                "plot_name": dataset.plot_name,
+                "vectors": vectors,
+                "backend_requested": normalized_backend,
+                "backend_used": "ltspice",
+                **_step_payload(dataset, selected_step),
+            }
+            return _image_tool_result(payload)
+        except Exception as exc:
+            if normalized_backend == "ltspice":
+                raise
+            warnings.append(f"ltspice backend failed; fell back to svg: {exc}")
+
+    svg_output_path = output_path
+    if output_path and Path(output_path).suffix.lower() not in {".svg"}:
+        svg_output_path = str(Path(output_path).with_suffix(".svg"))
+        warnings.append("output_path suffix adjusted to .svg for svg backend")
+    payload = render_plot_svg(
+        workdir=_runner.workdir,
+        dataset=dataset,
+        vectors=vectors,
+        step_index=selected_step,
+        output_path=svg_output_path,
+        width=width,
+        height=height,
+        downscale_factor=downscale_factor,
+        max_points=max_points,
+        y_mode=y_mode,
+        x_log=x_log,
+        title=title,
+    )
+    payload["backend_requested"] = normalized_backend
+    payload["backend_used"] = "svg"
+    if warnings:
+        payload["warnings"] = warnings
+    payload.update(_step_payload(dataset, selected_step))
+    return _image_tool_result(payload)
 
 
 @mcp.tool()

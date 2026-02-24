@@ -8,6 +8,7 @@ import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from .models import SimulationDiagnostic, SimulationRun
 from .textio import read_text_auto
@@ -210,6 +211,162 @@ def open_in_ltspice_ui(path: str | Path) -> dict[str, str | int | bool]:
         "path": str(target),
         "stdout": proc.stdout.strip(),
         "stderr": proc.stderr.strip(),
+    }
+
+
+def _run_osascript(lines: list[str]) -> subprocess.CompletedProcess[str]:
+    command: list[str] = ["osascript"]
+    for line in lines:
+        command.extend(["-e", line])
+    return subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _front_ltspice_window_id() -> int | None:
+    if platform.system() != "Darwin":
+        return None
+
+    proc = _run_osascript(
+        [
+            'tell application "LTspice" to activate',
+            'tell application "System Events"',
+            '  tell process "LTspice"',
+            "    set frontmost to true",
+            "    if (count of windows) is 0 then return \"\"",
+            "    return id of front window",
+            "  end tell",
+            "end tell",
+        ]
+    )
+    if proc.returncode != 0:
+        return None
+    raw = proc.stdout.strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _downscale_image_file(path: Path, downscale_factor: float) -> dict[str, Any]:
+    if downscale_factor >= 1.0:
+        return {"downscaled": False}
+    if downscale_factor <= 0:
+        raise ValueError("downscale_factor must be > 0")
+
+    if platform.system() != "Darwin":
+        return {"downscaled": False, "warning": "downscale currently implemented with macOS sips"}
+
+    probe = subprocess.run(
+        ["sips", "-g", "pixelWidth", "-g", "pixelHeight", str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if probe.returncode != 0:
+        return {"downscaled": False, "warning": probe.stderr.strip() or "sips probe failed"}
+
+    width_match = re.search(r"pixelWidth:\s*(\d+)", probe.stdout)
+    height_match = re.search(r"pixelHeight:\s*(\d+)", probe.stdout)
+    if not width_match or not height_match:
+        return {"downscaled": False, "warning": "could not parse image dimensions"}
+
+    width = int(width_match.group(1))
+    height = int(height_match.group(1))
+    new_width = max(1, int(round(width * downscale_factor)))
+    new_height = max(1, int(round(height * downscale_factor)))
+
+    scale = subprocess.run(
+        ["sips", "--resampleHeightWidth", str(new_height), str(new_width), str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if scale.returncode != 0:
+        return {"downscaled": False, "warning": scale.stderr.strip() or "sips resample failed"}
+    return {
+        "downscaled": True,
+        "original_width": width,
+        "original_height": height,
+        "scaled_width": new_width,
+        "scaled_height": new_height,
+    }
+
+
+def _probe_image_dimensions(path: Path) -> tuple[int | None, int | None]:
+    if platform.system() != "Darwin":
+        return None, None
+    probe = subprocess.run(
+        ["sips", "-g", "pixelWidth", "-g", "pixelHeight", str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if probe.returncode != 0:
+        return None, None
+    width_match = re.search(r"pixelWidth:\s*(\d+)", probe.stdout)
+    height_match = re.search(r"pixelHeight:\s*(\d+)", probe.stdout)
+    if not width_match or not height_match:
+        return None, None
+    return int(width_match.group(1)), int(height_match.group(1))
+
+
+def capture_ltspice_window_screenshot(
+    *,
+    output_path: str | Path,
+    open_path: str | Path | None = None,
+    settle_seconds: float = 1.0,
+    downscale_factor: float = 1.0,
+) -> dict[str, Any]:
+    target = Path(output_path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    open_event: dict[str, Any] | None = None
+    if open_path is not None:
+        open_event = open_in_ltspice_ui(open_path)
+        if not open_event.get("opened", False):
+            raise RuntimeError(f"Failed to open LTspice UI target: {open_event}")
+
+    if settle_seconds > 0:
+        time.sleep(settle_seconds)
+
+    window_id = _front_ltspice_window_id()
+    capture_command: list[str]
+    if window_id is not None:
+        capture_command = ["screencapture", "-x", "-l", str(window_id), str(target)]
+    else:
+        capture_command = ["screencapture", "-x", str(target)]
+
+    capture = subprocess.run(
+        capture_command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if capture.returncode != 0:
+        raise RuntimeError(
+            f"screencapture failed (rc={capture.returncode}): {capture.stderr.strip()}"
+        )
+    if not target.exists():
+        raise FileNotFoundError(f"screencapture did not produce file: {target}")
+
+    downscale_info = _downscale_image_file(target, downscale_factor=downscale_factor)
+    width, height = _probe_image_dimensions(target)
+    return {
+        "image_path": str(target),
+        "format": target.suffix.lstrip(".").lower() or "png",
+        "window_id": window_id,
+        "capture_command": capture_command,
+        "open_event": open_event,
+        "downscale_factor": float(downscale_factor),
+        "downscale": downscale_info,
+        "width": width,
+        "height": height,
     }
 
 
