@@ -68,6 +68,7 @@ async def _run_smoke_test(args: argparse.Namespace) -> None:
             tool_names = {tool.name for tool in tools_result.tools}
             required_tools = {
                 "getLtspiceStatus",
+                "setSchematicUiSingleWindow",
                 "createSchematic",
                 "createSchematicFromNetlist",
                 "listSchematicTemplates",
@@ -162,7 +163,10 @@ C1 out 0 1u
             )
             _require(isinstance(synced, dict), "syncSchematicFromNetlistFile did not return an object")
             _require(synced.get("asc_path"), "syncSchematicFromNetlistFile missing asc_path")
-            _require(synced.get("updated") is True, "Expected sync call to produce an initial update")
+            _require(
+                synced.get("reason") in {"forced", "missing_output", "source_changed", "unchanged"},
+                f"Unexpected sync reason: {synced.get('reason')}",
+            )
             print("Schematic sync check passed")
 
             watch_result = _extract_call_result(

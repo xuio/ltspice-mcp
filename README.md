@@ -10,6 +10,7 @@ This implementation is inspired by:
 
 - LTspice executable auto-discovery on macOS (`LTSPICE_BINARY` override supported)
 - Optional LTspice UI integration (disabled by default)
+- Schematic UI single-window mode (enabled by default)
 - Batch simulation from netlist text or existing netlist file
 - Schematic generation (`.asc`) from structured data or netlist auto-layout
 - JSON template-driven schematic generation
@@ -68,6 +69,8 @@ Environment variables:
 - `LTSPICE_MCP_WORKDIR`
 - `LTSPICE_MCP_TIMEOUT`
 - `LTSPICE_MCP_UI_ENABLED` (`true`/`false`)
+- `LTSPICE_MCP_SCHEMATIC_SINGLE_WINDOW` (`true`/`false`, default `true`)
+- `LTSPICE_MCP_SCHEMATIC_LIVE_PATH` (optional live schematic path override)
 
 ## MCP tools
 
@@ -76,6 +79,7 @@ Simulation and setup:
 - `getLtspiceStatus`
 - `getLtspiceUiStatus`
 - `setLtspiceUiEnabled`
+- `setSchematicUiSingleWindow`
 - `openLtspiceUi`
 - `createSchematic`
 - `createSchematicFromNetlist`
@@ -138,6 +142,12 @@ Global:
 - enable with `--ui-enabled` (or `LTSPICE_MCP_UI_ENABLED=true`)
 - disable explicitly with `--ui-disabled` (or `LTSPICE_MCP_UI_ENABLED=false`)
 - change at runtime via `setLtspiceUiEnabled`
+
+Schematic single-window mode:
+- enabled by default (`--schematic-single-window` / `LTSPICE_MCP_SCHEMATIC_SINGLE_WINDOW=true`)
+- routes schematic UI opens through one live path (default: `<workdir>/.ui/live_schematic.asc`)
+- disable via `--schematic-multi-window` or `setSchematicUiSingleWindow(false)`
+- override live path with `--schematic-live-path` or `LTSPICE_MCP_SCHEMATIC_LIVE_PATH`
 
 Per simulation call:
 - `show_ui=true|false` (overrides default)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +58,11 @@ _DEFAULT_WORKDIR = Path(os.getenv("LTSPICE_MCP_WORKDIR", os.getcwd()))
 _DEFAULT_TIMEOUT = int(os.getenv("LTSPICE_MCP_TIMEOUT", "120"))
 _DEFAULT_BINARY = os.getenv("LTSPICE_BINARY")
 _DEFAULT_UI_ENABLED = _read_env_bool("LTSPICE_MCP_UI_ENABLED", default=False)
+_DEFAULT_SCHEMATIC_SINGLE_WINDOW = _read_env_bool(
+    "LTSPICE_MCP_SCHEMATIC_SINGLE_WINDOW",
+    default=True,
+)
+_DEFAULT_SCHEMATIC_LIVE_PATH = os.getenv("LTSPICE_MCP_SCHEMATIC_LIVE_PATH")
 
 _runner = LTspiceRunner(
     workdir=_DEFAULT_WORKDIR,
@@ -69,6 +75,12 @@ _loaded_netlist: Path | None = None
 _raw_cache: dict[Path, tuple[float, RawDataset]] = {}
 _state_path: Path = _DEFAULT_WORKDIR / ".ltspice_mcp_runs.json"
 _ui_enabled: bool = _DEFAULT_UI_ENABLED
+_schematic_single_window_enabled: bool = _DEFAULT_SCHEMATIC_SINGLE_WINDOW
+_schematic_live_path: Path = (
+    Path(_DEFAULT_SCHEMATIC_LIVE_PATH).expanduser().resolve()
+    if _DEFAULT_SCHEMATIC_LIVE_PATH
+    else (_DEFAULT_WORKDIR / ".ui" / "live_schematic.asc").resolve()
+)
 
 
 def _save_run_state() -> None:
@@ -168,6 +180,36 @@ def _open_ui_target(
 
 def _effective_open_ui(open_ui: bool | None) -> bool:
     return _ui_enabled if open_ui is None else bool(open_ui)
+
+
+def _sync_schematic_live_file(source_path: Path) -> Path:
+    source = source_path.expanduser().resolve()
+    if not source.exists():
+        raise FileNotFoundError(f"Schematic file not found: {source}")
+    target = _schematic_live_path.expanduser().resolve()
+    if target == source:
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_target = target.with_suffix(".tmp")
+    shutil.copyfile(source, tmp_target)
+    tmp_target.replace(target)
+    return target
+
+
+def _open_schematic_ui(path: Path) -> dict[str, Any]:
+    requested_path = path.expanduser().resolve()
+    if _schematic_single_window_enabled:
+        ui_path = _sync_schematic_live_file(requested_path)
+        routed = ui_path != requested_path
+    else:
+        ui_path = requested_path
+        routed = False
+    event = _open_ui_target(path=ui_path)
+    event["single_window_mode"] = _schematic_single_window_enabled
+    event["requested_path"] = str(requested_path)
+    event["ui_path"] = str(ui_path)
+    event["routed_to_single_window"] = routed
+    return event
 
 
 def _resolve_raw_path(raw_path: str | None, run_id: str | None) -> Path:
@@ -330,6 +372,8 @@ def getLtspiceStatus() -> dict[str, Any]:
         "runs_recorded": len(_run_order),
         "run_state_path": str(_state_path),
         "ui_enabled_default": _ui_enabled,
+        "schematic_single_window_default": _schematic_single_window_enabled,
+        "schematic_live_path": str(_schematic_live_path),
     }
 
 
@@ -338,6 +382,8 @@ def getLtspiceUiStatus() -> dict[str, Any]:
     """Return whether LTspice UI appears to be running on this machine."""
     return {
         "ui_enabled_default": _ui_enabled,
+        "schematic_single_window_default": _schematic_single_window_enabled,
+        "schematic_live_path": str(_schematic_live_path),
         "ui_running": is_ltspice_ui_running(),
         "runs_recorded": len(_run_order),
         "latest_run_id": _run_order[-1] if _run_order else None,
@@ -350,6 +396,17 @@ def setLtspiceUiEnabled(enabled: bool) -> dict[str, Any]:
     global _ui_enabled
     _ui_enabled = bool(enabled)
     return {"ui_enabled_default": _ui_enabled}
+
+
+@mcp.tool()
+def setSchematicUiSingleWindow(enabled: bool) -> dict[str, Any]:
+    """Set whether schematic UI opens reuse a single live schematic path."""
+    global _schematic_single_window_enabled
+    _schematic_single_window_enabled = bool(enabled)
+    return {
+        "schematic_single_window_default": _schematic_single_window_enabled,
+        "schematic_live_path": str(_schematic_live_path),
+    }
 
 
 @mcp.tool()
@@ -407,10 +464,11 @@ def createSchematic(
     should_open = _effective_open_ui(open_ui)
     if should_open:
         try:
-            result["ui"] = _open_ui_target(path=Path(result["asc_path"]))
+            result["ui"] = _open_schematic_ui(Path(result["asc_path"]))
         except Exception as exc:
             result["ui"] = {"opened": False, "error": str(exc)}
     result["ui_enabled"] = should_open
+    result["single_window_mode"] = _schematic_single_window_enabled
     return result
 
 
@@ -440,10 +498,11 @@ def createSchematicFromNetlist(
     should_open = _effective_open_ui(open_ui)
     if should_open:
         try:
-            result["ui"] = _open_ui_target(path=Path(result["asc_path"]))
+            result["ui"] = _open_schematic_ui(Path(result["asc_path"]))
         except Exception as exc:
             result["ui"] = {"opened": False, "error": str(exc)}
     result["ui_enabled"] = should_open
+    result["single_window_mode"] = _schematic_single_window_enabled
     return result
 
 
@@ -483,10 +542,11 @@ def createSchematicFromTemplate(
     should_open = _effective_open_ui(open_ui)
     if should_open:
         try:
-            result["ui"] = _open_ui_target(path=Path(result["asc_path"]))
+            result["ui"] = _open_schematic_ui(Path(result["asc_path"]))
         except Exception as exc:
             result["ui"] = {"opened": False, "error": str(exc)}
     result["ui_enabled"] = should_open
+    result["single_window_mode"] = _schematic_single_window_enabled
     return result
 
 
@@ -520,10 +580,11 @@ def syncSchematicFromNetlistFile(
     should_open = _effective_open_ui(open_ui)
     if should_open and result.get("updated"):
         try:
-            result["ui"] = _open_ui_target(path=Path(result["asc_path"]))
+            result["ui"] = _open_schematic_ui(Path(result["asc_path"]))
         except Exception as exc:
             result["ui"] = {"opened": False, "error": str(exc)}
     result["ui_enabled"] = should_open
+    result["single_window_mode"] = _schematic_single_window_enabled
     return result
 
 
@@ -569,10 +630,11 @@ def watchSchematicFromNetlistFile(
             latest_path = result["last_result"].get("asc_path")
         if latest_path:
             try:
-                result["ui"] = _open_ui_target(path=Path(latest_path))
+                result["ui"] = _open_schematic_ui(Path(latest_path))
             except Exception as exc:
                 result["ui"] = {"opened": False, "error": str(exc)}
     result["ui_enabled"] = should_open
+    result["single_window_mode"] = _schematic_single_window_enabled
     return result
 
 
@@ -999,8 +1061,11 @@ def _configure_runner(
     ltspice_binary: str | None,
     timeout: int,
     ui_enabled: bool | None = None,
+    schematic_single_window: bool | None = None,
+    schematic_live_path: str | None = None,
 ) -> None:
     global _runner, _loaded_netlist, _raw_cache, _state_path, _ui_enabled
+    global _schematic_single_window_enabled, _schematic_live_path
     _runner = LTspiceRunner(
         workdir=workdir,
         executable=ltspice_binary,
@@ -1010,6 +1075,17 @@ def _configure_runner(
     _loaded_netlist = None
     _raw_cache = {}
     _ui_enabled = _DEFAULT_UI_ENABLED if ui_enabled is None else bool(ui_enabled)
+    _schematic_single_window_enabled = (
+        _DEFAULT_SCHEMATIC_SINGLE_WINDOW
+        if schematic_single_window is None
+        else bool(schematic_single_window)
+    )
+    if schematic_live_path:
+        _schematic_live_path = Path(schematic_live_path).expanduser().resolve()
+    elif _DEFAULT_SCHEMATIC_LIVE_PATH:
+        _schematic_live_path = Path(_DEFAULT_SCHEMATIC_LIVE_PATH).expanduser().resolve()
+    else:
+        _schematic_live_path = (workdir / ".ui" / "live_schematic.asc").resolve()
     _load_run_state()
 
 
@@ -1045,6 +1121,24 @@ def main() -> None:
     )
     parser.set_defaults(ui_enabled=None)
     parser.add_argument(
+        "--schematic-single-window",
+        dest="schematic_single_window",
+        action="store_true",
+        help="Reuse a single LTspice window path for schematic UI opens (default).",
+    )
+    parser.add_argument(
+        "--schematic-multi-window",
+        dest="schematic_single_window",
+        action="store_false",
+        help="Open generated schematics directly (can create multiple UI windows).",
+    )
+    parser.set_defaults(schematic_single_window=None)
+    parser.add_argument(
+        "--schematic-live-path",
+        default=os.getenv("LTSPICE_MCP_SCHEMATIC_LIVE_PATH"),
+        help="Override path used for single-window schematic UI mode.",
+    )
+    parser.add_argument(
         "--transport",
         default="stdio",
         choices=["stdio", "sse"],
@@ -1057,6 +1151,8 @@ def main() -> None:
         ltspice_binary=args.ltspice_binary,
         timeout=args.timeout,
         ui_enabled=args.ui_enabled,
+        schematic_single_window=args.schematic_single_window,
+        schematic_live_path=args.schematic_live_path,
     )
     mcp.run(transport=args.transport)
 
