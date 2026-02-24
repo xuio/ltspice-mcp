@@ -89,6 +89,9 @@ Simulation and setup:
 - `renderLtspicePlotImage`
 - `setLtspiceUiEnabled`
 - `setSchematicUiSingleWindow`
+- `closeLtspiceWindow`
+- `startLtspiceRenderSession`
+- `endLtspiceRenderSession`
 - `openLtspiceUi`
 - `createSchematic`
 - `createSchematicFromNetlist`
@@ -194,6 +197,11 @@ Template notes:
 
 All three tools return image content blocks through MCP (not just file paths), and also include `image_path` in structured metadata for traceability.
 When these tools open LTspice to render an image, the window is closed automatically afterwards.
+
+Render sessions:
+- `startLtspiceRenderSession` opens a window once and returns `render_session_id`.
+- `renderLtspiceSchematicImage` and `renderLtspicePlotImage` accept `render_session_id` to reuse that window and skip auto-close.
+- `endLtspiceRenderSession` closes the associated window.
 
 Rendering backend options:
 - `backend=auto` (default): try real LTspice UI screenshot first, fall back to SVG rendering

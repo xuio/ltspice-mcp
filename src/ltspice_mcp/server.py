@@ -6,6 +6,7 @@ import json
 import mimetypes
 import os
 import shutil
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ from .analysis import (
 from .ltspice import (
     LTspiceRunner,
     capture_ltspice_window_screenshot,
+    close_ltspice_window,
     find_ltspice_executable,
     get_ltspice_version,
     is_ltspice_ui_running,
@@ -91,6 +93,7 @@ _schematic_live_path: Path = (
 )
 _symbol_library: SymbolLibrary | None = None
 _symbol_library_zip_path: Path | None = None
+_render_sessions: dict[str, dict[str, Any]] = {}
 
 
 def _save_run_state() -> None:
@@ -190,6 +193,10 @@ def _open_ui_target(
 
 def _effective_open_ui(open_ui: bool | None) -> bool:
     return _ui_enabled if open_ui is None else bool(open_ui)
+
+
+def _new_render_session_id() -> str:
+    return uuid.uuid4().hex
 
 
 def _guess_image_mime(path: Path) -> str:
@@ -680,6 +687,7 @@ def renderLtspiceSchematicImage(
     settle_seconds: float = 1.0,
     include_symbol_graphics: bool = True,
     lib_zip_path: str | None = None,
+    render_session_id: str | None = None,
 ) -> types.CallToolResult:
     """
     Render an LTspice schematic (.asc) to an image and return it through MCP.
@@ -692,24 +700,38 @@ def renderLtspiceSchematicImage(
 
     if normalized_backend in {"auto", "ltspice"}:
         try:
+            open_path = asc_resolved
+            title_hint = asc_resolved.name
+            close_after_capture = True
+            if render_session_id:
+                session = _render_sessions.get(render_session_id)
+                if not session:
+                    raise ValueError(f"Unknown render_session_id '{render_session_id}'")
+                if session.get("path") and Path(session["path"]) != asc_resolved:
+                    raise ValueError("render_session_id is bound to a different path")
+                open_path = None
+                title_hint = str(session.get("title_hint") or asc_resolved.name)
+                close_after_capture = False
             screenshot_payload = capture_ltspice_window_screenshot(
                 output_path=_resolve_png_output_path(
                     kind="schematics",
                     name=asc_resolved.stem,
                     output_path=output_path,
                 ),
-                open_path=asc_resolved,
-                title_hint=asc_resolved.name,
+                open_path=open_path,
+                title_hint=title_hint,
                 settle_seconds=settle_seconds,
                 downscale_factor=downscale_factor,
                 avoid_space_switch=True,
                 prefer_screencapturekit=True,
+                close_after_capture=close_after_capture,
             )
             payload = {
                 **screenshot_payload,
                 "asc_path": str(asc_resolved),
                 "backend_requested": normalized_backend,
                 "backend_used": "ltspice",
+                "render_session_id": render_session_id,
             }
             return _image_tool_result(payload)
         except Exception as exc:
@@ -756,6 +778,7 @@ def renderLtspicePlotImage(
     y_mode: str = "magnitude",
     x_log: bool | None = None,
     title: str | None = None,
+    render_session_id: str | None = None,
 ) -> types.CallToolResult:
     """
     Render one or more vectors from a RAW dataset to a plot image and return it through MCP.
@@ -771,18 +794,31 @@ def renderLtspicePlotImage(
 
     if normalized_backend in {"auto", "ltspice"}:
         try:
+            open_path = dataset.path
+            title_hint = dataset.path.name
+            close_after_capture = True
+            if render_session_id:
+                session = _render_sessions.get(render_session_id)
+                if not session:
+                    raise ValueError(f"Unknown render_session_id '{render_session_id}'")
+                if session.get("path") and Path(session["path"]) != dataset.path:
+                    raise ValueError("render_session_id is bound to a different path")
+                open_path = None
+                title_hint = str(session.get("title_hint") or dataset.path.name)
+                close_after_capture = False
             screenshot_payload = capture_ltspice_window_screenshot(
                 output_path=_resolve_png_output_path(
                     kind="plots",
                     name=f"{dataset.path.stem}_{vectors[0]}",
                     output_path=output_path,
                 ),
-                open_path=dataset.path,
-                title_hint=dataset.path.name,
+                open_path=open_path,
+                title_hint=title_hint,
                 settle_seconds=settle_seconds,
                 downscale_factor=downscale_factor,
                 avoid_space_switch=True,
                 prefer_screencapturekit=True,
+                close_after_capture=close_after_capture,
             )
             payload = {
                 **screenshot_payload,
@@ -791,6 +827,7 @@ def renderLtspicePlotImage(
                 "vectors": vectors,
                 "backend_requested": normalized_backend,
                 "backend_used": "ltspice",
+                "render_session_id": render_session_id,
                 **_step_payload(dataset, selected_step),
             }
             return _image_tool_result(payload)
@@ -841,6 +878,51 @@ def setSchematicUiSingleWindow(enabled: bool) -> dict[str, Any]:
     return {
         "schematic_single_window_default": _schematic_single_window_enabled,
         "schematic_live_path": str(_schematic_live_path),
+    }
+
+
+@mcp.tool()
+def closeLtspiceWindow(title_hint: str) -> dict[str, Any]:
+    """Close LTspice windows whose title contains title_hint."""
+    return close_ltspice_window(title_hint)
+
+
+@mcp.tool()
+def startLtspiceRenderSession(
+    path: str,
+    title_hint: str | None = None,
+) -> dict[str, Any]:
+    """Open an LTspice window once for repeated image rendering."""
+    session_id = _new_render_session_id()
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.exists():
+        raise FileNotFoundError(f"Render session path not found: {resolved}")
+    resolved_title = title_hint or resolved.name
+    open_event = open_in_ltspice_ui(resolved, background=True)
+    _render_sessions[session_id] = {
+        "path": str(resolved),
+        "title_hint": resolved_title,
+        "opened": open_event.get("opened", False),
+    }
+    return {
+        "render_session_id": session_id,
+        "path": str(resolved),
+        "title_hint": resolved_title,
+        "open_event": open_event,
+    }
+
+
+@mcp.tool()
+def endLtspiceRenderSession(render_session_id: str) -> dict[str, Any]:
+    """Close the LTspice window associated with a render session."""
+    session = _render_sessions.get(render_session_id)
+    if not session:
+        raise ValueError(f"Unknown render_session_id '{render_session_id}'")
+    close_event = close_ltspice_window(str(session.get("title_hint") or ""))
+    _render_sessions.pop(render_session_id, None)
+    return {
+        "render_session_id": render_session_id,
+        "close_event": close_event,
     }
 
 
