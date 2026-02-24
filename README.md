@@ -214,6 +214,12 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 Schematic tests include fixture snapshots under `tests/fixtures/schematic/*.asc` for deterministic rendering checks.
 
+Real ScreenCaptureKit integration tests are available and disabled by default:
+
+```bash
+LTSPICE_MCP_RUN_REAL_SCK=1 PYTHONPATH=src python3 -m unittest tests.test_screencapturekit_integration -v
+```
+
 ## Run MCP smoke test
 
 This performs an end-to-end MCP stdio session, runs LTspice on a sample circuit, and validates the core tools.
