@@ -99,11 +99,13 @@ Simulation and setup:
 - `createSchematicFromTemplate`
 - `syncSchematicFromNetlistFile`
 - `watchSchematicFromNetlistFile`
+- `validateSchematic`
 - `loadCircuit`
 - `loadNetlistFromFile`
 - `runSimulation`
 - `simulateNetlist`
 - `simulateNetlistFile`
+- `simulateSchematicFile`
 - `listRuns`
 - `getRunDetails`
 
@@ -176,6 +178,12 @@ Per simulation call:
 - `loadCircuit`: also attempts netlist-to-schematic generation and returns `asc_path` when successful
 
 All create/sync/watch schematic tools return an `asc_path` and support `open_ui` to open the resulting schematic in LTspice.
+
+Schematic debug workflow:
+- `validateSchematic`: preflight checks for `.asc` files (components, ground flag, simulation directives)
+- `simulateSchematicFile`: runs `.asc` directly in batch mode and optionally includes preflight validation in the response
+- use `abort_on_validation_error=true` when you want to block execution until preflight issues are fixed
+- schematics generated from netlists/templates include a sidecar `.cir`; `simulateSchematicFile` prefers this sidecar for reliable batch execution
 
 Template notes:
 - built-in template JSON: `src/ltspice_mcp/schematic_templates.json`

@@ -768,8 +768,15 @@ def build_schematic_from_netlist(
 
     out_path = _resolve_output_path(workdir=workdir, circuit_name=circuit_name, output_path=output_path)
     builder.write(out_path)
+
+    normalized_netlist = netlist_content.rstrip() + "\n"
+    if not any(line.strip().lower() == ".end" for line in normalized_netlist.splitlines()):
+        normalized_netlist += ".end\n"
+    sidecar_netlist_path = out_path.with_suffix(".cir")
+    sidecar_netlist_path.write_text(normalized_netlist, encoding="utf-8")
     return {
         "asc_path": str(out_path),
+        "netlist_path": str(sidecar_netlist_path),
         "components": len(components),
         "nets": len(net_to_points),
         "wires": len(builder.wires),

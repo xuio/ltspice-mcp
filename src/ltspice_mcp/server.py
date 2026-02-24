@@ -445,6 +445,86 @@ def _sanitize_representation(value: str) -> str:
     return value
 
 
+_SIM_DIRECTIVE_PREFIXES = (
+    ".ac",
+    ".dc",
+    ".four",
+    ".noise",
+    ".op",
+    ".pz",
+    ".tf",
+    ".tran",
+)
+
+
+def _validate_schematic_file(path: Path) -> dict[str, Any]:
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    components = 0
+    wires = 0
+    flags = 0
+    has_ground = False
+    directives: list[str] = []
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("SYMBOL "):
+            components += 1
+            continue
+        if line.startswith("WIRE "):
+            wires += 1
+            continue
+        if line.startswith("FLAG "):
+            flags += 1
+            parts = line.split()
+            if len(parts) >= 4 and parts[-1].strip().lower() in {"0", "gnd", "ground"}:
+                has_ground = True
+            continue
+        if line.startswith("TEXT ") and "!" in line:
+            directive = line.split("!", 1)[1].strip()
+            if directive:
+                directives.append(directive)
+
+    sim_directives = [
+        directive
+        for directive in directives
+        if directive.lower().startswith(_SIM_DIRECTIVE_PREFIXES)
+    ]
+
+    issues: list[str] = []
+    warnings: list[str] = []
+    suggestions: list[str] = []
+
+    if components == 0:
+        issues.append("No components were found in the schematic.")
+        suggestions.append("Add at least one SYMBOL entry before simulation.")
+    if not has_ground:
+        issues.append("No ground flag (`FLAG ... 0`) was found in the schematic.")
+        suggestions.append("Add at least one ground symbol/net label (`0`).")
+    if not sim_directives:
+        issues.append("No simulation directive was found in schematic TEXT commands.")
+        suggestions.append("Add a directive such as `.op`, `.tran`, `.ac`, or `.dc`.")
+    if wires == 0:
+        warnings.append("No wire segments were found; component pins may be unconnected.")
+    if path.suffix.lower() != ".asc":
+        warnings.append("Path does not use `.asc` extension; LTspice usually expects schematic files as `.asc`.")
+
+    return {
+        "asc_path": str(path),
+        "components": components,
+        "wires": wires,
+        "flags": flags,
+        "has_ground": has_ground,
+        "directives": directives,
+        "simulation_directives": sim_directives,
+        "issues": issues,
+        "warnings": warnings,
+        "suggestions": suggestions,
+        "valid": len(issues) == 0,
+    }
+
+
 _load_run_state()
 
 
@@ -1276,6 +1356,80 @@ def simulateNetlistFile(
     )
     response = _run_payload(run, include_output=False, log_tail_lines=120)
     response["ui_enabled"] = effective_ui
+    if ui_events:
+        response["ui_events"] = ui_events
+    return response
+
+
+@mcp.tool()
+def validateSchematic(asc_path: str) -> dict[str, Any]:
+    """
+    Validate a schematic (.asc) for simulation readiness.
+
+    Checks for components, ground flag, and simulation directives in TEXT commands.
+    """
+    path = Path(asc_path).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Schematic file not found: {path}")
+    return _validate_schematic_file(path)
+
+
+@mcp.tool()
+def simulateSchematicFile(
+    asc_path: str,
+    ascii_raw: bool = False,
+    timeout_seconds: int | None = None,
+    show_ui: bool | None = None,
+    open_raw_after_run: bool = False,
+    validate_first: bool = True,
+    abort_on_validation_error: bool = False,
+) -> dict[str, Any]:
+    """
+    Run LTspice batch simulation for an existing schematic (.asc) file.
+
+    Optional preflight validation is included to help agents debug schematics before simulation.
+    """
+    global _loaded_netlist
+    path = Path(asc_path).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Schematic file not found: {path}")
+
+    validation: dict[str, Any] | None = None
+    if validate_first:
+        validation = _validate_schematic_file(path)
+        if abort_on_validation_error and not validation.get("valid", False):
+            raise ValueError(
+                "Schematic validation failed before simulation. "
+                f"Issues: {validation.get('issues', [])}"
+            )
+
+    run_target = path
+    sidecar_netlist: Path | None = None
+    if path.suffix.lower() == ".asc":
+        for suffix in (".cir", ".net", ".sp", ".spi"):
+            candidate = path.with_suffix(suffix)
+            if candidate.exists():
+                run_target = candidate
+                sidecar_netlist = candidate
+                break
+
+    _loaded_netlist = run_target
+    run, ui_events, effective_ui = _run_simulation_with_ui(
+        netlist_path=run_target,
+        ascii_raw=ascii_raw,
+        timeout_seconds=timeout_seconds,
+        show_ui=show_ui,
+        open_raw_after_run=open_raw_after_run,
+    )
+    response = _run_payload(run, include_output=False, log_tail_lines=120)
+    response["schematic_path"] = str(path)
+    response["run_target_path"] = str(run_target)
+    response["used_sidecar_netlist"] = sidecar_netlist is not None
+    if sidecar_netlist is not None:
+        response["sidecar_netlist_path"] = str(sidecar_netlist)
+    response["ui_enabled"] = effective_ui
+    if validation is not None:
+        response["schematic_validation"] = validation
     if ui_events:
         response["ui_events"] = ui_events
     return response

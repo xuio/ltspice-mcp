@@ -99,6 +99,8 @@ class TestSchematicBuilders(unittest.TestCase):
         )
         asc = Path(result["asc_path"])
         self.assertTrue(asc.exists())
+        netlist_sidecar = Path(result["netlist_path"])
+        self.assertTrue(netlist_sidecar.exists())
         text = asc.read_text(encoding="utf-8")
         self.assertEqual(text, self._fixture_text("netlist_case.asc"))
 

@@ -85,7 +85,9 @@ async def _run_smoke_test(args: argparse.Namespace) -> None:
                 "createSchematicFromTemplate",
                 "syncSchematicFromNetlistFile",
                 "watchSchematicFromNetlistFile",
+                "validateSchematic",
                 "simulateNetlist",
+                "simulateSchematicFile",
                 "getPlotNames",
                 "getVectorsInfo",
                 "getVectorData",
@@ -191,6 +193,30 @@ async def _run_smoke_test(args: argparse.Namespace) -> None:
             _require(isinstance(template_schematic, dict), "createSchematicFromTemplate did not return an object")
             _require(template_schematic.get("asc_path"), "createSchematicFromTemplate missing asc_path")
             print("Template schematic check passed")
+
+            schematic_validation = _extract_call_result(
+                await session.call_tool(
+                    "validateSchematic",
+                    {"asc_path": template_schematic.get("asc_path")},
+                )
+            )
+            _require(isinstance(schematic_validation, dict), "validateSchematic did not return an object")
+            _require(schematic_validation.get("valid") is True, "validateSchematic reported invalid template schematic")
+            print("Schematic validation check passed")
+
+            schematic_run = _extract_call_result(
+                await session.call_tool(
+                    "simulateSchematicFile",
+                    {
+                        "asc_path": template_schematic.get("asc_path"),
+                        "validate_first": True,
+                        "abort_on_validation_error": True,
+                    },
+                )
+            )
+            _require(isinstance(schematic_run, dict), "simulateSchematicFile did not return an object")
+            _require(schematic_run.get("succeeded") is True, f"simulateSchematicFile failed: {schematic_run}")
+            print("Schematic simulation check passed")
 
             schematic_image = _extract_call_result(
                 await session.call_tool(
