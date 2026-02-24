@@ -34,6 +34,7 @@ class TestOpenInLtspiceUi(unittest.TestCase):
         self.assertTrue(payload["opened"])
         self.assertTrue(payload["background"])
         self.assertEqual(payload["command"][:2], ["open", "-g"])
+        self.assertIn("-j", payload["command"])
         self.assertIn(str(target.resolve()), payload["command"])
 
 

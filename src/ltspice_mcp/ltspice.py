@@ -207,7 +207,9 @@ def open_in_ltspice_ui(
 
     command = ["open"]
     if background:
-        command.append("-g")
+        # `-g` avoids foreground activation and `-j` asks LaunchServices to launch hidden.
+        # Together they reduce chances of macOS Space switches during automation.
+        command.extend(["-g", "-j"])
     command.extend(["-a", "LTspice", str(target)])
     proc = subprocess.run(
         command,

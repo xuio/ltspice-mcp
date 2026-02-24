@@ -203,7 +203,7 @@ Downscale:
 
 LTspice screenshot behavior:
 - uses ScreenCaptureKit display-crop capture constrained to LTspice window bounds when `backend=ltspice`
-- opens targets in background (`open -g`) to avoid forcing a Space switch while rendering
+- opens targets in hidden/background mode (`open -g -j`) to reduce forced Space switches while rendering
 - designed to keep working even if LTspice is on a different macOS Space
 
 ## Run tests
