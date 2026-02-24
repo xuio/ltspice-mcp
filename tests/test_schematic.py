@@ -106,6 +106,7 @@ class TestSchematicBuilders(unittest.TestCase):
         listing = list_schematic_templates()
         names = {entry["name"] for entry in listing["templates"]}
         self.assertIn("rc_lowpass_ac", names)
+        self.assertIn("non_inverting_opamp_spec", names)
 
         output_path = self.temp_dir / "template_case.asc"
         result = build_schematic_from_template(
@@ -128,6 +129,28 @@ class TestSchematicBuilders(unittest.TestCase):
         self.assertIn("SYMATTR Value AC 2", text)
         self.assertIn("SYMATTR Value 2k", text)
         self.assertIn("SYMATTR Value 2u", text)
+
+    def test_non_inverting_opamp_template_rendering(self) -> None:
+        output_path = self.temp_dir / "non_inverting_template.asc"
+        result = build_schematic_from_template(
+            workdir=self.temp_dir,
+            template_name="non_inverting_opamp_spec",
+            parameters={
+                "vin_signal": "SINE(0 0.05 2k) AC 1",
+                "rf_value": "22k",
+                "rg_value": "2k",
+                "vplus": "12",
+                "vminus": "-12",
+            },
+            circuit_name="non_inverting_template",
+            output_path=str(output_path),
+        )
+        text = Path(result["asc_path"]).read_text(encoding="utf-8")
+        self.assertIn("SYMBOL UniversalOpAmp2", text)
+        self.assertIn("SYMATTR Value 22k", text)
+        self.assertIn("SYMATTR Value 2k", text)
+        self.assertIn("SYMATTR Value 12", text)
+        self.assertIn("SYMATTR Value -12", text)
 
     def test_sync_regenerates_only_on_change(self) -> None:
         netlist = self.temp_dir / "sync_case.cir"

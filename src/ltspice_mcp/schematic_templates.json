@@ -64,6 +64,188 @@
       "directives": [
         ".op"
       ]
+    },
+    {
+      "name": "non_inverting_opamp_spec",
+      "description": "Non-inverting op-amp amplifier with split supplies and feedback divider.",
+      "type": "spec",
+      "circuit_name": "non_inverting_opamp_spec",
+      "sheet_width": 1600,
+      "sheet_height": 1100,
+      "components": [
+        {
+          "symbol": "voltage",
+          "reference": "V1",
+          "x": 200,
+          "y": 360,
+          "value": "{vin_signal}"
+        },
+        {
+          "symbol": "UniversalOpAmp2",
+          "reference": "U1",
+          "x": 600,
+          "y": 340,
+          "value": "UniversalOpamp2"
+        },
+        {
+          "symbol": "res",
+          "reference": "R1",
+          "x": 696,
+          "y": 268,
+          "orientation": "M270",
+          "value": "{rf_value}"
+        },
+        {
+          "symbol": "res",
+          "reference": "R2",
+          "x": 472,
+          "y": 308,
+          "orientation": "R0",
+          "value": "{rg_value}"
+        },
+        {
+          "symbol": "voltage",
+          "reference": "V2",
+          "x": 760,
+          "y": 220,
+          "value": "{vplus}"
+        },
+        {
+          "symbol": "voltage",
+          "reference": "V3",
+          "x": 760,
+          "y": 380,
+          "value": "{vminus}"
+        }
+      ],
+      "wires": [
+        {
+          "x1": 200,
+          "y1": 376,
+          "x2": 520,
+          "y2": 376
+        },
+        {
+          "x1": 520,
+          "y1": 376,
+          "x2": 520,
+          "y2": 356
+        },
+        {
+          "x1": 520,
+          "y1": 356,
+          "x2": 568,
+          "y2": 356
+        },
+        {
+          "x1": 488,
+          "y1": 324,
+          "x2": 568,
+          "y2": 324
+        },
+        {
+          "x1": 632,
+          "y1": 340,
+          "x2": 760,
+          "y2": 340
+        },
+        {
+          "x1": 632,
+          "y1": 340,
+          "x2": 680,
+          "y2": 340
+        },
+        {
+          "x1": 680,
+          "y1": 340,
+          "x2": 680,
+          "y2": 252
+        },
+        {
+          "x1": 568,
+          "y1": 324,
+          "x2": 600,
+          "y2": 324
+        },
+        {
+          "x1": 600,
+          "y1": 324,
+          "x2": 600,
+          "y2": 252
+        },
+        {
+          "x1": 760,
+          "y1": 236,
+          "x2": 680,
+          "y2": 236
+        },
+        {
+          "x1": 680,
+          "y1": 236,
+          "x2": 680,
+          "y2": 308
+        },
+        {
+          "x1": 680,
+          "y1": 308,
+          "x2": 600,
+          "y2": 308
+        },
+        {
+          "x1": 760,
+          "y1": 396,
+          "x2": 680,
+          "y2": 396
+        },
+        {
+          "x1": 680,
+          "y1": 396,
+          "x2": 680,
+          "y2": 372
+        },
+        {
+          "x1": 680,
+          "y1": 372,
+          "x2": 600,
+          "y2": 372
+        }
+      ],
+      "labels": [
+        {
+          "x": 200,
+          "y": 376,
+          "name": "in"
+        },
+        {
+          "x": 760,
+          "y": 340,
+          "name": "out"
+        },
+        {
+          "x": 200,
+          "y": 456,
+          "name": "0"
+        },
+        {
+          "x": 488,
+          "y": 404,
+          "name": "0"
+        },
+        {
+          "x": 760,
+          "y": 316,
+          "name": "0"
+        },
+        {
+          "x": 760,
+          "y": 476,
+          "name": "0"
+        }
+      ],
+      "directives": [
+        ".tran 0 10m",
+        ".op"
+      ]
     }
   ]
 }

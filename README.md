@@ -179,6 +179,7 @@ All create/sync/watch schematic tools return an `asc_path` and support `open_ui`
 
 Template notes:
 - built-in template JSON: `src/ltspice_mcp/schematic_templates.json`
+- built-in examples include `rc_lowpass_ac`, `rl_highpass_ac`, `resistor_divider_spec`, and `non_inverting_opamp_spec`
 - string fields support `{placeholder}` substitution via `parameters`
 - missing placeholders are left as-is (useful for LTspice param braces like `{rval}`)
 
