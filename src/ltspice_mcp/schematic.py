@@ -601,6 +601,46 @@ def _canonical_net(name: str) -> str:
     return name.strip()
 
 
+def _choose_two_pin_orientation(symbol: str, nodes: list[str]) -> str:
+    if len(nodes) < 2:
+        return "R0"
+    n1 = _canonical_net(nodes[0])
+    n2 = _canonical_net(nodes[1])
+    symbol_key = symbol.strip().lower()
+
+    if symbol_key in {"res", "cap", "ind", "diode"}:
+        if n1 == "0" and n2 != "0":
+            return "R180"
+        if n2 == "0" and n1 != "0":
+            return "R0"
+        # Horizontal by default when both pins are signal nets.
+        return "M90"
+
+    if symbol_key in {"voltage", "current"}:
+        if n1 == "0" and n2 != "0":
+            return "R180"
+        return "R0"
+
+    return "R0"
+
+
+def _route_two_point_net(
+    builder: SchematicBuilder,
+    point_a: tuple[int, int],
+    point_b: tuple[int, int],
+) -> None:
+    x1, y1 = point_a
+    x2, y2 = point_b
+    if (x1, y1) == (x2, y2):
+        return
+    if x1 == x2 or y1 == y2:
+        builder.add_wire(x1, y1, x2, y2)
+        return
+    # Manhattan route with one bend keeps LTspice schematics legible.
+    builder.add_wire(x1, y1, x2, y1)
+    builder.add_wire(x2, y1, x2, y2)
+
+
 def build_schematic_from_netlist(
     *,
     workdir: Path,
@@ -648,6 +688,7 @@ def build_schematic_from_netlist(
             warnings.append(f"Could not parse nodes for element '{ref}'.")
             continue
 
+        canonical_nodes = [_canonical_net(nodes[0]), _canonical_net(nodes[1])]
         value = " ".join(tokens[3:]) if len(tokens) > 3 else None
         index = len(components)
         columns = max(1, (sheet_width - 160) // 160)
@@ -658,10 +699,10 @@ def build_schematic_from_netlist(
             reference=ref,
             x=x,
             y=y,
-            orientation="R0",
+            orientation=_choose_two_pin_orientation(symbol, canonical_nodes),
             value=value,
         )
-        components.append((placement, [_canonical_net(nodes[0]), _canonical_net(nodes[1])]))
+        components.append((placement, canonical_nodes))
         builder.add_component(placement)
 
     if not components:
@@ -677,6 +718,7 @@ def build_schematic_from_netlist(
                 continue
             net_to_points.setdefault(net_name, []).append((px, py))
 
+    multi_net_index = 0
     for net_name, points in net_to_points.items():
         unique_points = sorted(set(points))
         if not unique_points:
@@ -690,15 +732,22 @@ def build_schematic_from_netlist(
             builder.add_flag(x, y, net_name)
             continue
 
+        if len(unique_points) == 2:
+            point_a, point_b = unique_points
+            _route_two_point_net(builder, point_a, point_b)
+            label_point = min(unique_points, key=lambda point: (point[0], point[1]))
+            builder.add_flag(label_point[0], label_point[1], net_name)
+            continue
+
         trunk_x = min(point[0] for point in unique_points) - 40
         y_min = min(point[1] for point in unique_points)
-        y_max = max(point[1] for point in unique_points)
-        if y_min != y_max:
-            builder.add_wire(trunk_x, y_min, trunk_x, y_max)
+        lane_y = max(32, y_min - 48 - (multi_net_index * 32))
+        multi_net_index += 1
+        builder.add_wire(trunk_x, lane_y, max(point[0] for point in unique_points), lane_y)
         for x, y in unique_points:
-            if x != trunk_x:
-                builder.add_wire(x, y, trunk_x, y)
-        builder.add_flag(trunk_x, y_min, net_name)
+            if y != lane_y:
+                builder.add_wire(x, y, x, lane_y)
+        builder.add_flag(trunk_x, lane_y, net_name)
 
     for idx, directive in enumerate(directives):
         builder.add_directive(48, sheet_height - 140 + idx * 24, directive)

@@ -7,6 +7,7 @@ from pathlib import Path
 from ltspice_mcp.schematic import (
     PinDef,
     SymbolDef,
+    _transform_point,
     build_schematic_from_template,
     build_schematic_from_netlist,
     build_schematic_from_spec,
@@ -36,12 +37,10 @@ class _StubLibrary:
 
     def pin_offset(self, symbol: str, orientation: str, spice_order: int) -> tuple[int, int]:
         _ = symbol
-        if orientation != "R0":
-            raise ValueError("Test stub only supports R0")
         pin = self.get("stub").pin_for_order(spice_order)
         if pin is None:
             raise ValueError(f"Unsupported spice_order {spice_order}")
-        return pin.x, pin.y
+        return _transform_point(pin.x, pin.y, orientation)
 
 
 class TestSchematicBuilders(unittest.TestCase):
