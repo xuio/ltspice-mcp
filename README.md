@@ -193,6 +193,7 @@ Template notes:
 - `renderLtspicePlotImage`: returns rendered RAW plot image content plus metadata
 
 All three tools return image content blocks through MCP (not just file paths), and also include `image_path` in structured metadata for traceability.
+When these tools open LTspice to render an image, the window is closed automatically afterwards.
 
 Rendering backend options:
 - `backend=auto` (default): try real LTspice UI screenshot first, fall back to SVG rendering
@@ -204,7 +205,7 @@ Downscale:
 
 LTspice screenshot behavior:
 - uses ScreenCaptureKit direct-window capture (`SCContentFilter(desktopIndependentWindow:)`) when `backend=ltspice`
-- tries hidden/background open first (`open -g -j`) to reduce Space switching
+- opens LTspice in the background (`open -g -j`) to reduce Space switching
 - captures the first frame from an `SCStream` for reliability, including LTspice windows that are off-screen/in other Spaces
 
 ## Run tests

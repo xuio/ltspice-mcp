@@ -33,6 +33,7 @@ class TestOpenInLtspiceUi(unittest.TestCase):
 
         self.assertTrue(payload["opened"])
         self.assertTrue(payload["background"])
+        self.assertEqual(payload["background_requested"], True)
         self.assertEqual(payload["command"][:2], ["open", "-g"])
         self.assertIn("-j", payload["command"])
         self.assertIn(str(target.resolve()), payload["command"])
@@ -91,10 +92,12 @@ class TestScreenCaptureKitPath(unittest.TestCase):
                 "ltspice_mcp.ltspice._capture_ltspice_window_with_screencapturekit",
                 side_effect=_sck_side_effect,
             ) as sck_mock,
+            patch("ltspice_mcp.ltspice.close_ltspice_window") as close_mock,
             patch("ltspice_mcp.ltspice._downscale_image_file", return_value={"downscaled": True}),
             patch("ltspice_mcp.ltspice._probe_image_dimensions", return_value=(300, 200)),
         ):
             open_mock.return_value = {"opened": True, "path": str(open_path)}
+            close_mock.return_value = {"closed": True, "title_hint": "source.asc"}
             payload = capture_ltspice_window_screenshot(
                 output_path=output_path,
                 open_path=open_path,
@@ -105,6 +108,7 @@ class TestScreenCaptureKitPath(unittest.TestCase):
             )
 
         open_mock.assert_called_once_with(open_path, background=True)
+        close_mock.assert_called_once_with("source.asc")
         self.assertEqual(sck_mock.call_count, 1)
         self.assertEqual(payload["capture_backend"], "screencapturekit")
         self.assertEqual(payload["window_id"], 777)
@@ -112,6 +116,7 @@ class TestScreenCaptureKitPath(unittest.TestCase):
         self.assertEqual(payload["capture_command"], None)
         self.assertEqual(payload["width"], 300)
         self.assertEqual(payload["height"], 200)
+        self.assertTrue(payload["close_event"]["closed"])
 
     def test_capture_ltspice_window_screenshot_raises_on_sck_failure_when_preferred(self) -> None:
         temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_sck_fail_test_"))
@@ -124,8 +129,10 @@ class TestScreenCaptureKitPath(unittest.TestCase):
                 "ltspice_mcp.ltspice._capture_ltspice_window_with_screencapturekit",
                 side_effect=RuntimeError("SCK failed"),
             ),
+            patch("ltspice_mcp.ltspice.close_ltspice_window") as close_mock,
         ):
             open_mock.return_value = {"opened": True, "path": str(open_path)}
+            close_mock.return_value = {"closed": True, "title_hint": "source.asc"}
             with self.assertRaises(RuntimeError):
                 capture_ltspice_window_screenshot(
                     output_path=temp_dir / "shot.png",
@@ -133,6 +140,7 @@ class TestScreenCaptureKitPath(unittest.TestCase):
                     settle_seconds=0.0,
                     prefer_screencapturekit=True,
                 )
+            close_mock.assert_called_once_with("source.asc")
 
     def test_capture_ltspice_window_screenshot_falls_back_when_sck_disabled(self) -> None:
         temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_sck_disabled_test_"))
@@ -147,10 +155,12 @@ class TestScreenCaptureKitPath(unittest.TestCase):
         with (
             patch("ltspice_mcp.ltspice.open_in_ltspice_ui") as open_mock,
             patch("ltspice_mcp.ltspice.subprocess.run", side_effect=_run_side_effect),
+            patch("ltspice_mcp.ltspice.close_ltspice_window") as close_mock,
             patch("ltspice_mcp.ltspice._downscale_image_file", return_value={"downscaled": False}),
             patch("ltspice_mcp.ltspice._probe_image_dimensions", return_value=(640, 480)),
         ):
             open_mock.return_value = {"opened": True, "path": str(open_path)}
+            close_mock.return_value = {"closed": True, "title_hint": "source.asc"}
             payload = capture_ltspice_window_screenshot(
                 output_path=output_path,
                 open_path=open_path,
@@ -161,6 +171,8 @@ class TestScreenCaptureKitPath(unittest.TestCase):
         self.assertEqual(payload["capture_backend"], "screencapture")
         self.assertIsInstance(payload["capture_command"], list)
         self.assertEqual(payload["capture_command"][:2], ["screencapture", "-x"])
+        close_mock.assert_called_once_with("source.asc")
+        self.assertTrue(payload["close_event"]["closed"])
 
 
 if __name__ == "__main__":

@@ -197,7 +197,7 @@ def is_ltspice_ui_running() -> bool:
 def open_in_ltspice_ui(
     path: str | Path,
     *,
-    background: bool = False,
+    background: bool = True,
 ) -> dict[str, Any]:
     target = Path(path).expanduser().resolve()
     if not target.exists():
@@ -206,7 +206,8 @@ def open_in_ltspice_ui(
         raise RuntimeError("LTspice UI integration is currently implemented for macOS only.")
 
     command = ["open"]
-    if background:
+    effective_background = True
+    if effective_background:
         # `-g` avoids foreground activation and `-j` asks LaunchServices to launch hidden.
         # Together they reduce chances of macOS Space switches during automation.
         command.extend(["-g", "-j"])
@@ -221,8 +222,54 @@ def open_in_ltspice_ui(
         "opened": proc.returncode == 0,
         "return_code": proc.returncode,
         "path": str(target),
-        "background": background,
+        "background_requested": background,
+        "background": effective_background,
         "command": command,
+        "stdout": proc.stdout.strip(),
+        "stderr": proc.stderr.strip(),
+    }
+
+
+def close_ltspice_window(title_hint: str) -> dict[str, Any]:
+    if not title_hint.strip():
+        return {
+            "closed": False,
+            "return_code": 1,
+            "title_hint": title_hint,
+            "error": "title_hint must be non-empty to close LTspice window",
+        }
+    if platform.system() != "Darwin":
+        raise RuntimeError("LTspice UI integration is currently implemented for macOS only.")
+
+    escaped = title_hint.replace('"', '\\"')
+    script = (
+        'tell application "System Events"\n'
+        '  if not (exists process "LTspice") then return\n'
+        '  tell process "LTspice"\n'
+        f'    set matches to (windows whose name contains "{escaped}")\n'
+        '    repeat with w in matches\n'
+        '      try\n'
+        '        click (first button of w whose subrole is "AXCloseButton")\n'
+        '      on error\n'
+        '        try\n'
+        '          perform action "AXCloseButton" of w\n'
+        '        end try\n'
+        '      end try\n'
+        '    end repeat\n'
+        '  end tell\n'
+        'end tell'
+    )
+    proc = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return {
+        "closed": proc.returncode == 0,
+        "return_code": proc.returncode,
+        "title_hint": title_hint,
+        "command": ["osascript", "-e", script],
         "stdout": proc.stdout.strip(),
         "stderr": proc.stderr.strip(),
     }
@@ -564,11 +611,14 @@ def capture_ltspice_window_screenshot(
     title_hint: str | None = None,
     avoid_space_switch: bool = True,
     prefer_screencapturekit: bool = True,
+    close_after_capture: bool = True,
 ) -> dict[str, Any]:
     target = Path(output_path).expanduser().resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
 
     open_event: dict[str, Any] | None = None
+    close_event: dict[str, Any] | None = None
+    opened_window = False
     if open_path is not None:
         open_event = open_in_ltspice_ui(
             open_path,
@@ -576,6 +626,7 @@ def capture_ltspice_window_screenshot(
         )
         if not open_event.get("opened", False):
             raise RuntimeError(f"Failed to open LTspice UI target: {open_event}")
+        opened_window = True
 
     if settle_seconds > 0:
         time.sleep(settle_seconds)
@@ -589,36 +640,49 @@ def capture_ltspice_window_screenshot(
     window_id: int | None = None
     window_info: dict[str, Any] = {}
 
-    if prefer_screencapturekit:
-        try:
-            window_info = _capture_ltspice_window_with_screencapturekit(
-                output_path=target,
-                title_hint=title_hint,
-                timeout_seconds=max(10.0, settle_seconds + 20.0),
-            )
-            capture_backend = "screencapturekit"
-            raw_window_id = window_info.get("window_id")
-            if isinstance(raw_window_id, int):
-                window_id = raw_window_id
-        except Exception as exc:
-            raise RuntimeError(f"ScreenCaptureKit capture failed: {exc}") from exc
+    try:
+        if prefer_screencapturekit:
+            try:
+                window_info = _capture_ltspice_window_with_screencapturekit(
+                    output_path=target,
+                    title_hint=title_hint,
+                    timeout_seconds=max(10.0, settle_seconds + 20.0),
+                )
+                capture_backend = "screencapturekit"
+                raw_window_id = window_info.get("window_id")
+                if isinstance(raw_window_id, int):
+                    window_id = raw_window_id
+            except Exception as exc:
+                raise RuntimeError(f"ScreenCaptureKit capture failed: {exc}") from exc
 
-    if capture_backend != "screencapturekit":
-        # Optional non-ScreenCaptureKit path when explicitly requested.
-        capture_command = ["screencapture", "-x", str(target)]
-        capture = subprocess.run(
-            capture_command,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if capture.returncode != 0:
-            raise RuntimeError(
-                f"screencapture failed (rc={capture.returncode}): {capture.stderr.strip()}"
+        if capture_backend != "screencapturekit":
+            # Optional non-ScreenCaptureKit path when explicitly requested.
+            capture_command = ["screencapture", "-x", str(target)]
+            capture = subprocess.run(
+                capture_command,
+                capture_output=True,
+                text=True,
+                check=False,
             )
-        capture_stderr = capture.stderr.strip()
-    else:
-        capture = None
+            if capture.returncode != 0:
+                raise RuntimeError(
+                    f"screencapture failed (rc={capture.returncode}): {capture.stderr.strip()}"
+                )
+            capture_stderr = capture.stderr.strip()
+        else:
+            capture = None
+    finally:
+        if opened_window and close_after_capture:
+            close_title = title_hint or (Path(open_path).name if open_path is not None else "")
+            try:
+                close_event = close_ltspice_window(close_title)
+            except Exception as exc:
+                close_event = {
+                    "closed": False,
+                    "return_code": 1,
+                    "title_hint": close_title,
+                    "error": str(exc),
+                }
 
     if not target.exists():
         raise FileNotFoundError(f"Screenshot capture did not produce file: {target}")
@@ -633,6 +697,7 @@ def capture_ltspice_window_screenshot(
         "capture_backend": capture_backend,
         "capture_window_info": window_info,
         "open_event": open_event,
+        "close_event": close_event,
         "avoid_space_switch": avoid_space_switch,
         "downscale_factor": float(downscale_factor),
         "downscale": downscale_info,

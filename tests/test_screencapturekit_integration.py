@@ -94,6 +94,7 @@ class TestScreenCaptureKitIntegration(unittest.TestCase):
         self.assertEqual(payload.get("downscale_factor"), 0.6)
         self.assertGreater(int(payload.get("width") or 0), 0)
         self.assertGreater(int(payload.get("height") or 0), 0)
+        self.assertTrue(payload.get("close_event", {}).get("closed"))
 
 
 if __name__ == "__main__":
