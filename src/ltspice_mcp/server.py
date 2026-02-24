@@ -28,7 +28,14 @@ from .ltspice import (
 )
 from .models import RawDataset, SimulationRun
 from .raw_parser import RawParseError, parse_raw_file
-from .schematic import build_schematic_from_netlist, build_schematic_from_spec
+from .schematic import (
+    build_schematic_from_netlist,
+    build_schematic_from_spec,
+    build_schematic_from_template,
+    list_schematic_templates,
+    sync_schematic_from_netlist_file,
+    watch_schematic_from_netlist_file,
+)
 
 
 mcp = FastMCP("ltspice-mcp-macos")
@@ -436,6 +443,135 @@ def createSchematicFromNetlist(
             result["ui"] = _open_ui_target(path=Path(result["asc_path"]))
         except Exception as exc:
             result["ui"] = {"opened": False, "error": str(exc)}
+    result["ui_enabled"] = should_open
+    return result
+
+
+@mcp.tool()
+def listSchematicTemplates(template_path: str | None = None) -> dict[str, Any]:
+    """List available schematic templates from the built-in or user-provided JSON file."""
+    return list_schematic_templates(template_path=template_path)
+
+
+@mcp.tool()
+def createSchematicFromTemplate(
+    template_name: str,
+    parameters: dict[str, Any] | None = None,
+    circuit_name: str | None = None,
+    output_path: str | None = None,
+    sheet_width: int | None = None,
+    sheet_height: int | None = None,
+    template_path: str | None = None,
+    open_ui: bool | None = None,
+) -> dict[str, Any]:
+    """
+    Create an LTspice .asc schematic from a JSON template.
+
+    Templates support type=netlist (auto-layout) and type=spec (explicit placement).
+    """
+    result = build_schematic_from_template(
+        workdir=_runner.workdir,
+        template_name=template_name,
+        parameters=parameters,
+        circuit_name=circuit_name,
+        output_path=output_path,
+        sheet_width=sheet_width,
+        sheet_height=sheet_height,
+        template_path=template_path,
+    )
+
+    should_open = _effective_open_ui(open_ui)
+    if should_open:
+        try:
+            result["ui"] = _open_ui_target(path=Path(result["asc_path"]))
+        except Exception as exc:
+            result["ui"] = {"opened": False, "error": str(exc)}
+    result["ui_enabled"] = should_open
+    return result
+
+
+@mcp.tool()
+def syncSchematicFromNetlistFile(
+    netlist_path: str,
+    circuit_name: str | None = None,
+    output_path: str | None = None,
+    state_path: str | None = None,
+    sheet_width: int = 1200,
+    sheet_height: int = 900,
+    force: bool = False,
+    open_ui: bool | None = None,
+) -> dict[str, Any]:
+    """
+    Regenerate schematic from a netlist file only when source content changed.
+
+    Stores sync metadata in JSON so repeated calls are fast and deterministic.
+    """
+    result = sync_schematic_from_netlist_file(
+        workdir=_runner.workdir,
+        netlist_path=netlist_path,
+        circuit_name=circuit_name,
+        output_path=output_path,
+        state_path=state_path,
+        sheet_width=sheet_width,
+        sheet_height=sheet_height,
+        force=force,
+    )
+
+    should_open = _effective_open_ui(open_ui)
+    if should_open and result.get("updated"):
+        try:
+            result["ui"] = _open_ui_target(path=Path(result["asc_path"]))
+        except Exception as exc:
+            result["ui"] = {"opened": False, "error": str(exc)}
+    result["ui_enabled"] = should_open
+    return result
+
+
+@mcp.tool()
+def watchSchematicFromNetlistFile(
+    netlist_path: str,
+    circuit_name: str | None = None,
+    output_path: str | None = None,
+    state_path: str | None = None,
+    sheet_width: int = 1200,
+    sheet_height: int = 900,
+    duration_seconds: float = 10.0,
+    poll_interval_seconds: float = 0.5,
+    max_updates: int = 20,
+    force_initial_refresh: bool = False,
+    open_ui: bool | None = None,
+) -> dict[str, Any]:
+    """
+    Poll a netlist file and regenerate schematic whenever the netlist changes.
+
+    Returns update events for each rebuild detected during the watch interval.
+    """
+    result = watch_schematic_from_netlist_file(
+        workdir=_runner.workdir,
+        netlist_path=netlist_path,
+        circuit_name=circuit_name,
+        output_path=output_path,
+        state_path=state_path,
+        sheet_width=sheet_width,
+        sheet_height=sheet_height,
+        duration_seconds=duration_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+        max_updates=max_updates,
+        force_initial_refresh=force_initial_refresh,
+    )
+
+    should_open = _effective_open_ui(open_ui)
+    if should_open:
+        latest_path = None
+        if result.get("updates"):
+            latest_path = result["updates"][-1].get("asc_path")
+        elif isinstance(result.get("last_result"), dict):
+            latest_path = result["last_result"].get("asc_path")
+        if latest_path:
+            try:
+                result["ui"] = _open_ui_target(path=Path(latest_path))
+            except Exception as exc:
+                result["ui"] = {"opened": False, "error": str(exc)}
     result["ui_enabled"] = should_open
     return result
 

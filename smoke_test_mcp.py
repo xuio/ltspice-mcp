@@ -70,6 +70,10 @@ async def _run_smoke_test(args: argparse.Namespace) -> None:
                 "getLtspiceStatus",
                 "createSchematic",
                 "createSchematicFromNetlist",
+                "listSchematicTemplates",
+                "createSchematicFromTemplate",
+                "syncSchematicFromNetlistFile",
+                "watchSchematicFromNetlistFile",
                 "simulateNetlist",
                 "getPlotNames",
                 "getVectorsInfo",
@@ -91,6 +95,34 @@ async def _run_smoke_test(args: argparse.Namespace) -> None:
             ltspice_executable = status.get("ltspice_executable")
             _require(ltspice_executable, "LTspice executable not detected by server")
             print(f"LTspice executable: {ltspice_executable}")
+
+            templates = _extract_call_result(await session.call_tool("listSchematicTemplates", {}))
+            _require(isinstance(templates, dict), "listSchematicTemplates did not return an object")
+            template_entries = templates.get("templates", [])
+            _require(isinstance(template_entries, list) and len(template_entries) >= 1, "No schematic templates available")
+            print(f"Template list check passed ({len(template_entries)} templates)")
+
+            template_schematic = _extract_call_result(
+                await session.call_tool(
+                    "createSchematicFromTemplate",
+                    {
+                        "template_name": "rc_lowpass_ac",
+                        "parameters": {
+                            "vin_ac": "1",
+                            "r_value": "1k",
+                            "c_value": "1u",
+                            "ac_points": "20",
+                            "f_start": "10",
+                            "f_stop": "100k",
+                        },
+                        "circuit_name": "smoke_template_schematic",
+                        "open_ui": False,
+                    },
+                )
+            )
+            _require(isinstance(template_schematic, dict), "createSchematicFromTemplate did not return an object")
+            _require(template_schematic.get("asc_path"), "createSchematicFromTemplate missing asc_path")
+            print("Template schematic check passed")
 
             netlist = """
 * RC low-pass smoke test
@@ -117,6 +149,37 @@ C1 out 0 1u
             _require(isinstance(run_id, str) and run_id, "Missing run_id in simulation result")
             _require(len(run.get("raw_files", [])) > 0, "Simulation produced no RAW files")
             print(f"Simulation passed (run_id={run_id})")
+
+            synced = _extract_call_result(
+                await session.call_tool(
+                    "syncSchematicFromNetlistFile",
+                    {
+                        "netlist_path": run.get("netlist_path"),
+                        "circuit_name": "smoke_synced_schematic",
+                        "open_ui": False,
+                    },
+                )
+            )
+            _require(isinstance(synced, dict), "syncSchematicFromNetlistFile did not return an object")
+            _require(synced.get("asc_path"), "syncSchematicFromNetlistFile missing asc_path")
+            _require(synced.get("updated") is True, "Expected sync call to produce an initial update")
+            print("Schematic sync check passed")
+
+            watch_result = _extract_call_result(
+                await session.call_tool(
+                    "watchSchematicFromNetlistFile",
+                    {
+                        "netlist_path": run.get("netlist_path"),
+                        "duration_seconds": 0.1,
+                        "poll_interval_seconds": 0.05,
+                        "max_updates": 2,
+                        "open_ui": False,
+                    },
+                )
+            )
+            _require(isinstance(watch_result, dict), "watchSchematicFromNetlistFile did not return an object")
+            _require(isinstance(watch_result.get("updates_count"), int), "watchSchematicFromNetlistFile missing updates_count")
+            print("Schematic watch check passed")
 
             auto_schematic = _extract_call_result(
                 await session.call_tool(

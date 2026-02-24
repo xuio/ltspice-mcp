@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "templates": [
+    {
+      "name": "rc_lowpass_ac",
+      "description": "AC low-pass testbench with Vin, R, and C.",
+      "type": "netlist",
+      "circuit_name": "rc_lowpass_ac",
+      "sheet_width": 1200,
+      "sheet_height": 900,
+      "netlist_content": "* RC low-pass template\nV1 in 0 AC {vin_ac}\nR1 in out {r_value}\nC1 out 0 {c_value}\n.ac dec {ac_points} {f_start} {f_stop}\n.op\n.end"
+    },
+    {
+      "name": "rl_highpass_ac",
+      "description": "AC high-pass style RL divider fixture.",
+      "type": "netlist",
+      "circuit_name": "rl_highpass_ac",
+      "sheet_width": 1200,
+      "sheet_height": 900,
+      "netlist_content": "* RL high-pass template\nV1 in 0 AC {vin_ac}\nL1 in out {l_value}\nR1 out 0 {r_value}\n.ac dec {ac_points} {f_start} {f_stop}\n.end"
+    },
+    {
+      "name": "resistor_divider_spec",
+      "description": "Explicit schematic spec template for a resistor divider.",
+      "type": "spec",
+      "circuit_name": "resistor_divider_spec",
+      "sheet_width": 880,
+      "sheet_height": 680,
+      "components": [
+        {
+          "symbol": "voltage",
+          "reference": "V1",
+          "x": 120,
+          "y": 120,
+          "value": "{vin_dc}",
+          "pin_nets": {
+            "1": "vin",
+            "2": "0"
+          }
+        },
+        {
+          "symbol": "res",
+          "reference": "R1",
+          "x": 320,
+          "y": 120,
+          "value": "{r_top}",
+          "pin_nets": {
+            "1": "vin",
+            "2": "vout"
+          }
+        },
+        {
+          "symbol": "res",
+          "reference": "R2",
+          "x": 320,
+          "y": 280,
+          "value": "{r_bottom}",
+          "pin_nets": {
+            "1": "vout",
+            "2": "0"
+          }
+        }
+      ],
+      "directives": [
+        ".op"
+      ]
+    }
+  ]
+}

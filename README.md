@@ -12,6 +12,8 @@ This implementation is inspired by:
 - Optional LTspice UI integration (disabled by default)
 - Batch simulation from netlist text or existing netlist file
 - Schematic generation (`.asc`) from structured data or netlist auto-layout
+- JSON template-driven schematic generation
+- Netlist-file schematic sync/watch workflow with JSON state files
 - Run history with artifacts (`.log`, `.raw`, `.op.raw`)
 - JSON-backed run metadata persistence across server restarts (`.ltspice_mcp_runs.json`)
 - RAW parser with support for:
@@ -77,6 +79,10 @@ Simulation and setup:
 - `openLtspiceUi`
 - `createSchematic`
 - `createSchematicFromNetlist`
+- `listSchematicTemplates`
+- `createSchematicFromTemplate`
+- `syncSchematicFromNetlistFile`
+- `watchSchematicFromNetlistFile`
 - `loadCircuit`
 - `loadNetlistFromFile`
 - `runSimulation`
@@ -141,14 +147,25 @@ Per simulation call:
 
 - `createSchematic`: build `.asc` from explicit components/wires/labels/directives
 - `createSchematicFromNetlist`: parse a netlist and auto-place common two-pin primitives (`R`, `C`, `L`, `D`, `V`, `I`)
+- `listSchematicTemplates`: inspect built-in or user-supplied JSON templates
+- `createSchematicFromTemplate`: generate `.asc` from template type `netlist` or `spec`
+- `syncSchematicFromNetlistFile`: only regenerate `.asc` when source netlist content changes
+- `watchSchematicFromNetlistFile`: poll netlist changes and emit rebuild events
 
-Both tools return an `asc_path` and support `open_ui` to open the resulting schematic in LTspice.
+All create/sync/watch schematic tools return an `asc_path` and support `open_ui` to open the resulting schematic in LTspice.
+
+Template notes:
+- built-in template JSON: `src/ltspice_mcp/schematic_templates.json`
+- string fields support `{placeholder}` substitution via `parameters`
+- missing placeholders are left as-is (useful for LTspice param braces like `{rval}`)
 
 ## Run tests
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
+
+Schematic tests include fixture snapshots under `tests/fixtures/schematic/*.asc` for deterministic rendering checks.
 
 ## Run MCP smoke test
 
