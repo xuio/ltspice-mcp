@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -175,6 +176,41 @@ def tail_text_file(path: Path | None, max_lines: int = 120) -> str:
         return ""
     lines = read_text_auto(path).splitlines()
     return "\n".join(lines[-max_lines:])
+
+
+def is_ltspice_ui_running() -> bool:
+    try:
+        proc = subprocess.run(
+            ["pgrep", "-x", "LTspice"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return False
+    return proc.returncode == 0
+
+
+def open_in_ltspice_ui(path: str | Path) -> dict[str, str | int | bool]:
+    target = Path(path).expanduser().resolve()
+    if not target.exists():
+        raise FileNotFoundError(f"Cannot open missing path in LTspice UI: {target}")
+    if platform.system() != "Darwin":
+        raise RuntimeError("LTspice UI integration is currently implemented for macOS only.")
+
+    proc = subprocess.run(
+        ["open", "-a", "LTspice", str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return {
+        "opened": proc.returncode == 0,
+        "return_code": proc.returncode,
+        "path": str(target),
+        "stdout": proc.stdout.strip(),
+        "stderr": proc.stderr.strip(),
+    }
 
 
 class LTspiceRunner:

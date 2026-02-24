@@ -18,16 +18,37 @@ from .analysis import (
     interpolate_series,
     sample_indices,
 )
-from .ltspice import LTspiceRunner, find_ltspice_executable, get_ltspice_version, tail_text_file
+from .ltspice import (
+    LTspiceRunner,
+    find_ltspice_executable,
+    get_ltspice_version,
+    is_ltspice_ui_running,
+    open_in_ltspice_ui,
+    tail_text_file,
+)
 from .models import RawDataset, SimulationRun
 from .raw_parser import RawParseError, parse_raw_file
 
 
 mcp = FastMCP("ltspice-mcp-macos")
 
+
+def _read_env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 _DEFAULT_WORKDIR = Path(os.getenv("LTSPICE_MCP_WORKDIR", os.getcwd()))
 _DEFAULT_TIMEOUT = int(os.getenv("LTSPICE_MCP_TIMEOUT", "120"))
 _DEFAULT_BINARY = os.getenv("LTSPICE_BINARY")
+_DEFAULT_UI_ENABLED = _read_env_bool("LTSPICE_MCP_UI_ENABLED", default=True)
 
 _runner = LTspiceRunner(
     workdir=_DEFAULT_WORKDIR,
@@ -39,6 +60,7 @@ _run_order: list[str] = []
 _loaded_netlist: Path | None = None
 _raw_cache: dict[Path, tuple[float, RawDataset]] = {}
 _state_path: Path = _DEFAULT_WORKDIR / ".ltspice_mcp_runs.json"
+_ui_enabled: bool = _DEFAULT_UI_ENABLED
 
 
 def _save_run_state() -> None:
@@ -106,6 +128,34 @@ def _select_primary_raw(run: SimulationRun) -> Path | None:
     if non_op:
         return max(non_op, key=lambda path: path.stat().st_size)
     return max(run.raw_files, key=lambda path: path.stat().st_size)
+
+
+def _target_path_from_run(run: SimulationRun, target: str) -> Path:
+    if target == "netlist":
+        return run.netlist_path
+    if target == "raw":
+        selected = _select_primary_raw(run)
+        if not selected:
+            raise ValueError(f"Run '{run.run_id}' does not have a RAW file to open.")
+        return selected
+    if target == "log":
+        if run.log_path is None:
+            raise ValueError(f"Run '{run.run_id}' does not have a log file.")
+        return run.log_path
+    raise ValueError("target must be one of: netlist, raw, log")
+
+
+def _open_ui_target(
+    *,
+    run: SimulationRun | None = None,
+    path: Path | None = None,
+    target: str = "netlist",
+) -> dict[str, Any]:
+    if path is not None:
+        return open_in_ltspice_ui(path)
+    if run is None:
+        raise ValueError("Either run or path must be provided for UI open.")
+    return open_in_ltspice_ui(_target_path_from_run(run, target))
 
 
 def _resolve_raw_path(raw_path: str | None, run_id: str | None) -> Path:
@@ -195,6 +245,56 @@ def _run_payload(run: SimulationRun, *, include_output: bool, log_tail_lines: in
     return payload
 
 
+def _run_simulation_with_ui(
+    *,
+    netlist_path: Path,
+    ascii_raw: bool,
+    timeout_seconds: int | None,
+    show_ui: bool | None,
+    open_raw_after_run: bool,
+) -> tuple[SimulationRun, list[dict[str, Any]], bool]:
+    effective_ui = _ui_enabled if show_ui is None else bool(show_ui)
+    ui_events: list[dict[str, Any]] = []
+
+    if effective_ui:
+        try:
+            event = _open_ui_target(path=netlist_path)
+            ui_events.append({"stage": "before_run", "target": "netlist", **event})
+        except Exception as exc:
+            ui_events.append(
+                {
+                    "stage": "before_run",
+                    "target": "netlist",
+                    "opened": False,
+                    "error": str(exc),
+                }
+            )
+
+    run = _register_run(
+        _runner.run_file(
+            netlist_path,
+            ascii_raw=ascii_raw,
+            timeout_seconds=timeout_seconds,
+        )
+    )
+
+    if effective_ui and open_raw_after_run:
+        try:
+            event = _open_ui_target(run=run, target="raw")
+            ui_events.append({"stage": "after_run", "target": "raw", **event})
+        except Exception as exc:
+            ui_events.append(
+                {
+                    "stage": "after_run",
+                    "target": "raw",
+                    "opened": False,
+                    "error": str(exc),
+                }
+            )
+
+    return run, ui_events, effective_ui
+
+
 def _sanitize_representation(value: str) -> str:
     valid = {"auto", "real", "rectangular", "magnitude-phase", "both"}
     if value not in valid:
@@ -217,7 +317,46 @@ def getLtspiceStatus() -> dict[str, Any]:
         "default_timeout_seconds": _runner.default_timeout_seconds,
         "runs_recorded": len(_run_order),
         "run_state_path": str(_state_path),
+        "ui_enabled_default": _ui_enabled,
     }
+
+
+@mcp.tool()
+def getLtspiceUiStatus() -> dict[str, Any]:
+    """Return whether LTspice UI appears to be running on this machine."""
+    return {
+        "ui_enabled_default": _ui_enabled,
+        "ui_running": is_ltspice_ui_running(),
+        "runs_recorded": len(_run_order),
+        "latest_run_id": _run_order[-1] if _run_order else None,
+    }
+
+
+@mcp.tool()
+def setLtspiceUiEnabled(enabled: bool) -> dict[str, Any]:
+    """Set default UI behavior for simulation calls where show_ui is omitted."""
+    global _ui_enabled
+    _ui_enabled = bool(enabled)
+    return {"ui_enabled_default": _ui_enabled}
+
+
+@mcp.tool()
+def openLtspiceUi(
+    run_id: str | None = None,
+    path: str | None = None,
+    target: str = "netlist",
+) -> dict[str, Any]:
+    """
+    Open LTspice UI on a selected artifact.
+
+    If `path` is provided it is opened directly.
+    Otherwise, the path is resolved from `run_id` and `target`:
+    - target=netlist|raw|log
+    """
+    if path:
+        return _open_ui_target(path=Path(path).expanduser().resolve())
+    run = _resolve_run(run_id)
+    return _open_ui_target(run=run, target=target)
 
 
 @mcp.tool()
@@ -245,6 +384,8 @@ def runSimulation(
     command: str = "",
     ascii_raw: bool = False,
     timeout_seconds: int | None = None,
+    show_ui: bool | None = None,
+    open_raw_after_run: bool = False,
 ) -> dict[str, Any]:
     """
     Run LTspice in batch mode for the currently loaded netlist.
@@ -254,12 +395,12 @@ def runSimulation(
     if _loaded_netlist is None:
         raise ValueError("No netlist is loaded. Use loadCircuit or loadNetlistFromFile first.")
 
-    run = _register_run(
-        _runner.run_file(
-            _loaded_netlist,
-            ascii_raw=ascii_raw,
-            timeout_seconds=timeout_seconds,
-        )
+    run, ui_events, effective_ui = _run_simulation_with_ui(
+        netlist_path=_loaded_netlist,
+        ascii_raw=ascii_raw,
+        timeout_seconds=timeout_seconds,
+        show_ui=show_ui,
+        open_raw_after_run=open_raw_after_run,
     )
     notes: list[str] = []
     if command.strip():
@@ -269,6 +410,9 @@ def runSimulation(
     response = _run_payload(run, include_output=False, log_tail_lines=120)
     if notes:
         response["notes"] = notes
+    response["ui_enabled"] = effective_ui
+    if ui_events:
+        response["ui_events"] = ui_events
     return response
 
 
@@ -278,19 +422,25 @@ def simulateNetlist(
     circuit_name: str = "circuit",
     ascii_raw: bool = False,
     timeout_seconds: int | None = None,
+    show_ui: bool | None = None,
+    open_raw_after_run: bool = False,
 ) -> dict[str, Any]:
     """Write a netlist and run LTspice batch simulation in one call."""
     global _loaded_netlist
     netlist_path = _runner.write_netlist(netlist_content, circuit_name=circuit_name)
     _loaded_netlist = netlist_path
-    run = _register_run(
-        _runner.run_file(
-            netlist_path,
-            ascii_raw=ascii_raw,
-            timeout_seconds=timeout_seconds,
-        )
+    run, ui_events, effective_ui = _run_simulation_with_ui(
+        netlist_path=netlist_path,
+        ascii_raw=ascii_raw,
+        timeout_seconds=timeout_seconds,
+        show_ui=show_ui,
+        open_raw_after_run=open_raw_after_run,
     )
-    return _run_payload(run, include_output=False, log_tail_lines=120)
+    response = _run_payload(run, include_output=False, log_tail_lines=120)
+    response["ui_enabled"] = effective_ui
+    if ui_events:
+        response["ui_events"] = ui_events
+    return response
 
 
 @mcp.tool()
@@ -298,6 +448,8 @@ def simulateNetlistFile(
     netlist_path: str,
     ascii_raw: bool = False,
     timeout_seconds: int | None = None,
+    show_ui: bool | None = None,
+    open_raw_after_run: bool = False,
 ) -> dict[str, Any]:
     """Run LTspice batch simulation for an existing netlist path."""
     global _loaded_netlist
@@ -305,14 +457,18 @@ def simulateNetlistFile(
     if not path.exists():
         raise FileNotFoundError(f"Netlist file not found: {path}")
     _loaded_netlist = path
-    run = _register_run(
-        _runner.run_file(
-            path,
-            ascii_raw=ascii_raw,
-            timeout_seconds=timeout_seconds,
-        )
+    run, ui_events, effective_ui = _run_simulation_with_ui(
+        netlist_path=path,
+        ascii_raw=ascii_raw,
+        timeout_seconds=timeout_seconds,
+        show_ui=show_ui,
+        open_raw_after_run=open_raw_after_run,
     )
-    return _run_payload(run, include_output=False, log_tail_lines=120)
+    response = _run_payload(run, include_output=False, log_tail_lines=120)
+    response["ui_enabled"] = effective_ui
+    if ui_events:
+        response["ui_events"] = ui_events
+    return response
 
 
 @mcp.tool()
@@ -620,8 +776,14 @@ def getSettlingTime(
     }
 
 
-def _configure_runner(*, workdir: Path, ltspice_binary: str | None, timeout: int) -> None:
-    global _runner, _loaded_netlist, _raw_cache, _state_path
+def _configure_runner(
+    *,
+    workdir: Path,
+    ltspice_binary: str | None,
+    timeout: int,
+    ui_enabled: bool | None = None,
+) -> None:
+    global _runner, _loaded_netlist, _raw_cache, _state_path, _ui_enabled
     _runner = LTspiceRunner(
         workdir=workdir,
         executable=ltspice_binary,
@@ -630,6 +792,7 @@ def _configure_runner(*, workdir: Path, ltspice_binary: str | None, timeout: int
     _state_path = workdir / ".ltspice_mcp_runs.json"
     _loaded_netlist = None
     _raw_cache = {}
+    _ui_enabled = _DEFAULT_UI_ENABLED if ui_enabled is None else bool(ui_enabled)
     _load_run_state()
 
 
@@ -652,6 +815,19 @@ def main() -> None:
         help="Default simulation timeout in seconds",
     )
     parser.add_argument(
+        "--ui-enabled",
+        dest="ui_enabled",
+        action="store_true",
+        help="Enable LTspice UI opening by default in simulation calls",
+    )
+    parser.add_argument(
+        "--ui-disabled",
+        dest="ui_enabled",
+        action="store_false",
+        help="Disable LTspice UI opening by default in simulation calls",
+    )
+    parser.set_defaults(ui_enabled=None)
+    parser.add_argument(
         "--transport",
         default="stdio",
         choices=["stdio", "sse"],
@@ -663,6 +839,7 @@ def main() -> None:
         workdir=Path(args.workdir).expanduser().resolve(),
         ltspice_binary=args.ltspice_binary,
         timeout=args.timeout,
+        ui_enabled=args.ui_enabled,
     )
     mcp.run(transport=args.transport)
 
