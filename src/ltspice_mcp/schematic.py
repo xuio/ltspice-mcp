@@ -86,7 +86,10 @@ class SymbolDef:
 
 class SymbolLibrary:
     _INDEX_CACHE: dict[Path, dict[str, str]] = {}
+    _ENTRY_CACHE: dict[Path, list[str]] = {}
+    _SYMBOL_LIST_CACHE: dict[Path, list[dict[str, str]]] = {}
     _SYMBOL_CACHE: dict[tuple[Path, str], SymbolDef] = {}
+    _SOURCE_CACHE: dict[tuple[Path, str], str] = {}
 
     def __init__(self, zip_path: Path = DEFAULT_LTSPICE_LIB_ZIP) -> None:
         self.zip_path = zip_path.expanduser().resolve()
@@ -94,7 +97,21 @@ class SymbolLibrary:
             raise FileNotFoundError(f"LTspice symbol library not found at {self.zip_path}")
         self._zip = ZipFile(self.zip_path)
         self._index = self._build_index()
+        self._entries = self._build_entries()
         self._pin_offset_cache: dict[tuple[str, str, int], tuple[int, int]] = {}
+
+    def _build_entries(self) -> list[str]:
+        cached = self._ENTRY_CACHE.get(self.zip_path)
+        if cached is not None:
+            return cached
+
+        entries = sorted(
+            Path(name).as_posix()
+            for name in self._zip.namelist()
+            if name.lower().endswith(".asy")
+        )
+        self._ENTRY_CACHE[self.zip_path] = entries
+        return entries
 
     def _build_index(self) -> dict[str, str]:
         cached = self._INDEX_CACHE.get(self.zip_path)
@@ -138,6 +155,103 @@ class SymbolLibrary:
         symbol_def = SymbolDef(symbol=symbol, zip_entry=entry, pins=pins)
         self._SYMBOL_CACHE[(self.zip_path, cache_key)] = symbol_def
         return symbol_def
+
+    def resolve_entry(self, symbol: str) -> str:
+        return self._resolve_entry(symbol)
+
+    def read_symbol_source(self, symbol: str) -> str:
+        entry = self._resolve_entry(symbol)
+        cache_key = (self.zip_path, entry)
+        cached = self._SOURCE_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        text = self._zip.read(entry).decode("utf-8", errors="ignore")
+        self._SOURCE_CACHE[cache_key] = text
+        return text
+
+    def list_entries(self, *, query: str | None = None, limit: int = 500) -> list[str]:
+        if limit <= 0:
+            return []
+        entries = self._entries
+        if query:
+            needle = query.strip().lower()
+            entries = [entry for entry in entries if needle in entry.lower()]
+        return entries[:limit]
+
+    def list_symbols(
+        self,
+        *,
+        query: str | None = None,
+        library: str | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, str]]:
+        if limit <= 0:
+            return []
+
+        cached = self._SYMBOL_LIST_CACHE.get(self.zip_path)
+        if cached is None:
+            seen: set[str] = set()
+            rows: list[dict[str, str]] = []
+            for entry in self._entries:
+                symbol = Path(entry).stem
+                key = symbol.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                parts = Path(entry).parts
+                category = ""
+                if "sym" in parts:
+                    idx = parts.index("sym")
+                    if idx + 1 < len(parts) - 1:
+                        category = parts[idx + 1]
+                rows.append(
+                    {
+                        "symbol": symbol,
+                        "entry": entry,
+                        "category": category,
+                    }
+                )
+            cached = sorted(rows, key=lambda row: row["symbol"].lower())
+            self._SYMBOL_LIST_CACHE[self.zip_path] = cached
+
+        rows = cached
+        if library:
+            library_needle = library.strip().lower()
+            rows = [row for row in rows if library_needle in row["category"].lower()]
+        if query:
+            needle = query.strip().lower()
+            rows = [
+                row
+                for row in rows
+                if needle in row["symbol"].lower() or needle in row["entry"].lower()
+            ]
+        return rows[:limit]
+
+    def symbol_info(self, symbol: str) -> dict[str, Any]:
+        symbol_def = self.get(symbol)
+        pins_out = [
+            {
+                "spice_order": pin.spice_order,
+                "name": pin.name,
+                "x": pin.x,
+                "y": pin.y,
+            }
+            for pin in symbol_def.pins
+        ]
+        pins_out = sorted(
+            pins_out,
+            key=lambda item: (
+                item["spice_order"] if item["spice_order"] is not None else 9999,
+                item["name"] or "",
+            ),
+        )
+        return {
+            "symbol": symbol.strip(),
+            "zip_path": str(self.zip_path),
+            "zip_entry": symbol_def.zip_entry,
+            "pin_count": len(symbol_def.pins),
+            "pins": pins_out,
+        }
 
     def pin_offset(self, symbol: str, orientation: str, spice_order: int) -> tuple[int, int]:
         normalized_orientation = _normalize_orientation(orientation)

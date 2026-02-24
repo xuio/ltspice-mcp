@@ -30,6 +30,8 @@ from .ltspice import (
 from .models import RawDataset, SimulationRun
 from .raw_parser import RawParseError, parse_raw_file
 from .schematic import (
+    DEFAULT_LTSPICE_LIB_ZIP,
+    SymbolLibrary,
     build_schematic_from_netlist,
     build_schematic_from_spec,
     build_schematic_from_template,
@@ -81,6 +83,8 @@ _schematic_live_path: Path = (
     if _DEFAULT_SCHEMATIC_LIVE_PATH
     else (_DEFAULT_WORKDIR / ".ui" / "live_schematic.asc").resolve()
 )
+_symbol_library: SymbolLibrary | None = None
+_symbol_library_zip_path: Path | None = None
 
 
 def _save_run_state() -> None:
@@ -180,6 +184,22 @@ def _open_ui_target(
 
 def _effective_open_ui(open_ui: bool | None) -> bool:
     return _ui_enabled if open_ui is None else bool(open_ui)
+
+
+def _resolve_symbol_library(lib_zip_path: str | None = None) -> SymbolLibrary:
+    global _symbol_library, _symbol_library_zip_path
+    target_path = (
+        Path(lib_zip_path).expanduser().resolve()
+        if lib_zip_path
+        else DEFAULT_LTSPICE_LIB_ZIP.expanduser().resolve()
+    )
+    if _symbol_library is not None and _symbol_library_zip_path == target_path:
+        return _symbol_library
+    if _symbol_library is not None:
+        _symbol_library.close()
+    _symbol_library = SymbolLibrary(target_path)
+    _symbol_library_zip_path = target_path
+    return _symbol_library
 
 
 def _sync_schematic_live_file(source_path: Path) -> Path:
@@ -371,6 +391,7 @@ def getLtspiceStatus() -> dict[str, Any]:
         "default_timeout_seconds": _runner.default_timeout_seconds,
         "runs_recorded": len(_run_order),
         "run_state_path": str(_state_path),
+        "ltspice_lib_zip_path": str(DEFAULT_LTSPICE_LIB_ZIP.expanduser().resolve()),
         "ui_enabled_default": _ui_enabled,
         "schematic_single_window_default": _schematic_single_window_enabled,
         "schematic_live_path": str(_schematic_live_path),
@@ -388,6 +409,112 @@ def getLtspiceUiStatus() -> dict[str, Any]:
         "runs_recorded": len(_run_order),
         "latest_run_id": _run_order[-1] if _run_order else None,
     }
+
+
+@mcp.tool()
+def getLtspiceLibraryStatus(lib_zip_path: str | None = None) -> dict[str, Any]:
+    """Get LTspice symbol library ZIP status and basic counts."""
+    zip_path = (
+        Path(lib_zip_path).expanduser().resolve()
+        if lib_zip_path
+        else DEFAULT_LTSPICE_LIB_ZIP.expanduser().resolve()
+    )
+    exists = zip_path.exists()
+    if not exists:
+        return {
+            "zip_path": str(zip_path),
+            "exists": False,
+            "entries_count": 0,
+            "symbols_count": 0,
+        }
+
+    library = _resolve_symbol_library(str(zip_path))
+    entries = library.list_entries(limit=1_000_000)
+    symbols = library.list_symbols(limit=1_000_000)
+    return {
+        "zip_path": str(zip_path),
+        "exists": True,
+        "entries_count": len(entries),
+        "symbols_count": len(symbols),
+    }
+
+
+@mcp.tool()
+def listLtspiceLibraryEntries(
+    query: str | None = None,
+    limit: int = 200,
+    lib_zip_path: str | None = None,
+) -> dict[str, Any]:
+    """List LTspice symbol ZIP entries (.asy), optionally filtered by query."""
+    if limit <= 0:
+        return {"zip_path": str(DEFAULT_LTSPICE_LIB_ZIP), "entries": [], "returned_count": 0}
+
+    safe_limit = min(int(limit), 5000)
+    library = _resolve_symbol_library(lib_zip_path)
+    entries = library.list_entries(query=query, limit=safe_limit)
+    return {
+        "zip_path": str(library.zip_path),
+        "query": query,
+        "limit": safe_limit,
+        "returned_count": len(entries),
+        "entries": entries,
+    }
+
+
+@mcp.tool()
+def listLtspiceSymbols(
+    query: str | None = None,
+    library: str | None = None,
+    limit: int = 200,
+    lib_zip_path: str | None = None,
+) -> dict[str, Any]:
+    """List/search LTspice symbols parsed from the symbol library ZIP."""
+    if limit <= 0:
+        return {"symbols": [], "returned_count": 0}
+
+    safe_limit = min(int(limit), 5000)
+    symbol_lib = _resolve_symbol_library(lib_zip_path)
+    symbols = symbol_lib.list_symbols(
+        query=query,
+        library=library,
+        limit=safe_limit,
+    )
+    return {
+        "zip_path": str(symbol_lib.zip_path),
+        "query": query,
+        "library": library,
+        "limit": safe_limit,
+        "returned_count": len(symbols),
+        "symbols": symbols,
+    }
+
+
+@mcp.tool()
+def getLtspiceSymbolInfo(
+    symbol: str,
+    include_source: bool = False,
+    source_max_chars: int = 8000,
+    lib_zip_path: str | None = None,
+) -> dict[str, Any]:
+    """Get pin map and metadata for a symbol in LTspice's lib.zip."""
+    if not symbol.strip():
+        raise ValueError("symbol must be a non-empty string")
+
+    symbol_lib = _resolve_symbol_library(lib_zip_path)
+    payload = symbol_lib.symbol_info(symbol)
+
+    if include_source:
+        raw_source = symbol_lib.read_symbol_source(symbol)
+        max_chars = max(0, int(source_max_chars))
+        if max_chars and len(raw_source) > max_chars:
+            payload["source"] = raw_source[:max_chars]
+            payload["source_truncated"] = True
+        else:
+            payload["source"] = raw_source
+            payload["source_truncated"] = False
+        payload["source_line_count"] = len(raw_source.splitlines())
+
+    return payload
 
 
 @mcp.tool()
@@ -1066,6 +1193,7 @@ def _configure_runner(
 ) -> None:
     global _runner, _loaded_netlist, _raw_cache, _state_path, _ui_enabled
     global _schematic_single_window_enabled, _schematic_live_path
+    global _symbol_library, _symbol_library_zip_path
     _runner = LTspiceRunner(
         workdir=workdir,
         executable=ltspice_binary,
@@ -1074,6 +1202,10 @@ def _configure_runner(
     _state_path = workdir / ".ltspice_mcp_runs.json"
     _loaded_netlist = None
     _raw_cache = {}
+    if _symbol_library is not None:
+        _symbol_library.close()
+    _symbol_library = None
+    _symbol_library_zip_path = None
     _ui_enabled = _DEFAULT_UI_ENABLED if ui_enabled is None else bool(ui_enabled)
     _schematic_single_window_enabled = (
         _DEFAULT_SCHEMATIC_SINGLE_WINDOW

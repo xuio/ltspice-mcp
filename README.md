@@ -13,6 +13,7 @@ This implementation is inspired by:
 - Schematic UI single-window mode (enabled by default)
 - Batch simulation from netlist text or existing netlist file
 - Schematic generation (`.asc`) from structured data or netlist auto-layout
+- LTspice symbol library inspection tools (lib.zip entry/symbol/pin/source queries)
 - JSON template-driven schematic generation
 - Netlist-file schematic sync/watch workflow with JSON state files
 - Run history with artifacts (`.log`, `.raw`, `.op.raw`)
@@ -78,6 +79,10 @@ Simulation and setup:
 
 - `getLtspiceStatus`
 - `getLtspiceUiStatus`
+- `getLtspiceLibraryStatus`
+- `listLtspiceLibraryEntries`
+- `listLtspiceSymbols`
+- `getLtspiceSymbolInfo`
 - `setLtspiceUiEnabled`
 - `setSchematicUiSingleWindow`
 - `openLtspiceUi`
@@ -168,6 +173,13 @@ Template notes:
 - built-in template JSON: `src/ltspice_mcp/schematic_templates.json`
 - string fields support `{placeholder}` substitution via `parameters`
 - missing placeholders are left as-is (useful for LTspice param braces like `{rval}`)
+
+## LTspice library inspection
+
+- `getLtspiceLibraryStatus`: verify `lib.zip` path and symbol counts
+- `listLtspiceLibraryEntries`: list raw `.asy` zip entries (useful for path discovery)
+- `listLtspiceSymbols`: search symbols by name/category (e.g. `opamp2`, `UniversalOpAmp2`)
+- `getLtspiceSymbolInfo`: return parsed pin map and optional `.asy` source text
 
 ## Run tests
 

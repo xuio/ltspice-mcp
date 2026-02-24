@@ -68,6 +68,10 @@ async def _run_smoke_test(args: argparse.Namespace) -> None:
             tool_names = {tool.name for tool in tools_result.tools}
             required_tools = {
                 "getLtspiceStatus",
+                "getLtspiceLibraryStatus",
+                "listLtspiceLibraryEntries",
+                "listLtspiceSymbols",
+                "getLtspiceSymbolInfo",
                 "setSchematicUiSingleWindow",
                 "createSchematic",
                 "createSchematicFromNetlist",
@@ -96,6 +100,43 @@ async def _run_smoke_test(args: argparse.Namespace) -> None:
             ltspice_executable = status.get("ltspice_executable")
             _require(ltspice_executable, "LTspice executable not detected by server")
             print(f"LTspice executable: {ltspice_executable}")
+
+            lib_status = _extract_call_result(await session.call_tool("getLtspiceLibraryStatus", {}))
+            _require(isinstance(lib_status, dict), "getLtspiceLibraryStatus did not return an object")
+            _require(lib_status.get("exists") is True, "LTspice lib.zip not detected by server")
+            _require(lib_status.get("symbols_count", 0) > 0, "LTspice symbol library appears empty")
+            print(f"Library status check passed ({lib_status.get('symbols_count')} symbols)")
+
+            lib_entries = _extract_call_result(
+                await session.call_tool(
+                    "listLtspiceLibraryEntries",
+                    {"query": "OpAmps/opamp2.asy", "limit": 5},
+                )
+            )
+            _require(isinstance(lib_entries, dict), "listLtspiceLibraryEntries did not return an object")
+            _require(lib_entries.get("returned_count", 0) >= 1, "Expected opamp2 entry in library listing")
+            print("Library entry search check passed")
+
+            symbols = _extract_call_result(
+                await session.call_tool(
+                    "listLtspiceSymbols",
+                    {"query": "opamp2", "limit": 20},
+                )
+            )
+            _require(isinstance(symbols, dict), "listLtspiceSymbols did not return an object")
+            _require(symbols.get("returned_count", 0) >= 1, "Expected opamp2 symbol in symbol search")
+            print("Symbol search check passed")
+
+            symbol_info = _extract_call_result(
+                await session.call_tool(
+                    "getLtspiceSymbolInfo",
+                    {"symbol": "opamp2", "include_source": True, "source_max_chars": 1200},
+                )
+            )
+            _require(isinstance(symbol_info, dict), "getLtspiceSymbolInfo did not return an object")
+            _require(symbol_info.get("pin_count", 0) >= 5, "opamp2 pin map seems invalid")
+            _require("source" in symbol_info, "getLtspiceSymbolInfo missing source field")
+            print("Symbol info check passed")
 
             templates = _extract_call_result(await session.call_tool("listSchematicTemplates", {}))
             _require(isinstance(templates, dict), "listSchematicTemplates did not return an object")
