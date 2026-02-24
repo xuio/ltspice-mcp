@@ -693,13 +693,27 @@ def build_schematic_from_netlist(
         index = len(components)
         columns = max(1, (sheet_width - 160) // 160)
         x = 120 + (index % columns) * 160
-        y = 80 + (index // columns) * 200
+        row = index // columns
+        base_row_y = 80 + row * 200
+        signal_row_y = 96 + row * 200
+        orientation = _choose_two_pin_orientation(symbol, canonical_nodes)
+        y = base_row_y
+
+        preferred_pin_order = 1
+        if canonical_nodes[0] == "0" and canonical_nodes[1] != "0":
+            preferred_pin_order = 2
+        try:
+            _, pin_y = lib.pin_offset(symbol, orientation=orientation, spice_order=preferred_pin_order)
+            y = signal_row_y - pin_y
+        except Exception:
+            y = base_row_y
+
         placement = ComponentPlacement(
             symbol=symbol,
             reference=ref,
             x=x,
             y=y,
-            orientation=_choose_two_pin_orientation(symbol, canonical_nodes),
+            orientation=orientation,
             value=value,
         )
         components.append((placement, canonical_nodes))
