@@ -73,6 +73,10 @@ async def _run_smoke_test(args: argparse.Namespace) -> None:
                 "getVectorsInfo",
                 "getVectorData",
                 "getLocalExtrema",
+                "getBandwidth",
+                "getGainPhaseMargin",
+                "getRiseFallTime",
+                "getSettlingTime",
                 "listRuns",
                 "getRunDetails",
             }
@@ -163,6 +167,26 @@ C1 out 0 1u
             )
             print("Extrema check passed")
 
+            bandwidth = _extract_call_result(
+                await session.call_tool(
+                    "getBandwidth",
+                    {"run_id": run_id, "vector": "V(out)"},
+                )
+            )
+            _require(isinstance(bandwidth, dict), "getBandwidth did not return an object")
+            _require("lowpass_bandwidth_hz" in bandwidth, "getBandwidth missing expected output")
+            print("Bandwidth check passed")
+
+            margins = _extract_call_result(
+                await session.call_tool(
+                    "getGainPhaseMargin",
+                    {"run_id": run_id, "vector": "V(out)"},
+                )
+            )
+            _require(isinstance(margins, dict), "getGainPhaseMargin did not return an object")
+            _require("gain_crossover_hz" in margins, "getGainPhaseMargin missing expected output")
+            print("Gain/phase margin check passed")
+
             runs = _extract_call_result(await session.call_tool("listRuns", {"limit": 10}))
             _require(isinstance(runs, list), "listRuns did not return a list")
             _require(any(item.get("run_id") == run_id for item in runs), "run_id not found in listRuns")
@@ -174,6 +198,60 @@ C1 out 0 1u
             _require(isinstance(details, dict), "getRunDetails did not return an object")
             _require(details.get("run_id") == run_id, "getRunDetails returned wrong run_id")
             print("Run detail check passed")
+
+            transient_netlist = """
+* RC transient stepped smoke test
+.param rval=1k
+V1 in 0 PULSE(0 1 0 1u 1u 500u 1m)
+R1 in out {rval}
+C1 out 0 1u
+.step param rval list 1k 2k
+.tran 0 4m 0 20u
+.end
+""".strip()
+            tran_run = _extract_call_result(
+                await session.call_tool(
+                    "simulateNetlist",
+                    {
+                        "netlist_content": transient_netlist,
+                        "circuit_name": "smoke_rc_transient",
+                    },
+                )
+            )
+            _require(isinstance(tran_run, dict), "Transient simulateNetlist did not return an object")
+            _require(tran_run.get("succeeded") is True, "Transient simulation failed")
+            tran_id = tran_run.get("run_id")
+
+            stepped_data = _extract_call_result(
+                await session.call_tool(
+                    "getVectorData",
+                    {"run_id": tran_id, "vectors": ["V(out)"], "step_index": 1},
+                )
+            )
+            _require(isinstance(stepped_data, dict), "Stepped getVectorData did not return an object")
+            _require(stepped_data.get("step_count", 1) >= 2, "Expected stepped run with step_count >= 2")
+            _require(stepped_data.get("selected_step") == 1, "Step filter did not select step_index=1")
+            print("Step-filter check passed")
+
+            rise_fall = _extract_call_result(
+                await session.call_tool(
+                    "getRiseFallTime",
+                    {"run_id": tran_id, "vector": "V(out)"},
+                )
+            )
+            _require(isinstance(rise_fall, dict), "getRiseFallTime did not return an object")
+            _require("rise_time_s" in rise_fall, "getRiseFallTime missing expected output")
+            print("Rise/fall check passed")
+
+            settling = _extract_call_result(
+                await session.call_tool(
+                    "getSettlingTime",
+                    {"run_id": tran_id, "vector": "V(out)"},
+                )
+            )
+            _require(isinstance(settling, dict), "getSettlingTime did not return an object")
+            _require("settling_time_s" in settling, "getSettlingTime missing expected output")
+            print("Settling-time check passed")
 
     print("MCP smoke test passed")
 

@@ -8,18 +8,54 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from .models import SimulationRun
+from .models import SimulationDiagnostic, SimulationRun
+from .textio import read_text_auto
 
 
-_ERROR_PATTERNS = (
-    re.compile(r"(?i)\bfatal\b"),
-    re.compile(r"(?i)\berror\b"),
-    re.compile(r"(?i)singular matrix"),
-    re.compile(r"(?i)time step too small"),
-    re.compile(r"(?i)convergence failed"),
-)
-_WARNING_PATTERNS = (re.compile(r"(?i)\bwarning\b"),)
 _END_DIRECTIVE_RE = re.compile(r"(?im)^\s*\.end\b")
+
+_CATEGORY_RULES: list[tuple[str, str, re.Pattern[str], str]] = [
+    (
+        "convergence",
+        "error",
+        re.compile(
+            r"(?i)(time step too small|convergence failed|gmin stepping failed|source stepping failed|newton iteration failed)"
+        ),
+        "Add realistic parasitics or bleeder resistors, set reasonable initial conditions (.ic), and relax time step constraints.",
+    ),
+    (
+        "floating_node",
+        "error",
+        re.compile(r"(?i)(singular matrix|floating)"),
+        "Ensure every node has a DC return path (often via a large resistor to ground) and verify all pins are connected.",
+    ),
+    (
+        "model_missing",
+        "error",
+        re.compile(
+            r"(?i)(unknown subcircuit|can't find definition of model|could not open include file|unable to open .*\\.lib)"
+        ),
+        "Check .include/.lib paths and model names, and make sure referenced model files exist in accessible paths.",
+    ),
+    (
+        "netlist_syntax",
+        "error",
+        re.compile(r"(?i)(syntax error|unknown parameter|missing value|expected .* token)"),
+        "Inspect the failing line in the netlist and verify directive spelling, parameter order, and numeric units.",
+    ),
+    (
+        "generic_error",
+        "error",
+        re.compile(r"(?i)\b(fatal|error)\b"),
+        "Inspect the log context around this message and adjust netlist directives or model includes accordingly.",
+    ),
+    (
+        "warning",
+        "warning",
+        re.compile(r"(?i)\bwarning\b"),
+        "Review warning context to ensure simulation accuracy is acceptable.",
+    ),
+]
 
 
 def _is_executable(path: Path) -> bool:
@@ -91,39 +127,53 @@ def get_ltspice_version(executable: Path) -> str | None:
     return None
 
 
-def analyze_log(log_path: Path | None) -> tuple[list[str], list[str]]:
+def analyze_log(log_path: Path | None) -> tuple[list[str], list[str], list[SimulationDiagnostic]]:
     if not log_path or not log_path.exists():
-        return [], []
+        return [], [], []
 
     issues: list[str] = []
     warnings: list[str] = []
+    diagnostics: list[SimulationDiagnostic] = []
     seen_issue: set[str] = set()
     seen_warning: set[str] = set()
+    seen_diag: set[tuple[str, str]] = set()
 
-    for raw_line in log_path.read_text(errors="ignore").splitlines():
+    for raw_line in read_text_auto(log_path).splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        for pattern in _ERROR_PATTERNS:
-            if pattern.search(line):
-                if line not in seen_issue:
-                    issues.append(line)
-                    seen_issue.add(line)
-                break
-        for pattern in _WARNING_PATTERNS:
-            if pattern.search(line):
-                if line not in seen_warning:
-                    warnings.append(line)
-                    seen_warning.add(line)
-                break
+        for category, severity, pattern, suggestion in _CATEGORY_RULES:
+            if not pattern.search(line):
+                continue
 
-    return issues, warnings
+            key = (category, line)
+            if key in seen_diag:
+                continue
+            seen_diag.add(key)
+            diagnostics.append(
+                SimulationDiagnostic(
+                    category=category,
+                    severity=severity,
+                    message=line,
+                    suggestion=suggestion,
+                )
+            )
+
+            if severity == "error" and line not in seen_issue:
+                issues.append(line)
+                seen_issue.add(line)
+            if severity == "warning" and line not in seen_warning:
+                warnings.append(line)
+                seen_warning.add(line)
+            break
+
+    return issues, warnings, diagnostics
 
 
 def tail_text_file(path: Path | None, max_lines: int = 120) -> str:
     if not path or not path.exists():
         return ""
-    lines = path.read_text(errors="ignore").splitlines()
+    lines = read_text_auto(path).splitlines()
     return "\n".join(lines[-max_lines:])
 
 
@@ -221,11 +271,27 @@ class LTspiceRunner:
             candidates = sorted(netlist.parent.glob(f"{netlist.stem}*.log"))
             log_path = candidates[0] if candidates else None
 
-        issues, warnings = analyze_log(log_path)
+        issues, warnings, diagnostics = analyze_log(log_path)
         if return_code != 0:
             issues.append(f"LTspice exited with return code {return_code}.")
+            diagnostics.append(
+                SimulationDiagnostic(
+                    category="process_error",
+                    severity="error",
+                    message=f"LTspice exited with return code {return_code}.",
+                    suggestion="Check stderr output and LTspice log details for the underlying simulation failure.",
+                )
+            )
         if not raw_files and return_code == 0:
             warnings.append("No .raw output file was generated.")
+            diagnostics.append(
+                SimulationDiagnostic(
+                    category="missing_artifact",
+                    severity="warning",
+                    message="No .raw output file was generated.",
+                    suggestion="Ensure the netlist includes a simulation directive such as .tran, .ac, .dc, or .op.",
+                )
+            )
 
         run_id = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         return SimulationRun(
@@ -243,4 +309,5 @@ class LTspiceRunner:
             artifacts=artifacts,
             issues=issues,
             warnings=warnings,
+            diagnostics=diagnostics,
         )

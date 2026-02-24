@@ -11,15 +11,23 @@ This implementation is inspired by:
 - LTspice executable auto-discovery on macOS (`LTSPICE_BINARY` override supported)
 - Batch simulation from netlist text or existing netlist file
 - Run history with artifacts (`.log`, `.raw`, `.op.raw`)
+- JSON-backed run metadata persistence across server restarts (`.ltspice_mcp_runs.json`)
 - RAW parser with support for:
   - real/complex datasets
   - standard and `FastAccess` binary layouts
   - ASCII `Values:` layout
+  - stepped sweeps (`.step`) with per-step segmentation
 - Vector queries:
   - list plots and vectors
   - sample/downsample vector traces
   - interpolate vector values at explicit points
   - local minima/maxima extraction
+- Structured diagnostics from LTspice logs with categorized issues/suggestions
+- Analysis tools:
+  - bandwidth
+  - gain/phase margin
+  - rise/fall time
+  - settling time
 
 ## Requirements
 
@@ -75,6 +83,23 @@ Data access:
 - `getVectorsInfo`
 - `getVectorData`
 - `getLocalExtrema`
+- `getBandwidth`
+- `getGainPhaseMargin`
+- `getRiseFallTime`
+- `getSettlingTime`
+
+### Stepped sweeps
+
+For stepped RAW datasets, `getVectorsInfo`, `getVectorData`, `getLocalExtrema`, and the analysis tools accept `step_index`.
+
+- `step_index` omitted: defaults to step `0`
+- `step_index=1` (etc.): filter to a specific sweep step
+
+Responses include:
+
+- `step_count`
+- `selected_step`
+- `steps` (index/range/label metadata)
 
 ## Example client config
 
@@ -106,3 +131,5 @@ python3 smoke_test_mcp.py \
   --server-command .venv/bin/ltspice-mcp \
   --ltspice-binary /Applications/LTspice.app/Contents/MacOS/LTspice
 ```
+
+Run responses now include `diagnostics` with categories like `convergence`, `floating_node`, and `model_missing`, each with suggested fixes.

@@ -161,6 +161,45 @@ class TestRawParser(unittest.TestCase):
         self.assertAlmostEqual(data.get_vector("time")[1].real, 1.0, places=6)
         self.assertAlmostEqual(data.get_vector("V(out)")[1].real, 2.0, places=6)
 
+    def test_parse_stepped_data_and_labels(self) -> None:
+        variables = [("time", "time"), ("V(out)", "voltage")]
+        points = [
+            (0.0, 0.0),
+            (1.0, 1.0),
+            (2.0, 2.0),
+            (0.0, 10.0),
+            (1.0, 11.0),
+            (2.0, 12.0),
+        ]
+        payload = bytearray()
+        for row in points:
+            payload.extend(struct.pack("<d", row[0]))
+            payload.extend(struct.pack("<f", row[1]))
+
+        blob = (
+            _build_header(
+                plot="Transient Analysis",
+                flags="real forward stepped",
+                variables=variables,
+                points=len(points),
+                encoding="utf-16le",
+            )
+            + "Binary:\n".encode("utf-16le")
+            + bytes(payload)
+        )
+        path = _write_blob(blob)
+        path.with_suffix(".log").write_text(
+            "LTspice log\n.step rval=1000\n.step rval=2000\n",
+            encoding="utf-16le",
+        )
+        data = parse_raw_file(path)
+
+        self.assertEqual(data.step_count, 2)
+        self.assertEqual(data.steps[0].label, "rval=1000")
+        self.assertEqual(data.steps[1].label, "rval=2000")
+        self.assertEqual(len(data.scale_values(step_index=0)), 3)
+        self.assertAlmostEqual(data.get_vector("V(out)", step_index=1)[0].real, 10.0, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

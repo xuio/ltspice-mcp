@@ -1,13 +1,23 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from .analysis import find_local_extrema, format_series, interpolate_series, sample_indices
+from .analysis import (
+    compute_bandwidth,
+    compute_gain_phase_margin,
+    compute_rise_fall_time,
+    compute_settling_time,
+    find_local_extrema,
+    format_series,
+    interpolate_series,
+    sample_indices,
+)
 from .ltspice import LTspiceRunner, find_ltspice_executable, get_ltspice_version, tail_text_file
 from .models import RawDataset, SimulationRun
 from .raw_parser import RawParseError, parse_raw_file
@@ -28,11 +38,50 @@ _runs: dict[str, SimulationRun] = {}
 _run_order: list[str] = []
 _loaded_netlist: Path | None = None
 _raw_cache: dict[Path, tuple[float, RawDataset]] = {}
+_state_path: Path = _DEFAULT_WORKDIR / ".ltspice_mcp_runs.json"
+
+
+def _save_run_state() -> None:
+    _state_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "runs": [_runs[run_id].to_storage_dict() for run_id in _run_order if run_id in _runs],
+    }
+    tmp_path = _state_path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp_path.replace(_state_path)
+
+
+def _load_run_state() -> None:
+    _runs.clear()
+    _run_order.clear()
+    if not _state_path.exists():
+        return
+
+    try:
+        payload = json.loads(_state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+
+    entries = payload.get("runs", [])
+    if not isinstance(entries, list):
+        return
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            run = SimulationRun.from_storage_dict(entry)
+        except Exception:
+            continue
+        _runs[run.run_id] = run
+        _run_order.append(run.run_id)
 
 
 def _register_run(run: SimulationRun) -> SimulationRun:
     _runs[run.run_id] = run
     _run_order.append(run.run_id)
+    _save_run_state()
     return run
 
 
@@ -115,6 +164,31 @@ def _resolve_dataset(plot: str | None, run_id: str | None, raw_path: str | None)
     return _load_dataset(primary)
 
 
+def _resolve_step_index(dataset: RawDataset, step_index: int | None) -> int | None:
+    if not dataset.steps:
+        return None
+    if step_index is None:
+        return 0
+    if step_index < 0 or step_index >= len(dataset.steps):
+        raise ValueError(f"step_index must be in range [0, {len(dataset.steps) - 1}]")
+    return step_index
+
+
+def _step_payload(dataset: RawDataset, step_index: int | None) -> dict[str, Any]:
+    if not dataset.steps:
+        return {
+            "step_count": 1,
+            "selected_step": 0 if step_index is None else step_index,
+            "steps": [{"step_index": 0, "start_index": 0, "end_index": dataset.points, "points": dataset.points}],
+        }
+    selected = _resolve_step_index(dataset, step_index)
+    return {
+        "step_count": dataset.step_count,
+        "selected_step": selected,
+        "steps": [step.as_dict() for step in dataset.steps],
+    }
+
+
 def _run_payload(run: SimulationRun, *, include_output: bool, log_tail_lines: int) -> dict[str, Any]:
     payload = run.as_dict(include_output=include_output)
     payload["log_tail"] = tail_text_file(run.log_path, max_lines=log_tail_lines)
@@ -128,6 +202,9 @@ def _sanitize_representation(value: str) -> str:
     return value
 
 
+_load_run_state()
+
+
 @mcp.tool()
 def getLtspiceStatus() -> dict[str, Any]:
     """Get LTspice executable status and server configuration."""
@@ -139,6 +216,7 @@ def getLtspiceStatus() -> dict[str, Any]:
         "workdir": str(_runner.workdir),
         "default_timeout_seconds": _runner.default_timeout_seconds,
         "runs_recorded": len(_run_order),
+        "run_state_path": str(_state_path),
     }
 
 
@@ -269,6 +347,7 @@ def getPlotNames(run_id: str | None = None, raw_path: str | None = None) -> dict
                     "plot_name": dataset.plot_name,
                     "raw_path": str(dataset.path),
                     "points": dataset.points,
+                    "step_count": dataset.step_count,
                 }
             ],
         }
@@ -283,6 +362,7 @@ def getPlotNames(run_id: str | None = None, raw_path: str | None = None) -> dict
                     "plot_name": dataset.plot_name,
                     "raw_path": str(candidate),
                     "points": dataset.points,
+                    "step_count": dataset.step_count,
                 }
             )
         except RawParseError as exc:
@@ -295,12 +375,14 @@ def getVectorsInfo(
     plot: str | None = None,
     run_id: str | None = None,
     raw_path: str | None = None,
+    step_index: int | None = None,
 ) -> dict[str, Any]:
     """Get detailed information about vectors in a plot."""
     dataset = _resolve_dataset(plot=plot, run_id=run_id, raw_path=raw_path)
+    selected_step = _resolve_step_index(dataset, step_index)
     vectors: list[dict[str, Any]] = []
     for variable in dataset.variables:
-        series = dataset.values[variable.index]
+        series = dataset.get_vector(variable.name, step_index=selected_step)
         vectors.append(
             {
                 "index": variable.index,
@@ -313,9 +395,11 @@ def getVectorsInfo(
     return {
         "plot_name": dataset.plot_name,
         "raw_path": str(dataset.path),
-        "points": dataset.points,
+        "points": len(dataset.scale_values(step_index=selected_step)),
+        "total_points": dataset.points,
         "flags": sorted(dataset.flags),
         "vectors": vectors,
+        **_step_payload(dataset, selected_step),
     }
 
 
@@ -325,6 +409,7 @@ def getVectorData(
     plot: str | None = None,
     run_id: str | None = None,
     raw_path: str | None = None,
+    step_index: int | None = None,
     points: list[float] | None = None,
     representation: str = "auto",
     max_points: int = 400,
@@ -335,7 +420,8 @@ def getVectorData(
     representation = _sanitize_representation(representation)
 
     dataset = _resolve_dataset(plot=plot, run_id=run_id, raw_path=raw_path)
-    scale = dataset.scale_values()
+    selected_step = _resolve_step_index(dataset, step_index)
+    scale = dataset.scale_values(step_index=selected_step)
 
     if points is not None:
         sampled_scale = points
@@ -343,14 +429,15 @@ def getVectorData(
         for vector_name in vectors:
             sampled_vectors[vector_name] = interpolate_series(
                 scale=scale,
-                series=dataset.get_vector(vector_name),
+                series=dataset.get_vector(vector_name, step_index=selected_step),
                 points=points,
             )
     else:
-        idx = sample_indices(dataset.points, max_points=max_points)
+        idx = sample_indices(len(scale), max_points=max_points)
         sampled_scale = [scale[i] for i in idx]
         sampled_vectors = {
-            vector_name: [dataset.get_vector(vector_name)[i] for i in idx] for vector_name in vectors
+            vector_name: [dataset.get_vector(vector_name, step_index=selected_step)[i] for i in idx]
+            for vector_name in vectors
         }
 
     payload_vectors: dict[str, Any] = {}
@@ -367,6 +454,7 @@ def getVectorData(
         "scale_name": dataset.scale_name,
         "scale_points": sampled_scale,
         "vectors": payload_vectors,
+        **_step_payload(dataset, selected_step),
     }
 
 
@@ -376,6 +464,7 @@ def getLocalExtrema(
     plot: str | None = None,
     run_id: str | None = None,
     raw_path: str | None = None,
+    step_index: int | None = None,
     options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Get local minima/maxima for vectors."""
@@ -389,13 +478,14 @@ def getLocalExtrema(
     max_results = int(options.get("max_results", 200))
 
     dataset = _resolve_dataset(plot=plot, run_id=run_id, raw_path=raw_path)
-    scale = dataset.scale_values()
+    selected_step = _resolve_step_index(dataset, step_index)
+    scale = dataset.scale_values(step_index=selected_step)
     extrema_by_vector: dict[str, Any] = {}
 
     for vector_name in vectors:
         extrema_by_vector[vector_name] = find_local_extrema(
             scale=scale,
-            series=dataset.get_vector(vector_name),
+            series=dataset.get_vector(vector_name, step_index=selected_step),
             include_minima=include_minima,
             include_maxima=include_maxima,
             threshold=threshold,
@@ -406,18 +496,141 @@ def getLocalExtrema(
         "plot_name": dataset.plot_name,
         "raw_path": str(dataset.path),
         "extrema": extrema_by_vector,
+        **_step_payload(dataset, selected_step),
+    }
+
+
+@mcp.tool()
+def getBandwidth(
+    vector: str,
+    plot: str | None = None,
+    run_id: str | None = None,
+    raw_path: str | None = None,
+    step_index: int | None = None,
+    reference: str = "first",
+    drop_db: float = 3.0,
+) -> dict[str, Any]:
+    """Compute -drop_db bandwidth for an AC response vector."""
+    dataset = _resolve_dataset(plot=plot, run_id=run_id, raw_path=raw_path)
+    selected_step = _resolve_step_index(dataset, step_index)
+    if dataset.scale_name.lower() != "frequency":
+        raise ValueError("Bandwidth requires a frequency-domain plot (AC analysis).")
+
+    result = compute_bandwidth(
+        frequency_hz=dataset.scale_values(step_index=selected_step),
+        response=dataset.get_vector(vector, step_index=selected_step),
+        reference=reference,
+        drop_db=drop_db,
+    )
+    return {
+        "plot_name": dataset.plot_name,
+        "raw_path": str(dataset.path),
+        "vector": vector,
+        **result,
+        **_step_payload(dataset, selected_step),
+    }
+
+
+@mcp.tool()
+def getGainPhaseMargin(
+    vector: str,
+    plot: str | None = None,
+    run_id: str | None = None,
+    raw_path: str | None = None,
+    step_index: int | None = None,
+) -> dict[str, Any]:
+    """Compute gain and phase margins from an AC loop-gain vector."""
+    dataset = _resolve_dataset(plot=plot, run_id=run_id, raw_path=raw_path)
+    selected_step = _resolve_step_index(dataset, step_index)
+    if dataset.scale_name.lower() != "frequency":
+        raise ValueError("Gain/phase margin requires a frequency-domain plot (AC analysis).")
+
+    result = compute_gain_phase_margin(
+        frequency_hz=dataset.scale_values(step_index=selected_step),
+        response=dataset.get_vector(vector, step_index=selected_step),
+    )
+    return {
+        "plot_name": dataset.plot_name,
+        "raw_path": str(dataset.path),
+        "vector": vector,
+        **result,
+        **_step_payload(dataset, selected_step),
+    }
+
+
+@mcp.tool()
+def getRiseFallTime(
+    vector: str,
+    plot: str | None = None,
+    run_id: str | None = None,
+    raw_path: str | None = None,
+    step_index: int | None = None,
+    low_threshold_pct: float = 10.0,
+    high_threshold_pct: float = 90.0,
+) -> dict[str, Any]:
+    """Compute first rise/fall times for a transient response."""
+    dataset = _resolve_dataset(plot=plot, run_id=run_id, raw_path=raw_path)
+    selected_step = _resolve_step_index(dataset, step_index)
+    if dataset.scale_name.lower() != "time":
+        raise ValueError("Rise/fall time requires a time-domain plot (transient analysis).")
+
+    result = compute_rise_fall_time(
+        time_s=dataset.scale_values(step_index=selected_step),
+        signal=dataset.get_vector(vector, step_index=selected_step),
+        low_threshold_pct=low_threshold_pct,
+        high_threshold_pct=high_threshold_pct,
+    )
+    return {
+        "plot_name": dataset.plot_name,
+        "raw_path": str(dataset.path),
+        "vector": vector,
+        **result,
+        **_step_payload(dataset, selected_step),
+    }
+
+
+@mcp.tool()
+def getSettlingTime(
+    vector: str,
+    plot: str | None = None,
+    run_id: str | None = None,
+    raw_path: str | None = None,
+    step_index: int | None = None,
+    tolerance_percent: float = 2.0,
+    target_value: float | None = None,
+) -> dict[str, Any]:
+    """Compute settling time to a target within tolerance_percent band."""
+    dataset = _resolve_dataset(plot=plot, run_id=run_id, raw_path=raw_path)
+    selected_step = _resolve_step_index(dataset, step_index)
+    if dataset.scale_name.lower() != "time":
+        raise ValueError("Settling time requires a time-domain plot (transient analysis).")
+
+    result = compute_settling_time(
+        time_s=dataset.scale_values(step_index=selected_step),
+        signal=dataset.get_vector(vector, step_index=selected_step),
+        tolerance_percent=tolerance_percent,
+        target_value=target_value,
+    )
+    return {
+        "plot_name": dataset.plot_name,
+        "raw_path": str(dataset.path),
+        "vector": vector,
+        **result,
+        **_step_payload(dataset, selected_step),
     }
 
 
 def _configure_runner(*, workdir: Path, ltspice_binary: str | None, timeout: int) -> None:
-    global _runner, _loaded_netlist, _raw_cache
+    global _runner, _loaded_netlist, _raw_cache, _state_path
     _runner = LTspiceRunner(
         workdir=workdir,
         executable=ltspice_binary,
         default_timeout_seconds=timeout,
     )
+    _state_path = workdir / ".ltspice_mcp_runs.json"
     _loaded_netlist = None
     _raw_cache = {}
+    _load_run_state()
 
 
 def main() -> None:

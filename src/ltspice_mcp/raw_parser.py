@@ -5,7 +5,8 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 
-from .models import RawDataset, RawVariable
+from .models import RawDataset, RawStep, RawVariable
+from .textio import read_text_auto
 
 
 class RawParseError(ValueError):
@@ -22,6 +23,7 @@ class _SectionMarker:
 
 _INT_RE = re.compile(r"-?\d+")
 _SCALAR_COMPLEX_RE = re.compile(r"^\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)$")
+_STEP_LINE_RE = re.compile(r"^\s*\.step\s+(.+?)\s*$", re.IGNORECASE)
 
 
 def _find_section_marker(blob: bytes) -> _SectionMarker:
@@ -183,6 +185,77 @@ def _parse_values_section(section_text: str, num_vars: int, num_points: int) -> 
     return values
 
 
+def _parse_step_labels_from_log(raw_path: Path) -> list[str]:
+    log_path = raw_path.with_suffix(".log")
+    if not log_path.exists():
+        return []
+
+    labels: list[str] = []
+    for raw_line in read_text_auto(log_path).splitlines():
+        match = _STEP_LINE_RE.match(raw_line)
+        if not match:
+            continue
+        labels.append(match.group(1).strip())
+    return labels
+
+
+def _detect_step_starts(scale: list[float]) -> list[int]:
+    if len(scale) < 2:
+        return [0]
+    starts = [0]
+    for idx in range(1, len(scale)):
+        prev = scale[idx - 1]
+        curr = scale[idx]
+        tol = max(1e-30, abs(prev) * 1e-12, abs(curr) * 1e-12)
+        if curr < prev - tol:
+            starts.append(idx)
+    return starts
+
+
+def _build_steps(
+    *,
+    raw_path: Path,
+    flags: set[str],
+    values: list[list[complex]],
+) -> list[RawStep]:
+    total_points = len(values[0]) if values else 0
+    if total_points <= 0:
+        return [RawStep(index=0, start=0, end=0)]
+
+    labels = _parse_step_labels_from_log(raw_path)
+    if "stepped" not in flags:
+        return [RawStep(index=0, start=0, end=total_points, label=labels[0] if labels else None)]
+
+    starts = _detect_step_starts([value.real for value in values[0]])
+    if len(starts) == 1 and labels:
+        if total_points == len(labels):
+            starts = list(range(total_points))
+        elif total_points % len(labels) == 0:
+            points_per_step = total_points // len(labels)
+            starts = [step_idx * points_per_step for step_idx in range(len(labels))]
+
+    starts = sorted(set(starts))
+    if starts[0] != 0:
+        starts.insert(0, 0)
+    if starts[-1] != total_points:
+        starts.append(total_points)
+    else:
+        starts = starts + [total_points]
+
+    steps: list[RawStep] = []
+    for step_idx in range(len(starts) - 1):
+        start = starts[step_idx]
+        end = starts[step_idx + 1]
+        if end <= start:
+            continue
+        label = labels[step_idx] if step_idx < len(labels) else None
+        steps.append(RawStep(index=step_idx, start=start, end=end, label=label))
+
+    if not steps:
+        steps = [RawStep(index=0, start=0, end=total_points, label=labels[0] if labels else None)]
+    return steps
+
+
 def parse_raw_file(path: str | Path) -> RawDataset:
     raw_path = Path(path).expanduser().resolve()
     blob = raw_path.read_bytes()
@@ -219,6 +292,11 @@ def parse_raw_file(path: str | Path) -> RawDataset:
         values = _parse_values_section(section_text, num_vars=num_vars, num_points=num_points)
 
     plot_name = metadata.get("Plotname", "Unknown Plot")
+    steps = _build_steps(
+        raw_path=raw_path,
+        flags=flags,
+        values=values,
+    )
     return RawDataset(
         path=raw_path,
         plot_name=plot_name,
@@ -226,4 +304,5 @@ def parse_raw_file(path: str | Path) -> RawDataset:
         metadata=metadata,
         variables=variables,
         values=values,
+        steps=steps,
     )
