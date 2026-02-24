@@ -223,6 +223,24 @@ C1 out 0 1u
 .end
 """.strip()
 
+            loaded = _extract_call_result(
+                await session.call_tool(
+                    "loadCircuit",
+                    {
+                        "netlist": netlist,
+                        "circuit_name": "smoke_rc_load_only",
+                    },
+                )
+            )
+            _require(isinstance(loaded, dict), "loadCircuit did not return an object")
+            _require(loaded.get("loaded") is True, "loadCircuit did not mark circuit as loaded")
+            _require(loaded.get("asc_path"), "loadCircuit missing generated asc_path")
+            _require(
+                Path(str(loaded.get("asc_path"))).exists(),
+                "loadCircuit reported asc_path but file is missing",
+            )
+            print("loadCircuit schematic generation check passed")
+
             run = _extract_call_result(
                 await session.call_tool(
                     "simulateNetlist",

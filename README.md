@@ -170,6 +170,7 @@ Per simulation call:
 - `createSchematicFromTemplate`: generate `.asc` from template type `netlist` or `spec`
 - `syncSchematicFromNetlistFile`: only regenerate `.asc` when source netlist content changes
 - `watchSchematicFromNetlistFile`: poll netlist changes and emit rebuild events
+- `loadCircuit`: also attempts netlist-to-schematic generation and returns `asc_path` when successful
 
 All create/sync/watch schematic tools return an `asc_path` and support `open_ui` to open the resulting schematic in LTspice.
 

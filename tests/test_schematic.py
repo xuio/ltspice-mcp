@@ -6,6 +6,7 @@ from pathlib import Path
 
 from ltspice_mcp.schematic import (
     PinDef,
+    SymbolLibrary,
     SymbolDef,
     _transform_point,
     build_schematic_from_template,
@@ -191,6 +192,68 @@ class TestSchematicBuilders(unittest.TestCase):
         self.assertEqual(result["poll_count"], 1)
         self.assertEqual(result["updates_count"], 1)
         self.assertTrue(result["updates"][0]["updated"])
+
+    def test_real_symbol_rc_lowpass_capacitor_connectivity(self) -> None:
+        try:
+            lib = SymbolLibrary()
+        except FileNotFoundError:
+            self.skipTest("LTspice lib.zip not available on this machine.")
+
+        output_path = self.temp_dir / "real_symbol_rc.asc"
+        result = build_schematic_from_netlist(
+            workdir=self.temp_dir,
+            netlist_content=(
+                "* RC low-pass\n"
+                "V1 in 0 AC 1\n"
+                "R1 in out 1k\n"
+                "C1 out 0 100n\n"
+                ".ac dec 30 10 1e6\n"
+                ".op\n"
+                ".end\n"
+            ),
+            circuit_name="real_symbol_rc",
+            output_path=str(output_path),
+            library=lib,
+        )
+        asc = Path(result["asc_path"])
+        text = asc.read_text(encoding="utf-8")
+
+        cap_x = cap_y = None
+        cap_orientation = None
+        wires: list[tuple[int, int, int, int]] = []
+        flags: list[tuple[int, int, str]] = []
+
+        for raw in text.splitlines():
+            parts = raw.split()
+            if not parts:
+                continue
+            if parts[0] == "SYMBOL" and len(parts) >= 5 and parts[1].lower() == "cap":
+                cap_x = int(parts[2])
+                cap_y = int(parts[3])
+                cap_orientation = parts[4]
+            elif parts[0] == "WIRE" and len(parts) >= 5:
+                wires.append((int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4])))
+            elif parts[0] == "FLAG" and len(parts) >= 4:
+                flags.append((int(parts[1]), int(parts[2]), parts[3]))
+
+        self.assertIsNotNone(cap_x, "Capacitor symbol not found in generated schematic.")
+        self.assertIsNotNone(cap_y, "Capacitor symbol not found in generated schematic.")
+        self.assertEqual(cap_orientation, "R0", "RC low-pass capacitor should be vertical to ground.")
+
+        pin1_dx, pin1_dy = lib.pin_offset("cap", orientation=cap_orientation, spice_order=1)
+        pin2_dx, pin2_dy = lib.pin_offset("cap", orientation=cap_orientation, spice_order=2)
+        cap_pin1 = (cap_x + pin1_dx, cap_y + pin1_dy)
+        cap_pin2 = (cap_x + pin2_dx, cap_y + pin2_dy)
+
+        self.assertTrue(
+            any((x1, y1) == cap_pin1 or (x2, y2) == cap_pin1 for x1, y1, x2, y2 in wires),
+            "Capacitor signal pin is not connected to any wire.",
+        )
+        self.assertIn(
+            (cap_pin2[0], cap_pin2[1], "0"),
+            flags,
+            "Capacitor ground pin is not tied to net 0.",
+        )
 
 
 if __name__ == "__main__":

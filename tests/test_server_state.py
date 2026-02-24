@@ -88,6 +88,30 @@ class TestServerStatePersistence(unittest.TestCase):
         self.assertEqual(event["requested_path"], str(source_asc.resolve()))
         self.assertEqual(event["ui_path"], str(source_asc.resolve()))
 
+    def test_load_circuit_generates_schematic(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_load_circuit_test_"))
+        server._configure_runner(workdir=temp_dir, ltspice_binary=None, timeout=10)
+
+        result = server.loadCircuit(
+            netlist=(
+                "* RC low-pass\n"
+                "V1 in 0 AC 1\n"
+                "R1 in out 1k\n"
+                "C1 out 0 100n\n"
+                ".ac dec 20 10 1e6\n"
+                ".end\n"
+            ),
+            circuit_name="rc_load_case",
+        )
+
+        self.assertTrue(result["loaded"])
+        self.assertIn("asc_path", result)
+        asc_path = Path(result["asc_path"])
+        self.assertTrue(asc_path.exists())
+        text = asc_path.read_text(encoding="utf-8")
+        self.assertIn("SYMBOL res", text)
+        self.assertIn("SYMBOL cap", text)
+
 
 if __name__ == "__main__":
     unittest.main()

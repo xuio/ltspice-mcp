@@ -1079,7 +1079,21 @@ def loadCircuit(netlist: str, circuit_name: str = "circuit") -> dict[str, Any]:
     global _loaded_netlist
     path = _runner.write_netlist(netlist, circuit_name=circuit_name)
     _loaded_netlist = path
-    return {"netlist_path": str(path), "loaded": True}
+    response: dict[str, Any] = {"netlist_path": str(path), "loaded": True}
+    try:
+        schematic = build_schematic_from_netlist(
+            workdir=_runner.workdir,
+            netlist_content=netlist,
+            circuit_name=f"{circuit_name}_schematic",
+            output_path=str(path.with_suffix(".asc")),
+            sheet_width=1200,
+            sheet_height=900,
+        )
+        response["asc_path"] = schematic["asc_path"]
+        response["schematic"] = schematic
+    except Exception as exc:
+        response["schematic_error"] = str(exc)
+    return response
 
 
 @mcp.tool()
