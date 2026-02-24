@@ -293,10 +293,34 @@ Task {
             selected = candidates.max(by: { ($0.frame.width * $0.frame.height) < ($1.frame.width * $1.frame.height) })!
         }
 
-        let filter = SCContentFilter(desktopIndependentWindow: selected)
+        guard let display = shareable.displays.first(where: { candidate in
+            let center = CGPoint(x: selected.frame.midX, y: selected.frame.midY)
+            return candidate.frame.contains(center)
+        }) ?? shareable.displays.first else {
+            fputs("No display found for LTspice window.\n", stderr)
+            failed = true
+            return
+        }
+
+        let filter = SCContentFilter(display: display, excludingWindows: [])
         let configuration = SCStreamConfiguration()
-        configuration.width = max(1, Int(selected.frame.width))
-        configuration.height = max(1, Int(selected.frame.height))
+        let localRect = CGRect(
+            x: selected.frame.origin.x - display.frame.origin.x,
+            y: selected.frame.origin.y - display.frame.origin.y,
+            width: selected.frame.width,
+            height: selected.frame.height
+        )
+        let displayRect = CGRect(origin: .zero, size: display.frame.size)
+        let clippedRect = localRect.intersection(displayRect)
+        guard !clippedRect.isNull && clippedRect.width > 1 && clippedRect.height > 1 else {
+            fputs("Selected LTspice window has invalid capture rect.\n", stderr)
+            failed = true
+            return
+        }
+
+        configuration.sourceRect = clippedRect
+        configuration.width = max(1, Int(clippedRect.width))
+        configuration.height = max(1, Int(clippedRect.height))
         let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
 
         guard let destination = CGImageDestinationCreateWithURL(
@@ -327,8 +351,15 @@ Task {
                 "height": selected.frame.height
             ],
             "capture_mode": "screencapturekit_window",
+            "capture_strategy": "display_crop",
             "captured_width": image.width,
-            "captured_height": image.height
+            "captured_height": image.height,
+            "display_frame": [
+                "x": display.frame.origin.x,
+                "y": display.frame.origin.y,
+                "width": display.frame.width,
+                "height": display.frame.height
+            ]
         ]
         emitJSON(payload)
     } catch {
@@ -487,10 +518,10 @@ def capture_ltspice_window_screenshot(
         title_hint = Path(open_path).name
 
     capture_command: list[str] | None = None
-    capture_backend = "screencapture"
+    capture_backend = "screencapturekit" if prefer_screencapturekit else "screencapture"
+    capture_stderr = ""
     window_id: int | None = None
     window_info: dict[str, Any] = {}
-    screencapturekit_error: str | None = None
 
     if prefer_screencapturekit:
         try:
@@ -504,17 +535,10 @@ def capture_ltspice_window_screenshot(
             if isinstance(raw_window_id, int):
                 window_id = raw_window_id
         except Exception as exc:
-            screencapturekit_error = str(exc)
-            window_info = {"warning": screencapturekit_error}
-
-    if capture_backend != "screencapturekit" and prefer_screencapturekit:
-        raise RuntimeError(
-            screencapturekit_error
-            or "ScreenCaptureKit capture failed before fallback."
-        )
+            raise RuntimeError(f"ScreenCaptureKit capture failed: {exc}") from exc
 
     if capture_backend != "screencapturekit":
-        # Fallback path: capture a single LTspice window if possible.
+        # Optional non-ScreenCaptureKit path when explicitly requested.
         capture_command = ["screencapture", "-x", str(target)]
         capture = subprocess.run(
             capture_command,
@@ -526,6 +550,7 @@ def capture_ltspice_window_screenshot(
             raise RuntimeError(
                 f"screencapture failed (rc={capture.returncode}): {capture.stderr.strip()}"
             )
+        capture_stderr = capture.stderr.strip()
     else:
         capture = None
 
@@ -547,7 +572,7 @@ def capture_ltspice_window_screenshot(
         "downscale": downscale_info,
         "width": width,
         "height": height,
-        "capture_stderr": (capture.stderr.strip() if capture is not None else ""),
+        "capture_stderr": capture_stderr,
     }
 
 

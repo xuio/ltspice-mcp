@@ -202,7 +202,7 @@ Downscale:
 - `downscale_factor` (e.g. `0.5`) is supported for symbol, schematic, and plot image tools.
 
 LTspice screenshot behavior:
-- uses window-targeted capture (not full display capture) when `backend=ltspice`
+- uses ScreenCaptureKit display-crop capture constrained to LTspice window bounds when `backend=ltspice`
 - opens targets in background (`open -g`) to avoid forcing a Space switch while rendering
 - designed to keep working even if LTspice is on a different macOS Space
 

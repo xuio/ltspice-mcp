@@ -55,27 +55,6 @@ class TestScreenCaptureKitIntegration(unittest.TestCase):
             raise unittest.SkipTest(f"Failed to warm up LTspice UI: {warmup_event}")
         time.sleep(1.5)
 
-    def _capture_wrapper_with_retry(self, output_path: Path, attempts: int = 3) -> dict[str, object]:
-        last_error: Exception | None = None
-        for _ in range(attempts):
-            try:
-                return capture_ltspice_window_screenshot(
-                    output_path=output_path,
-                    open_path=self.asc_path,
-                    title_hint=self.asc_path.name,
-                    settle_seconds=2.0,
-                    downscale_factor=0.6,
-                    avoid_space_switch=True,
-                    prefer_screencapturekit=True,
-                )
-            except RuntimeError as exc:
-                last_error = exc
-                if "SCStreamErrorDomain" not in str(exc):
-                    raise
-                time.sleep(1.0)
-        assert last_error is not None
-        raise last_error
-
     def test_real_screencapturekit_helper(self) -> None:
         open_event = open_in_ltspice_ui(self.asc_path, background=True)
         self.assertTrue(open_event.get("opened"), f"LTspice open failed: {open_event}")
@@ -95,7 +74,15 @@ class TestScreenCaptureKitIntegration(unittest.TestCase):
 
     def test_real_capture_ltspice_window_screenshot(self) -> None:
         output_path = self.temp_dir / "capture_wrapper.png"
-        payload = self._capture_wrapper_with_retry(output_path=output_path)
+        payload = capture_ltspice_window_screenshot(
+            output_path=output_path,
+            open_path=self.asc_path,
+            title_hint=self.asc_path.name,
+            settle_seconds=1.5,
+            downscale_factor=0.6,
+            avoid_space_switch=True,
+            prefer_screencapturekit=True,
+        )
 
         self.assertTrue(output_path.exists(), "capture_ltspice_window_screenshot did not write an image.")
         self.assertGreater(output_path.stat().st_size, 0, "Captured image is empty.")
