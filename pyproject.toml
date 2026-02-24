@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ltspice-mcp"
+version = "0.1.0"
+description = "Model Context Protocol server for LTspice on macOS"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp>=1.6.0",
+]
+
+[project.scripts]
+ltspice-mcp = "ltspice_mcp.server:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
