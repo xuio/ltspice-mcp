@@ -632,7 +632,35 @@ def close_ltspice_window(
         '      end try\n'
         '      if didClose then set closeCount to closeCount + 1\n'
         '    end repeat\n'
-        '    return "OK|" & (matchCount as text) & "|" & (closeCount as text)\n'
+        '    set closeStrategy to "ax"\n'
+        '    if closeCount < matchCount or matchCount is 0 then\n'
+        '      set menuMatchCount to 0\n'
+        '      try\n'
+        '        set windowMenu to menu 1 of menu bar item "Window" of menu bar 1\n'
+        '        set fileMenu to menu 1 of menu bar item "File" of menu bar 1\n'
+        '        repeat with mi in menu items of windowMenu\n'
+        '          set itemName to ""\n'
+        '          try\n'
+        '            set itemName to (name of mi) as text\n'
+        '          end try\n'
+        '          set menuItemMatch to false\n'
+        '          if targetExactName is not "" and itemName is targetExactName then set menuItemMatch to true\n'
+        '          if (not menuItemMatch) and targetContainsName is not "" and itemName contains targetContainsName then set menuItemMatch to true\n'
+        '          if menuItemMatch then\n'
+        '            set menuMatchCount to menuMatchCount + 1\n'
+        '            try\n'
+        '              click mi\n'
+        '              delay 0.05\n'
+        '              click menu item "Close" of fileMenu\n'
+        '              set closeCount to closeCount + 1\n'
+        '              set closeStrategy to "menu"\n'
+        '            end try\n'
+        '          end if\n'
+        '        end repeat\n'
+        '      end try\n'
+        '      if menuMatchCount > matchCount then set matchCount to menuMatchCount\n'
+        '    end if\n'
+        '    return "OK|" & (matchCount as text) & "|" & (closeCount as text) & "|" & closeStrategy\n'
         '  end tell\n'
         'end tell'
     )
@@ -645,15 +673,18 @@ def close_ltspice_window(
     status = "UNKNOWN"
     matched_windows = 0
     closed_windows = 0
+    close_strategy = None
     for raw_line in reversed(proc.stdout.splitlines()):
         line = raw_line.strip()
         if not line:
             continue
         parts = line.split("|")
-        if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+        if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
             status = parts[0]
             matched_windows = int(parts[1])
             closed_windows = int(parts[2])
+            if len(parts) >= 4 and parts[3]:
+                close_strategy = parts[3]
             break
     if status == "UNKNOWN" and proc.returncode == 0:
         status = "OK"
@@ -664,6 +695,7 @@ def close_ltspice_window(
         "partially_closed": proc.returncode == 0 and 0 < closed_windows < matched_windows,
         "matched_windows": matched_windows,
         "closed_windows": closed_windows,
+        "close_strategy": close_strategy,
         "status": status,
         "return_code": proc.returncode,
         "title_hint": title_hint,

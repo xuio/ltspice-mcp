@@ -213,6 +213,21 @@ class TestCloseLtspiceWindow(unittest.TestCase):
         self.assertEqual(payload["closed_windows"], 0)
         self.assertEqual(payload["status"], "OK")
 
+    def test_close_ltspice_window_parses_close_strategy_suffix(self) -> None:
+        with (
+            patch("ltspice_mcp.ltspice.platform.system", return_value="Darwin"),
+            patch("ltspice_mcp.ltspice.subprocess.run") as run_mock,
+        ):
+            run_mock.return_value = CompletedProcess(
+                args=["osascript"],
+                returncode=0,
+                stdout="OK|1|1|menu\n",
+                stderr="",
+            )
+            payload = close_ltspice_window("foo.asc")
+        self.assertTrue(payload["closed"])
+        self.assertEqual(payload["close_strategy"], "menu")
+
 
 if __name__ == "__main__":
     unittest.main()
