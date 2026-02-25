@@ -104,6 +104,8 @@ _DEFAULT_SCHEMATIC_SINGLE_WINDOW = _read_env_bool(
     default=True,
 )
 _DEFAULT_SCHEMATIC_LIVE_PATH = os.getenv("LTSPICE_MCP_SCHEMATIC_LIVE_PATH")
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_AGENT_README_PATH = _PROJECT_ROOT / "AGENT_README.md"
 
 _runner = LTspiceRunner(
     workdir=_DEFAULT_WORKDIR,
@@ -440,6 +442,97 @@ def _percentile(values: list[float], pct: float) -> float | None:
     pct_clamped = max(0.0, min(1.0, float(pct)))
     idx = int(round((len(ordered) - 1) * pct_clamped))
     return float(ordered[idx])
+
+
+def _read_agent_readme_text() -> str:
+    if not _AGENT_README_PATH.exists():
+        raise FileNotFoundError(f"Agent guide not found: {_AGENT_README_PATH}")
+    return _AGENT_README_PATH.read_text(encoding="utf-8")
+
+
+def _parse_markdown_headings(text: str) -> list[dict[str, Any]]:
+    headings: list[dict[str, Any]] = []
+    for line_no, raw_line in enumerate(text.splitlines(), start=1):
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", raw_line)
+        if not match:
+            continue
+        level = len(match.group(1))
+        title = match.group(2).strip()
+        headings.append(
+            {
+                "index": len(headings) + 1,
+                "line_number": line_no,
+                "level": level,
+                "title": title,
+            }
+        )
+    return headings
+
+
+def _resolve_heading_query(
+    headings: list[dict[str, Any]],
+    section: str,
+) -> dict[str, Any] | None:
+    query = section.strip()
+    if not query:
+        return None
+    if query.isdigit():
+        idx = int(query)
+        if idx <= 0:
+            return None
+        for heading in headings:
+            if int(heading["index"]) == idx:
+                return heading
+    normalized = query.casefold()
+    for heading in headings:
+        if str(heading["title"]).casefold() == normalized:
+            return heading
+    for heading in headings:
+        if normalized in str(heading["title"]).casefold():
+            return heading
+    return None
+
+
+def _extract_heading_section(
+    text: str,
+    headings: list[dict[str, Any]],
+    heading: dict[str, Any],
+) -> str:
+    lines = text.splitlines()
+    start_line = int(heading["line_number"])
+    start_idx = max(0, start_line - 1)
+    end_idx = len(lines)
+    selected_level = int(heading["level"])
+    for candidate in headings:
+        if int(candidate["line_number"]) <= start_line:
+            continue
+        if int(candidate["level"]) <= selected_level:
+            end_idx = int(candidate["line_number"]) - 1
+            break
+    section_lines = lines[start_idx:end_idx]
+    content = "\n".join(section_lines).strip()
+    if content:
+        content += "\n"
+    return content
+
+
+def _search_text_lines(
+    text: str,
+    query: str,
+    *,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    needle = query.strip().casefold()
+    if not needle:
+        return []
+    matches: list[dict[str, Any]] = []
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        if needle not in line.casefold():
+            continue
+        matches.append({"line_number": line_no, "line": line})
+        if len(matches) >= limit:
+            break
+    return matches
 
 
 def _telemetry_payload() -> dict[str, Any]:
@@ -2557,6 +2650,74 @@ def _lint_schematic_file(
 
 
 _load_run_state()
+
+
+@mcp.resource(
+    "docs://agent-readme",
+    name="agent_readme",
+    title="LTspice MCP Agent Playbook",
+    description="Agent-focused operational guide for this MCP server.",
+    mime_type="text/markdown",
+)
+def agent_readme_resource() -> str:
+    return _read_agent_readme_text()
+
+
+@mcp.tool()
+def readAgentGuide(
+    section: str | None = None,
+    query: str | None = None,
+    include_headings: bool = True,
+    max_chars: int = 20000,
+) -> dict[str, Any]:
+    """
+    Read AGENT_README.md through MCP for interactive agent guidance.
+
+    - section: heading index (1-based) or heading title (exact/contains match)
+    - query: optional case-insensitive text search
+    """
+    safe_max_chars = max(500, min(120000, int(max_chars)))
+    text = _read_agent_readme_text()
+    headings = _parse_markdown_headings(text)
+    content = text
+    selected_heading: dict[str, Any] | None = None
+    warning: str | None = None
+
+    if section:
+        selected_heading = _resolve_heading_query(headings, section)
+        if selected_heading is None:
+            warning = f"Section '{section}' not found. Returning full guide."
+        else:
+            content = _extract_heading_section(text, headings, selected_heading)
+
+    search_matches: list[dict[str, Any]] = []
+    if query:
+        search_matches = _search_text_lines(content, query, limit=20)
+        if not search_matches and selected_heading is not None:
+            warning = (
+                warning
+                or f"No matches for query '{query}' in section '{selected_heading.get('title')}'."
+            )
+        elif not search_matches:
+            warning = warning or f"No matches for query '{query}' in guide."
+
+    truncated = len(content) > safe_max_chars
+    trimmed_content = content[:safe_max_chars]
+    return {
+        "path": str(_AGENT_README_PATH),
+        "section_requested": section,
+        "section_resolved": selected_heading,
+        "query": query,
+        "match_count": len(search_matches),
+        "matches": search_matches,
+        "include_headings": bool(include_headings),
+        "headings": headings if include_headings else None,
+        "max_chars": safe_max_chars,
+        "content_chars": len(content),
+        "truncated": truncated,
+        "content": trimmed_content,
+        "warning": warning,
+    }
 
 
 @mcp.tool()

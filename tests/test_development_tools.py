@@ -7,6 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import anyio
+
 from ltspice_mcp import server
 from ltspice_mcp.models import RawDataset, RawVariable, SimulationDiagnostic, SimulationRun
 
@@ -528,6 +530,33 @@ class TestDevelopmentTools(unittest.TestCase):
         payload = server._run_payload(run, include_output=False, log_tail_lines=10)
         self.assertIn("log_tail_utf8", payload)
         self.assertEqual(payload["log_tail_utf8"], "A\nB")
+
+    def test_read_agent_guide_supports_section_and_query(self) -> None:
+        payload = server.readAgentGuide(
+            section="1",
+            query="daemon",
+            include_headings=True,
+            max_chars=8000,
+        )
+        self.assertTrue(payload["path"].endswith("AGENT_README.md"))
+        self.assertIsNotNone(payload["section_resolved"])
+        self.assertGreaterEqual(payload["match_count"], 1)
+        self.assertIsInstance(payload["headings"], list)
+        self.assertIn("LTspice MCP Agent Playbook", payload["content"])
+
+    def test_agent_readme_resource_is_registered_and_readable(self) -> None:
+        resources = server.mcp._resource_manager.list_resources()  # type: ignore[attr-defined]
+        uris = {str(item.uri) for item in resources}
+        self.assertIn("docs://agent-readme", uris)
+
+        async def _read_resource() -> str:
+            resource = await server.mcp._resource_manager.get_resource(  # type: ignore[attr-defined]
+                "docs://agent-readme"
+            )
+            return await resource.read()
+
+        content = anyio.run(_read_resource)
+        self.assertIn("LTspice MCP Agent Playbook", content)
 
 
 if __name__ == "__main__":

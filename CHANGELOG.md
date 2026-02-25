@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.29.0 - 2026-02-25
+
+### Added
+- MCP resource `docs://agent-readme` to serve `AGENT_README.md` directly through MCP.
+- MCP tool `readAgentGuide` with section selection and text search for interactive agent guidance.
+
+### Improved
+- Reworked `README.md` into a quickstart-first layout with clearer sections and reduced duplication.
+- Reworked `AGENT_README.md` into a concise operational playbook focused on the real agent workflow.
+
+### Tests
+- Added regression coverage for `readAgentGuide` and MCP resource registration/readability for `docs://agent-readme`.
+
 ## v1.28.0 - 2026-02-25
 
 ### Added
