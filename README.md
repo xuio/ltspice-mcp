@@ -377,11 +377,6 @@ Render sessions:
 - `renderLtspiceSchematicImage` and `renderLtspicePlotImage` accept `render_session_id` to reuse that window and skip auto-close.
 - `endLtspiceRenderSession` closes the associated window.
 
-Rendering backend options:
-- `backend=auto` (default): use real LTspice UI screenshot mode
-- `backend=ltspice`: force LTspice UI screenshot mode
-- `backend=svg`: force deterministic SVG renderer (explicit opt-in)
-
 Plot rendering specifics:
 - `renderLtspicePlotImage` writes a companion `.plt` file next to the RAW file so LTspice opens with the requested traces preselected.
 - This avoids UI button/menu interaction for trace selection and keeps rendering on LTspice's native plot engine.
@@ -401,7 +396,7 @@ Downscale:
 - `downscale_factor` (e.g. `0.5`) is supported for symbol, schematic, and plot image tools.
 
 LTspice screenshot behavior:
-- uses ScreenCaptureKit direct-window capture (`SCContentFilter(desktopIndependentWindow:)`) when `backend=ltspice`
+- uses ScreenCaptureKit direct-window capture (`SCContentFilter(desktopIndependentWindow:)`)
 - runs capture through a persistent helper binary (`ltspice-sck-helper`) so macOS Screen Recording can be approved once per helper path
 - opens LTspice in the background (`open -g -j`) to reduce Space switching
 - captures the first frame from an `SCStream` for reliability, including LTspice windows that are off-screen/in other Spaces

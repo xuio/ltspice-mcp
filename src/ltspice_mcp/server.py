@@ -59,7 +59,6 @@ from .schematic import (
     watch_schematic_from_netlist_file,
 )
 from .textio import read_text_auto
-from .visualization import render_plot_svg, render_schematic_svg, render_symbol_svg
 
 
 mcp = FastMCP("ltspice-mcp-macos")
@@ -1115,13 +1114,6 @@ def _validate_plot_capture(path: Path) -> dict[str, Any]:
         "min_green_pixels": min_green_pixels,
         "valid": valid,
     }
-
-
-def _normalize_image_backend(value: str) -> str:
-    backend = value.strip().lower()
-    if backend not in {"auto", "ltspice", "svg"}:
-        raise ValueError("backend must be one of: auto, ltspice, svg")
-    return backend
 
 
 def _image_tool_result(payload: dict[str, Any]) -> CallToolResult:
@@ -2334,7 +2326,6 @@ def renderLtspiceSymbolImage(
     width: int = 640,
     height: int = 420,
     downscale_factor: float = 1.0,
-    backend: str = "auto",
     settle_seconds: float = 1.0,
     include_pins: bool = True,
     include_pin_labels: bool = True,
@@ -2348,72 +2339,52 @@ def renderLtspiceSymbolImage(
     if not symbol.strip():
         raise ValueError("symbol must be a non-empty string")
 
-    normalized_backend = _normalize_image_backend(backend)
-    warnings: list[str] = []
-
-    if normalized_backend in {"auto", "ltspice"}:
-        try:
-            preview = build_schematic_from_spec(
-                workdir=_runner.workdir,
-                components=[
-                    {
-                        "symbol": symbol,
-                        "reference": "X1",
-                        "x": 240,
-                        "y": 180,
-                        "value": symbol,
-                    }
-                ],
-                circuit_name=f"symbol_preview_{symbol}",
-                sheet_width=max(600, width),
-                sheet_height=max(420, height),
-            )
-            screenshot_payload = capture_ltspice_window_screenshot(
-                output_path=_resolve_png_output_path(
-                    kind="symbols",
-                    name=symbol,
-                    output_path=output_path,
-                ),
-                open_path=preview["asc_path"],
-                title_hint=f"symbol_preview_{symbol}",
-                settle_seconds=settle_seconds,
-                downscale_factor=downscale_factor,
-                avoid_space_switch=True,
-                prefer_screencapturekit=True,
-            )
-            payload = {
-                **screenshot_payload,
-                "symbol": symbol,
-                "preview_asc_path": preview["asc_path"],
-                "backend_requested": normalized_backend,
-                "backend_used": "ltspice",
-            }
-            return _image_tool_result(payload)
-        except Exception as exc:
-            if normalized_backend == "ltspice":
-                raise
-            warnings.append(f"ltspice backend failed; fell back to svg: {exc}")
-
-    symbol_lib = _resolve_symbol_library(lib_zip_path)
-    svg_output_path = output_path
-    if output_path and Path(output_path).suffix.lower() not in {".svg"}:
-        svg_output_path = str(Path(output_path).with_suffix(".svg"))
-        warnings.append("output_path suffix adjusted to .svg for svg backend")
-    payload = render_symbol_svg(
+    preview = build_schematic_from_spec(
         workdir=_runner.workdir,
-        symbol=symbol,
-        output_path=svg_output_path,
-        width=width,
-        height=height,
-        downscale_factor=downscale_factor,
-        include_pins=include_pins,
-        include_pin_labels=include_pin_labels,
-        library=symbol_lib,
+        components=[
+            {
+                "symbol": symbol,
+                "reference": "X1",
+                "x": 240,
+                "y": 180,
+                "value": symbol,
+            }
+        ],
+        circuit_name=f"symbol_preview_{symbol}",
+        sheet_width=max(600, width),
+        sheet_height=max(420, height),
     )
-    payload["backend_requested"] = normalized_backend
-    payload["backend_used"] = "svg"
-    if warnings:
-        payload["warnings"] = warnings
+    screenshot_payload = capture_ltspice_window_screenshot(
+        output_path=_resolve_png_output_path(
+            kind="symbols",
+            name=symbol,
+            output_path=output_path,
+        ),
+        open_path=preview["asc_path"],
+        title_hint=f"symbol_preview_{symbol}",
+        settle_seconds=settle_seconds,
+        downscale_factor=downscale_factor,
+        avoid_space_switch=True,
+        prefer_screencapturekit=True,
+    )
+    payload: dict[str, Any] = {
+        **screenshot_payload,
+        "symbol": symbol,
+        "preview_asc_path": preview["asc_path"],
+        "backend_used": "ltspice",
+    }
+    ignored = []
+    if not include_pins:
+        ignored.append("include_pins")
+    if not include_pin_labels:
+        ignored.append("include_pin_labels")
+    if lib_zip_path:
+        ignored.append("lib_zip_path")
+    if ignored:
+        payload["warnings"] = [
+            "The following parameters are ignored for LTspice-native rendering: "
+            + ", ".join(ignored)
+        ]
     return _image_tool_result(payload)
 
 
@@ -2424,7 +2395,6 @@ def renderLtspiceSchematicImage(
     width: int = 1400,
     height: int = 900,
     downscale_factor: float = 1.0,
-    backend: str = "auto",
     settle_seconds: float = 1.0,
     include_symbol_graphics: bool = True,
     lib_zip_path: str | None = None,
@@ -2435,70 +2405,53 @@ def renderLtspiceSchematicImage(
 
     `downscale_factor` lets clients request smaller rendered images.
     """
-    normalized_backend = _normalize_image_backend(backend)
     asc_resolved = Path(asc_path).expanduser().resolve()
-    warnings: list[str] = []
-
-    if normalized_backend in {"auto", "ltspice"}:
-        try:
-            open_path = asc_resolved
-            title_hint = asc_resolved.name
-            close_after_capture = True
-            if render_session_id:
-                session = _render_sessions.get(render_session_id)
-                if not session:
-                    raise ValueError(f"Unknown render_session_id '{render_session_id}'")
-                if session.get("path") and Path(session["path"]) != asc_resolved:
-                    raise ValueError("render_session_id is bound to a different path")
-                open_path = None
-                title_hint = str(session.get("title_hint") or asc_resolved.name)
-                close_after_capture = False
-            screenshot_payload = capture_ltspice_window_screenshot(
-                output_path=_resolve_png_output_path(
-                    kind="schematics",
-                    name=asc_resolved.stem,
-                    output_path=output_path,
-                ),
-                open_path=open_path,
-                title_hint=title_hint,
-                settle_seconds=settle_seconds,
-                downscale_factor=downscale_factor,
-                avoid_space_switch=True,
-                prefer_screencapturekit=True,
-                close_after_capture=close_after_capture,
-            )
-            payload = {
-                **screenshot_payload,
-                "asc_path": str(asc_resolved),
-                "backend_requested": normalized_backend,
-                "backend_used": "ltspice",
-                "render_session_id": render_session_id,
-            }
-            return _image_tool_result(payload)
-        except Exception as exc:
-            if normalized_backend == "ltspice":
-                raise
-            warnings.append(f"ltspice backend failed; fell back to svg: {exc}")
-
-    symbol_lib = _resolve_symbol_library(lib_zip_path) if include_symbol_graphics else None
-    svg_output_path = output_path
-    if output_path and Path(output_path).suffix.lower() not in {".svg"}:
-        svg_output_path = str(Path(output_path).with_suffix(".svg"))
-        warnings.append("output_path suffix adjusted to .svg for svg backend")
-    payload = render_schematic_svg(
-        workdir=_runner.workdir,
-        asc_path=asc_resolved,
-        output_path=svg_output_path,
-        width=width,
-        height=height,
+    open_path = asc_resolved
+    title_hint = asc_resolved.name
+    close_after_capture = True
+    if render_session_id:
+        session = _render_sessions.get(render_session_id)
+        if not session:
+            raise ValueError(f"Unknown render_session_id '{render_session_id}'")
+        if session.get("path") and Path(session["path"]) != asc_resolved:
+            raise ValueError("render_session_id is bound to a different path")
+        open_path = None
+        title_hint = str(session.get("title_hint") or asc_resolved.name)
+        close_after_capture = False
+    screenshot_payload = capture_ltspice_window_screenshot(
+        output_path=_resolve_png_output_path(
+            kind="schematics",
+            name=asc_resolved.stem,
+            output_path=output_path,
+        ),
+        open_path=open_path,
+        title_hint=title_hint,
+        settle_seconds=settle_seconds,
         downscale_factor=downscale_factor,
-        include_symbol_graphics=include_symbol_graphics,
-        library=symbol_lib,
+        avoid_space_switch=True,
+        prefer_screencapturekit=True,
+        close_after_capture=close_after_capture,
     )
-    payload["backend_requested"] = normalized_backend
-    payload["backend_used"] = "svg"
-    if warnings:
-        payload["warnings"] = warnings
+    payload: dict[str, Any] = {
+        **screenshot_payload,
+        "asc_path": str(asc_resolved),
+        "backend_used": "ltspice",
+        "render_session_id": render_session_id,
+    }
+    ignored = []
+    if width != 1400:
+        ignored.append("width")
+    if height != 900:
+        ignored.append("height")
+    if not include_symbol_graphics:
+        ignored.append("include_symbol_graphics")
+    if lib_zip_path:
+        ignored.append("lib_zip_path")
+    if ignored:
+        payload["warnings"] = [
+            "The following parameters are ignored for LTspice-native rendering: "
+            + ", ".join(ignored)
+        ]
     return _image_tool_result(payload)
 
 
@@ -2513,7 +2466,6 @@ def renderLtspicePlotImage(
     width: int = 1280,
     height: int = 720,
     downscale_factor: float = 1.0,
-    backend: str = "auto",
     settle_seconds: float = 1.0,
     max_points: int = 2000,
     y_mode: str = "magnitude",
@@ -2538,7 +2490,6 @@ def renderLtspicePlotImage(
         raise ValueError("vectors must contain at least one vector name")
     dataset = _resolve_dataset(plot=plot, run_id=run_id, raw_path=raw_path)
     selected_step = _resolve_step_index(dataset, step_index)
-    normalized_backend = _normalize_image_backend(backend)
     normalized_mode = _normalize_plot_mode(mode)
     normalized_pane_layout = _normalize_pane_layout(pane_layout)
     warnings: list[str] = []
@@ -2555,119 +2506,93 @@ def renderLtspicePlotImage(
         elif y_mode_normalized == "magnitude":
             effective_mode = "db" if _infer_plot_type(dataset) == "ac" else "real"
 
-    use_ltspice_backend = normalized_backend in {"auto", "ltspice"}
-    if use_ltspice_backend:
-        render_dataset, step_rendering = _materialize_plot_step_dataset(
-            dataset=dataset,
-            selected_step=selected_step,
-        )
-        plt_payload = _write_ltspice_plot_settings_file(
-            dataset=render_dataset,
-            vectors=vectors,
-            mode=effective_mode,
-            pane_layout=normalized_pane_layout,
-            dual_axis=dual_axis,
-            x_log=x_log,
-            x_min=x_min,
-            x_max=x_max,
-            y_min=y_min,
-            y_max=y_max,
-        )
-        open_path = render_dataset.path
-        title_hint = render_dataset.path.name
-        close_after_capture = True
-        if render_session_id:
-            session = _render_sessions.get(render_session_id)
-            if not session:
-                raise ValueError(f"Unknown render_session_id '{render_session_id}'")
-            session_path = Path(str(session.get("path") or "")).expanduser().resolve()
-            if session.get("path") and session_path != render_dataset.path:
-                raise ValueError(
-                    "render_session_id is bound to a different path. "
-                    "Start a render session for the selected step/raw file first."
-                )
-            title_hint = str(session.get("title_hint") or render_dataset.path.name)
-            open_path = None
-            close_after_capture = False
-        screenshot_payload = capture_ltspice_window_screenshot(
-            output_path=_resolve_png_output_path(
-                kind="plots",
-                name=f"{render_dataset.path.stem}_{vectors[0]}",
-                output_path=output_path,
-            ),
-            open_path=open_path,
-            title_hint=title_hint,
-            settle_seconds=settle_seconds,
-            downscale_factor=downscale_factor,
-            avoid_space_switch=True,
-            prefer_screencapturekit=True,
-            close_after_capture=close_after_capture,
-        )
-        if any(
-            [
-                title is not None,
-                max_points != 2000,
-            ]
-        ):
-            warnings.append(
-                "LTspice plot rendering uses .plt settings and ignores title/max_points."
-            )
-        validation = None
-        if validate_capture:
-            validation = _validate_plot_capture(Path(str(screenshot_payload["image_path"])))
-            if not validation["valid"]:
-                raise RuntimeError(
-                    "LTspice plot capture appears empty or missing traces "
-                    f"(trace_pixels={validation['trace_pixels']}, "
-                    f"required_min={validation['min_trace_pixels']})."
-                )
-        payload = {
-            **screenshot_payload,
-            "raw_path": str(dataset.path),
-            "render_raw_path": str(render_dataset.path),
-            "plot_name": dataset.plot_name,
-            "vectors": vectors,
-            "plot_settings": plt_payload,
-            "mode_requested": normalized_mode,
-            "mode_used": plt_payload["mode_used"],
-            "pane_layout": normalized_pane_layout,
-            "dual_axis_requested": dual_axis,
-            "validate_capture": bool(validate_capture),
-            "backend_requested": normalized_backend,
-            "backend_used": "ltspice",
-            "render_session_id": render_session_id,
-            "step_rendering": step_rendering,
-            **_step_payload(dataset, selected_step),
-        }
-        if validation is not None:
-            payload["capture_validation"] = validation
-        if warnings:
-            payload["warnings"] = warnings
-        return _image_tool_result(payload)
-
-    svg_output_path = output_path
-    if output_path and Path(output_path).suffix.lower() not in {".svg"}:
-        svg_output_path = str(Path(output_path).with_suffix(".svg"))
-        warnings.append("output_path suffix adjusted to .svg for svg backend")
-    payload = render_plot_svg(
-        workdir=_runner.workdir,
+    render_dataset, step_rendering = _materialize_plot_step_dataset(
         dataset=dataset,
-        vectors=vectors,
-        step_index=selected_step,
-        output_path=svg_output_path,
-        width=width,
-        height=height,
-        downscale_factor=downscale_factor,
-        max_points=max_points,
-        y_mode=y_mode,
-        x_log=x_log,
-        title=title,
+        selected_step=selected_step,
     )
-    payload["backend_requested"] = normalized_backend
-    payload["backend_used"] = "svg"
+    plt_payload = _write_ltspice_plot_settings_file(
+        dataset=render_dataset,
+        vectors=vectors,
+        mode=effective_mode,
+        pane_layout=normalized_pane_layout,
+        dual_axis=dual_axis,
+        x_log=x_log,
+        x_min=x_min,
+        x_max=x_max,
+        y_min=y_min,
+        y_max=y_max,
+    )
+    open_path = render_dataset.path
+    title_hint = render_dataset.path.name
+    close_after_capture = True
+    if render_session_id:
+        session = _render_sessions.get(render_session_id)
+        if not session:
+            raise ValueError(f"Unknown render_session_id '{render_session_id}'")
+        session_path = Path(str(session.get("path") or "")).expanduser().resolve()
+        if session.get("path") and session_path != render_dataset.path:
+            raise ValueError(
+                "render_session_id is bound to a different path. "
+                "Start a render session for the selected step/raw file first."
+            )
+        title_hint = str(session.get("title_hint") or render_dataset.path.name)
+        open_path = None
+        close_after_capture = False
+    screenshot_payload = capture_ltspice_window_screenshot(
+        output_path=_resolve_png_output_path(
+            kind="plots",
+            name=f"{render_dataset.path.stem}_{vectors[0]}",
+            output_path=output_path,
+        ),
+        open_path=open_path,
+        title_hint=title_hint,
+        settle_seconds=settle_seconds,
+        downscale_factor=downscale_factor,
+        avoid_space_switch=True,
+        prefer_screencapturekit=True,
+        close_after_capture=close_after_capture,
+    )
+    if any(
+        [
+            title is not None,
+            max_points != 2000,
+            width != 1280,
+            height != 720,
+        ]
+    ):
+        warnings.append(
+            "LTspice plot rendering uses .plt settings and ignores title/max_points/width/height."
+        )
+    validation = None
+    if validate_capture:
+        validation = _validate_plot_capture(Path(str(screenshot_payload["image_path"])))
+        if not validation["valid"]:
+            raise RuntimeError(
+                "LTspice plot capture appears empty or missing traces "
+                f"(trace_pixels={validation['trace_pixels']}, "
+                f"required_min={validation['min_trace_pixels']})."
+            )
+    payload = {
+        **screenshot_payload,
+        "raw_path": str(dataset.path),
+        "render_raw_path": str(render_dataset.path),
+        "plot_name": dataset.plot_name,
+        "vectors": vectors,
+        "plot_settings": plt_payload,
+        "mode_requested": normalized_mode,
+        "mode_used": plt_payload["mode_used"],
+        "pane_layout": normalized_pane_layout,
+        "dual_axis_requested": dual_axis,
+        "validate_capture": bool(validate_capture),
+        "backend_used": "ltspice",
+        "render_session_id": render_session_id,
+        "step_rendering": step_rendering,
+        **_step_payload(dataset, selected_step),
+    }
+    if validation is not None:
+        payload["capture_validation"] = validation
     if warnings:
         payload["warnings"] = warnings
-    payload.update(_step_payload(dataset, selected_step))
     return _image_tool_result(payload)
 
 
@@ -2787,7 +2712,6 @@ def renderLtspicePlotPresetImage(
     raw_path: str | None = None,
     step_index: int | None = None,
     output_path: str | None = None,
-    backend: str = "auto",
     settle_seconds: float = 1.0,
     downscale_factor: float = 1.0,
     validate_capture: bool = True,
@@ -2805,7 +2729,6 @@ def renderLtspicePlotPresetImage(
         raw_path=raw_path,
         step_index=step_index,
         output_path=output_path,
-        backend=backend,
         settle_seconds=settle_seconds,
         downscale_factor=downscale_factor,
         mode=str(settings["mode"]),

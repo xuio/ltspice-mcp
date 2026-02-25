@@ -165,21 +165,18 @@ async def _run_smoke_test(args: argparse.Namespace) -> None:
             symbol_image = _extract_call_result(
                 await session.call_tool(
                     "renderLtspiceSymbolImage",
-                    {"symbol": "opamp2", "downscale_factor": 0.5, "backend": "auto"},
+                    {"symbol": "opamp2", "downscale_factor": 0.5},
                 )
             )
             _require(isinstance(symbol_image, dict), "renderLtspiceSymbolImage did not return an object")
             symbol_image_path = Path(symbol_image.get("image_path", ""))
             _require(symbol_image_path.exists(), "renderLtspiceSymbolImage output missing")
-            _require(symbol_image.get("backend_used") in {"ltspice", "svg"}, "Unexpected symbol image backend")
-            if symbol_image.get("backend_used") == "svg":
-                _require(symbol_image.get("width", 0) < 640, "Symbol image downscale did not apply (svg)")
-            else:
-                downscale_info = symbol_image.get("downscale", {})
-                _require(
-                    isinstance(downscale_info, dict) and (downscale_info.get("downscaled") is True or symbol_image.get("downscale_factor") < 1.0),
-                    "Symbol image downscale metadata missing for ltspice backend",
-                )
+            _require(symbol_image.get("backend_used") == "ltspice", "Unexpected symbol image backend")
+            downscale_info = symbol_image.get("downscale", {})
+            _require(
+                isinstance(downscale_info, dict) and (downscale_info.get("downscaled") is True or symbol_image.get("downscale_factor") < 1.0),
+                "Symbol image downscale metadata missing for ltspice backend",
+            )
             print("Symbol image render check passed")
 
             templates = _extract_call_result(await session.call_tool("listSchematicTemplates", {}))
@@ -281,22 +278,18 @@ async def _run_smoke_test(args: argparse.Namespace) -> None:
                     {
                         "asc_path": template_schematic.get("asc_path"),
                         "downscale_factor": 0.5,
-                        "backend": "auto",
                     },
                 )
             )
             _require(isinstance(schematic_image, dict), "renderLtspiceSchematicImage did not return an object")
             schematic_image_path = Path(schematic_image.get("image_path", ""))
             _require(schematic_image_path.exists(), "renderLtspiceSchematicImage output missing")
-            _require(schematic_image.get("backend_used") in {"ltspice", "svg"}, "Unexpected schematic image backend")
-            if schematic_image.get("backend_used") == "svg":
-                _require(schematic_image.get("width", 0) < 1400, "Schematic image downscale did not apply (svg)")
-            else:
-                downscale_info = schematic_image.get("downscale", {})
-                _require(
-                    isinstance(downscale_info, dict) and (downscale_info.get("downscaled") is True or schematic_image.get("downscale_factor") < 1.0),
-                    "Schematic image downscale metadata missing for ltspice backend",
-                )
+            _require(schematic_image.get("backend_used") == "ltspice", "Unexpected schematic image backend")
+            downscale_info = schematic_image.get("downscale", {})
+            _require(
+                isinstance(downscale_info, dict) and (downscale_info.get("downscaled") is True or schematic_image.get("downscale_factor") < 1.0),
+                "Schematic image downscale metadata missing for ltspice backend",
+            )
             print("Schematic image render check passed")
 
             netlist = """
@@ -486,7 +479,6 @@ C1 out 0 1u
                             "preset": "bode",
                             "run_id": run_id,
                             "downscale_factor": 0.5,
-                            "backend": "auto",
                             "render_session_id": render_session_id,
                         },
                     )
@@ -504,7 +496,6 @@ C1 out 0 1u
                             "vectors": ["V(out)"],
                             "y_mode": "magnitude",
                             "downscale_factor": 0.5,
-                            "backend": "auto",
                             "validate_capture": False,
                             "render_session_id": render_session_id,
                         },

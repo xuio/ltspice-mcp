@@ -127,7 +127,6 @@ class TestPlotRenderMCPReal(unittest.TestCase):
                         "mode": "db",
                         "dual_axis": False,
                         "pane_layout": "single",
-                        "backend": "auto",
                     },
                 )
             )
@@ -163,7 +162,6 @@ class TestPlotRenderMCPReal(unittest.TestCase):
                         "vectors": ["V(out)", "V(in)"],
                         "mode": "real",
                         "pane_layout": "per_trace",
-                        "backend": "auto",
                         "x_log": False,
                     },
                 )
@@ -202,7 +200,6 @@ class TestPlotRenderMCPReal(unittest.TestCase):
                         "vectors": ["V(out)"],
                         "step_index": 1,
                         "mode": "real",
-                        "backend": "auto",
                     },
                 )
             )

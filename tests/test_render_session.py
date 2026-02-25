@@ -41,7 +41,6 @@ class TestRenderSessions(unittest.TestCase):
 
             result = server.renderLtspiceSchematicImage(
                 asc_path=str(asc_path),
-                backend="ltspice",
                 render_session_id=session_id,
             )
             self.assertFalse(result.isError)
@@ -103,7 +102,6 @@ class TestRenderSessions(unittest.TestCase):
             session_id = session["render_session_id"]
             result = server.renderLtspicePlotImage(
                 vectors=["V(out)"],
-                backend="ltspice",
                 render_session_id=session_id,
             )
             self.assertFalse(result.isError)

@@ -95,7 +95,7 @@ First daemon start can run these automatically once (marker file):
 
 ## 5) Screenshot/render behavior to expect
 
-When using `backend=ltspice` on render tools:
+When using LTspice render tools:
 - capture uses ScreenCaptureKit helper (`ltspice-sck-helper`),
 - LTspice window should auto-close after capture by default,
 - response includes diagnostics in:
@@ -121,7 +121,7 @@ If you pass `render_session_id`, auto-close is intentionally skipped until:
 ./scripts/ltspice_mcp_daemon.sh restart
 ```
 
-3. Run one MCP render call (`renderLtspiceSymbolImage` with `backend=ltspice`).
+3. Run one MCP render call (`renderLtspiceSymbolImage`).
 
 4. Inspect result fields:
 - `capture_backend` should be `screencapturekit`

@@ -33,7 +33,7 @@ class TestPlotRenderBackendSelection(unittest.TestCase):
             steps=[],
         )
 
-    def test_auto_backend_uses_ltspice_with_plt_settings(self) -> None:
+    def test_plot_render_uses_ltspice_with_plt_settings(self) -> None:
         dataset = self._dataset()
         png_path = self.temp_dir / "ltspice_capture.png"
 
@@ -58,11 +58,9 @@ class TestPlotRenderBackendSelection(unittest.TestCase):
                 "ltspice_mcp.server._validate_plot_capture",
                 return_value={"valid": True, "trace_pixels": 400, "min_trace_pixels": 120},
             ),
-            patch("ltspice_mcp.server.render_plot_svg") as svg_mock,
         ):
             result = server.renderLtspicePlotImage(
                 vectors=["V(out)"],
-                backend="auto",
                 output_path=str(png_path),
                 settle_seconds=0.0,
             )
@@ -75,44 +73,15 @@ class TestPlotRenderBackendSelection(unittest.TestCase):
         capture_kwargs = capture_mock.call_args.kwargs
         self.assertEqual(Path(str(capture_kwargs["open_path"])), dataset.path)
         self.assertIn("capture_validation", payload)
-        svg_mock.assert_not_called()
 
-    def test_svg_backend_uses_svg_renderer(self) -> None:
+    def test_backend_parameter_removed(self) -> None:
         dataset = self._dataset()
-        svg_path = self.temp_dir / "plot.svg"
-
-        def _fake_svg_render(**_: object) -> dict[str, object]:
-            svg_path.write_text(
-                '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="60"></svg>\n',
-                encoding="utf-8",
-            )
-            return {
-                "image_path": str(svg_path),
-                "format": "svg",
-                "width": 640,
-                "height": 360,
-                "points_total": 3,
-                "points_rendered": 3,
-                "x_log": False,
-                "y_mode": "real",
-                "y_range": [0.0, 1.0],
-                "x_range": [0.0, 0.002],
-            }
-
-        with (
-            patch("ltspice_mcp.server._resolve_dataset", return_value=dataset),
-            patch("ltspice_mcp.server.capture_ltspice_window_screenshot") as capture_mock,
-            patch("ltspice_mcp.server.render_plot_svg", side_effect=_fake_svg_render),
-        ):
-            result = server.renderLtspicePlotImage(
-                vectors=["V(out)"],
-                backend="svg",
-            )
-
-        payload = result.structuredContent
-        self.assertEqual(payload["backend_used"], "svg")
-        self.assertTrue(str(payload["image_path"]).endswith(".svg"))
-        capture_mock.assert_not_called()
+        with patch("ltspice_mcp.server._resolve_dataset", return_value=dataset):
+            with self.assertRaises(TypeError):
+                server.renderLtspicePlotImage(
+                    vectors=["V(out)"],
+                    backend="ltspice",
+                )
 
     def test_stepped_dataset_materializes_step_raw_for_ltspice_render(self) -> None:
         raw_path = self.temp_dir / "stepped.raw"
@@ -156,7 +125,6 @@ class TestPlotRenderBackendSelection(unittest.TestCase):
         ):
             result = server.renderLtspicePlotImage(
                 vectors=["V(out)"],
-                backend="ltspice",
                 step_index=1,
                 settle_seconds=0.0,
             )
@@ -209,7 +177,6 @@ class TestPlotRenderBackendSelection(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 server.renderLtspicePlotImage(
                     vectors=["V(out)"],
-                    backend="ltspice",
                     settle_seconds=0.0,
                 )
 
