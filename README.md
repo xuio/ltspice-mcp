@@ -230,6 +230,22 @@ ltspice-mcp --daemon-http --host 127.0.0.1 --port 8765 --http-path /mcp
 
 3. Keep daemon running (or run it via `launchd`) so clients connect to it rather than spawning separate subprocesses.
 
+Daemon helper script (recommended, uses `uv run` internally):
+```bash
+./scripts/ltspice_mcp_daemon.sh start
+```
+
+Agent/LLM operations after code changes:
+```bash
+./scripts/ltspice_mcp_daemon.sh restart
+./scripts/ltspice_mcp_daemon.sh status
+./scripts/ltspice_mcp_daemon.sh follow
+./scripts/ltspice_mcp_daemon.sh latest-log
+./scripts/ltspice_mcp_daemon.sh list-logs 5
+./scripts/ltspice_mcp_daemon.sh logs --lines 200
+./scripts/ltspice_mcp_daemon.sh logs --follow
+```
+
 ## UI integration (optional)
 
 UI is disabled by default. You can enable or override it either globally or per call.
