@@ -6,6 +6,11 @@ This implementation is inspired by:
 - [gtnoble/ngspice-mcp](https://github.com/gtnoble/ngspice-mcp)
 - [luc-me/ltspiceMCP](https://github.com/luc-me/ltspiceMCP)
 
+## Agent guide
+
+For agent-focused operation details (daemon lifecycle, permissions, MCP tool workflow, close verification, and troubleshooting), see:
+- [`AGENT_README.md`](AGENT_README.md)
+
 ## What it provides
 
 - LTspice executable auto-discovery on macOS (`LTSPICE_BINARY` override supported)
