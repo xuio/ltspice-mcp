@@ -44,7 +44,7 @@ Granular permission helpers:
 3. Inspect results:
    - `getPlotNames`, `getVectorsInfo`, `getVectorData`
    - `getBandwidth`, `getGainPhaseMargin`, `getRiseFallTime`, `getSettlingTime`
-   - `parseMeasResults`, `runVerificationPlan`
+   - `parseMeasResults`, `runVerificationPlan` (`all_of`/`any_of`, tolerance fields)
    - `runSweepStudy`
 4. Render visuals:
    - `renderLtspiceSchematicImage`
@@ -52,8 +52,12 @@ Granular permission helpers:
 5. For long simulations:
    - `queueSimulationJob`, `listJobs`, `jobStatus`, `cancelJob`
    - use `priority` (lower first) and `max_retries` for queue policy
+   - use `listJobHistory` for retained terminal jobs across restarts
 6. For schematic cleanup:
    - `inspectSchematicVisualQuality`, `autoCleanSchematicLayout`
+   - `lintSchematic(strict_style=true, ...)` for style gating
+7. For one-shot flows:
+   - `generateVerifyAndCleanCircuit`
 
 ## 4) Screenshot and Window Behavior
 

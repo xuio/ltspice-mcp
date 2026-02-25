@@ -1,5 +1,35 @@
 # Changelog
 
+## v1.32.0 - 2026-02-25
+
+### Added
+- Strict style linting support in `lintSchematic`:
+  - `strict_style`
+  - `min_style_score`
+  - `max_component_overlap`
+  - `max_component_crowding`
+  - `max_wire_crossing`
+- New orchestration MCP tool:
+  - `generateVerifyAndCleanCircuit`
+- Verification DSL enhancements in `runVerificationPlan`:
+  - assertion groups (`all_of`, `any_of`)
+  - tolerance checks (`target`, `rel_tol_pct`, `abs_tol`)
+- Queue history persistence with retention:
+  - archived terminal jobs in `.ltspice_mcp_job_history.json`
+  - `listJobHistory` tool
+  - job-status fallback to history when not active
+
+### Improved
+- Active queue state persistence now stores only non-terminal jobs; terminal jobs are archived separately.
+- `getLtspiceStatus` now reports queue-history metadata (path/count/retention).
+
+### Tests
+- Added regression coverage for:
+  - grouped/tolerance verification assertions,
+  - strict style lint mode,
+  - orchestration tool behavior,
+  - queue history persistence/querying.
+
 ## v1.31.0 - 2026-02-25
 
 ### Added

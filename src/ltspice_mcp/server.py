@@ -141,6 +141,10 @@ _job_queue: queue.PriorityQueue[tuple[int, int, str]] = queue.PriorityQueue()
 _job_worker_thread: threading.Thread | None = None
 _job_worker_stop = threading.Event()
 _job_state_path: Path = _DEFAULT_WORKDIR / ".ltspice_mcp_jobs.json"
+_job_history_path: Path = _DEFAULT_WORKDIR / ".ltspice_mcp_job_history.json"
+_job_history: list[dict[str, Any]] = []
+_job_history_index: dict[str, int] = {}
+_job_history_retention = max(50, int(os.getenv("LTSPICE_MCP_JOB_HISTORY_RETENTION", "1000")))
 _job_seq = 0
 _JOB_TERMINAL_STATUSES = {"succeeded", "failed", "canceled"}
 
@@ -615,7 +619,12 @@ def _next_job_seq() -> int:
 
 def _save_job_state() -> None:
     with _job_lock:
-        if not _job_order:
+        active_jobs = [
+            dict(_jobs[job_id])
+            for job_id in _job_order
+            if job_id in _jobs and str(_jobs[job_id].get("status", "")).lower() not in _JOB_TERMINAL_STATUSES
+        ]
+        if not active_jobs:
             if _job_state_path.exists():
                 try:
                     _job_state_path.unlink()
@@ -625,8 +634,8 @@ def _save_job_state() -> None:
         payload = {
             "version": 1,
             "job_seq": int(_job_seq),
-            "job_order": list(_job_order),
-            "jobs": [dict(_jobs[job_id]) for job_id in _job_order if job_id in _jobs],
+            "job_order": [str(job.get("job_id", "")) for job in active_jobs if str(job.get("job_id", "")).strip()],
+            "jobs": active_jobs,
         }
     _job_state_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = _job_state_path.with_suffix(".tmp")
@@ -707,6 +716,74 @@ def _load_job_state() -> None:
                 continue
             if str(job.get("status", "")).lower() == "queued":
                 _enqueue_job_locked(job_id)
+
+
+def _trim_job_history_locked() -> None:
+    global _job_history
+    if len(_job_history) <= _job_history_retention:
+        _job_history_index.clear()
+        _job_history_index.update({str(item.get("job_id", "")): idx for idx, item in enumerate(_job_history)})
+        return
+    _job_history = _job_history[-_job_history_retention:]
+    _job_history_index.clear()
+    _job_history_index.update({str(item.get("job_id", "")): idx for idx, item in enumerate(_job_history)})
+
+
+def _archive_job_locked(job: dict[str, Any]) -> None:
+    job_id = str(job.get("job_id", "")).strip()
+    if not job_id:
+        return
+    payload = dict(job)
+    payload["archived_at"] = _now_iso()
+    existing = _job_history_index.get(job_id)
+    if existing is None:
+        _job_history.append(payload)
+        _job_history_index[job_id] = len(_job_history) - 1
+    else:
+        _job_history[existing] = payload
+    _trim_job_history_locked()
+
+
+def _save_job_history_state() -> None:
+    with _job_lock:
+        if not _job_history:
+            if _job_history_path.exists():
+                try:
+                    _job_history_path.unlink()
+                except Exception:
+                    pass
+            return
+        payload = {
+            "version": 1,
+            "retention": int(_job_history_retention),
+            "history": list(_job_history),
+        }
+    _job_history_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = _job_history_path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp_path.replace(_job_history_path)
+
+
+def _load_job_history_state() -> None:
+    _job_history.clear()
+    _job_history_index.clear()
+    if not _job_history_path.exists():
+        return
+    try:
+        payload = json.loads(_job_history_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    entries = payload.get("history", [])
+    if not isinstance(entries, list):
+        return
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        job_id = str(entry.get("job_id", "")).strip()
+        if not job_id:
+            continue
+        _job_history.append(dict(entry))
+    _trim_job_history_locked()
 
 
 def _load_run_state() -> None:
@@ -1830,6 +1907,232 @@ def _evaluate_limits(
     return passed, " and ".join(checks)
 
 
+def _evaluate_target_tolerance(
+    *,
+    value: float | None,
+    target: float | None,
+    rel_tol_pct: float | None,
+    abs_tol: float | None,
+) -> tuple[bool, str, dict[str, float] | None]:
+    if target is None and rel_tol_pct is None and abs_tol is None:
+        return True, "no target/tolerance provided", None
+    if target is None:
+        return False, "target is required when rel_tol_pct/abs_tol is specified", None
+    if value is None:
+        return False, "value is unavailable", None
+
+    allowed = 0.0
+    rel_allowed = 0.0
+    abs_allowed = 0.0
+    checks: list[str] = []
+    if rel_tol_pct is not None:
+        rel_allowed = abs(float(target)) * (abs(float(rel_tol_pct)) / 100.0)
+        checks.append(f"abs(value-target) <= {rel_allowed} (rel_tol_pct={rel_tol_pct})")
+        allowed = max(allowed, rel_allowed)
+    if abs_tol is not None:
+        abs_allowed = abs(float(abs_tol))
+        checks.append(f"abs(value-target) <= {abs_allowed} (abs_tol)")
+        allowed = max(allowed, abs_allowed)
+    if not checks:
+        checks.append("value == target")
+
+    lower = float(target) - allowed
+    upper = float(target) + allowed
+    passed = lower <= float(value) <= upper
+    details = {
+        "target": float(target),
+        "allowed_abs_deviation": float(allowed),
+        "lower_bound": float(lower),
+        "upper_bound": float(upper),
+        "rel_allowed": float(rel_allowed),
+        "abs_allowed": float(abs_allowed),
+    }
+    return passed, " and ".join(checks), details
+
+
+def _assertion_requires_dataset(assertion: dict[str, Any]) -> bool:
+    check_type = str(assertion.get("type", "vector_stat")).strip().lower()
+    if check_type in {"all_of", "any_of"}:
+        children = assertion.get("assertions") or assertion.get("checks") or []
+        if not isinstance(children, list):
+            return True
+        for item in children:
+            if isinstance(item, dict) and _assertion_requires_dataset(item):
+                return True
+        return False
+    return check_type != "meas"
+
+
+def _evaluate_verification_assertion(
+    *,
+    assertion: dict[str, Any],
+    dataset: RawDataset | None,
+    measurement_map: dict[str, float],
+    default_id: str,
+    fail_fast: bool,
+) -> dict[str, Any]:
+    check_id = str(assertion.get("id") or assertion.get("name") or default_id)
+    check_type = str(assertion.get("type", "vector_stat")).strip().lower()
+    if check_type in {"all_of", "any_of"}:
+        children = assertion.get("assertions") or assertion.get("checks")
+        if not isinstance(children, list) or not children:
+            raise ValueError(f"{check_type} assertion requires non-empty `assertions` list")
+        child_results: list[dict[str, Any]] = []
+        for index, child in enumerate(children, start=1):
+            if not isinstance(child, dict):
+                child_results.append(
+                    {
+                        "id": f"{check_id}.{index}",
+                        "type": "invalid",
+                        "passed": False,
+                        "error": "Child assertion must be an object",
+                        "details": {"child": child},
+                    }
+                )
+                if fail_fast and check_type == "all_of":
+                    break
+                continue
+            child_result = _evaluate_verification_assertion(
+                assertion=child,
+                dataset=dataset,
+                measurement_map=measurement_map,
+                default_id=f"{check_id}.{index}",
+                fail_fast=fail_fast,
+            )
+            child_results.append(child_result)
+            if fail_fast:
+                if check_type == "all_of" and not bool(child_result.get("passed")):
+                    break
+                if check_type == "any_of" and bool(child_result.get("passed")):
+                    break
+        child_passed = [bool(item.get("passed")) for item in child_results]
+        passed = all(child_passed) if check_type == "all_of" else any(child_passed)
+        return {
+            "id": check_id,
+            "type": check_type,
+            "passed": passed,
+            "value": None,
+            "condition": "all child assertions must pass"
+            if check_type == "all_of"
+            else "at least one child assertion must pass",
+            "details": {"assertion": assertion},
+            "children": child_results,
+            "child_count": len(child_results),
+            "child_passed_count": sum(1 for item in child_results if bool(item.get("passed"))),
+        }
+
+    minimum_raw = assertion.get("min")
+    maximum_raw = assertion.get("max")
+    target_raw = assertion.get("target")
+    rel_tol_raw = assertion.get("rel_tol_pct")
+    abs_tol_raw = assertion.get("abs_tol")
+    minimum = float(minimum_raw) if minimum_raw is not None else None
+    maximum = float(maximum_raw) if maximum_raw is not None else None
+    target = float(target_raw) if target_raw is not None else None
+    rel_tol_pct = float(rel_tol_raw) if rel_tol_raw is not None else None
+    abs_tol = float(abs_tol_raw) if abs_tol_raw is not None else None
+    value: float | None = None
+    details: dict[str, Any] = {"assertion": assertion}
+
+    if check_type == "meas":
+        meas_name = str(assertion.get("name", "")).strip()
+        if not meas_name:
+            raise ValueError("meas assertion requires `name`")
+        value = measurement_map.get(meas_name)
+        details["measurement_name"] = meas_name
+    else:
+        if dataset is None:
+            raise ValueError("No RAW dataset available for non-meas assertions")
+        step_index_raw = assertion.get("step_index")
+        selected_step = _resolve_step_index(dataset, int(step_index_raw) if step_index_raw is not None else None)
+        vector = str(assertion.get("vector", "")).strip()
+        if not vector:
+            raise ValueError(f"{check_type} assertion requires `vector`")
+        if check_type == "vector_stat":
+            statistic = str(assertion.get("statistic", "final"))
+            series = dataset.get_vector(vector, step_index=selected_step)
+            value = _metric_from_series(series, statistic)
+            details.update({"vector": vector, "statistic": statistic, **_step_payload(dataset, selected_step)})
+        elif check_type == "bandwidth":
+            metric = str(assertion.get("metric", "lowpass_bandwidth_hz"))
+            result = compute_bandwidth(
+                frequency_hz=dataset.scale_values(step_index=selected_step),
+                response=dataset.get_vector(vector, step_index=selected_step),
+                reference=str(assertion.get("reference", "first")),
+                drop_db=float(assertion.get("drop_db", 3.0)),
+            )
+            value = result.get(metric)
+            details.update(
+                {"vector": vector, "metric": metric, "result": result, **_step_payload(dataset, selected_step)}
+            )
+        elif check_type == "gain_phase_margin":
+            metric = str(assertion.get("metric", "phase_margin_deg"))
+            result = compute_gain_phase_margin(
+                frequency_hz=dataset.scale_values(step_index=selected_step),
+                response=dataset.get_vector(vector, step_index=selected_step),
+            )
+            value = result.get(metric)
+            details.update(
+                {"vector": vector, "metric": metric, "result": result, **_step_payload(dataset, selected_step)}
+            )
+        elif check_type == "rise_fall_time":
+            metric = str(assertion.get("metric", "rise_time_s"))
+            result = compute_rise_fall_time(
+                time_s=dataset.scale_values(step_index=selected_step),
+                signal=dataset.get_vector(vector, step_index=selected_step),
+                low_threshold_pct=float(assertion.get("low_threshold_pct", 10.0)),
+                high_threshold_pct=float(assertion.get("high_threshold_pct", 90.0)),
+            )
+            value = result.get(metric)
+            details.update(
+                {"vector": vector, "metric": metric, "result": result, **_step_payload(dataset, selected_step)}
+            )
+        elif check_type == "settling_time":
+            metric = str(assertion.get("metric", "settling_time_s"))
+            result = compute_settling_time(
+                time_s=dataset.scale_values(step_index=selected_step),
+                signal=dataset.get_vector(vector, step_index=selected_step),
+                tolerance_percent=float(assertion.get("tolerance_percent", 2.0)),
+                target_value=float(assertion["target_value"])
+                if "target_value" in assertion and assertion["target_value"] is not None
+                else None,
+            )
+            value = result.get(metric)
+            details.update(
+                {"vector": vector, "metric": metric, "result": result, **_step_payload(dataset, selected_step)}
+            )
+        else:
+            raise ValueError(f"Unsupported assertion type '{check_type}'")
+
+    passed_limits, condition_limits = _evaluate_limits(value=value, minimum=minimum, maximum=maximum)
+    passed_tolerance, condition_tolerance, tolerance_details = _evaluate_target_tolerance(
+        value=value,
+        target=target,
+        rel_tol_pct=rel_tol_pct,
+        abs_tol=abs_tol,
+    )
+    conditions = [condition_limits]
+    if condition_tolerance != "no target/tolerance provided":
+        conditions.append(condition_tolerance)
+    combined_condition = " and ".join(part for part in conditions if part)
+    if tolerance_details is not None:
+        details["tolerance"] = tolerance_details
+
+    return {
+        "id": check_id,
+        "type": check_type,
+        "passed": bool(passed_limits and passed_tolerance),
+        "value": value,
+        "min": minimum,
+        "max": maximum,
+        "target": target,
+        "rel_tol_pct": rel_tol_pct,
+        "abs_tol": abs_tol,
+        "condition": combined_condition,
+        "details": details,
+    }
+
+
 def _run_process_simulation_with_cancel(
     *,
     netlist_path: Path,
@@ -1945,6 +2248,7 @@ def _job_public_payload(job: dict[str, Any]) -> dict[str, Any]:
         "job_id": job["job_id"],
         "status": job["status"],
         "created_at": job["created_at"],
+        "archived_at": job.get("archived_at"),
         "started_at": job.get("started_at"),
         "finished_at": job.get("finished_at"),
         "cancel_requested": bool(job.get("cancel_requested", False)),
@@ -1990,7 +2294,9 @@ def _ensure_job_worker() -> None:
                         job["status"] = "canceled"
                         job["finished_at"] = _now_iso()
                         job["summary"] = "Canceled before start."
+                        _archive_job_locked(job)
                         _save_job_state()
+                        _save_job_history_state()
                     _job_queue.task_done()
                     continue
                 with _job_lock:
@@ -2035,7 +2341,10 @@ def _ensure_job_worker() -> None:
                                 job["summary"] = "; ".join(run.issues[:3]) if run.issues else "Simulation failed."
                                 job["error"] = "; ".join(run.issues[:3]) if run.issues else "Simulation failed."
                                 job["finished_at"] = _now_iso()
+                        if str(job.get("status", "")).lower() in _JOB_TERMINAL_STATUSES:
+                            _archive_job_locked(job)
                         _save_job_state()
+                        _save_job_history_state()
                 except Exception as exc:  # noqa: BLE001
                     with _job_lock:
                         retry_count = int(job.get("retry_count", 0))
@@ -2055,7 +2364,9 @@ def _ensure_job_worker() -> None:
                             job["error"] = str(exc)
                             job["summary"] = f"Runtime error: {exc}"
                             job["finished_at"] = _now_iso()
+                            _archive_job_locked(job)
                         _save_job_state()
+                        _save_job_history_state()
                 _job_queue.task_done()
 
         _job_worker_thread = threading.Thread(
@@ -2114,6 +2425,7 @@ def _stop_job_worker() -> None:
         thread.join(timeout=2)
     with _job_lock:
         _save_job_state()
+        _save_job_history_state()
         _job_worker_thread = None
         while True:
             try:
@@ -3691,6 +4003,7 @@ def _lint_schematic_file(
 
 _load_run_state()
 _load_job_state()
+_load_job_history_state()
 if any(
     str(_jobs[job_id].get("status", "")).lower() == "queued" and not _jobs[job_id].get("cancel_requested")
     for job_id in _job_order
@@ -3884,8 +4197,12 @@ def runVerificationPlan(
     - `rise_fall_time`: vector (+ optional metric)
     - `settling_time`: vector (+ optional tolerance_percent/target_value)
     - `meas`: name from .meas results
+    - `all_of`: all nested assertions must pass
+    - `any_of`: at least one nested assertion must pass
     Bounds:
     - `min`, `max`
+    Tolerances:
+    - `target` (+ optional `rel_tol_pct`, `abs_tol`)
     """
     if not assertions:
         raise ValueError("assertions must contain at least one assertion object")
@@ -3938,107 +4255,45 @@ def runVerificationPlan(
         }
         measurement_report = parsed_meas
 
-    requires_dataset = any(str(item.get("type", "")).strip().lower() != "meas" for item in assertions)
+    requires_dataset = any(_assertion_requires_dataset(item) for item in assertions if isinstance(item, dict))
     dataset = _resolve_dataset(plot=None, run_id=run.run_id, raw_path=None) if requires_dataset else None
     checks: list[dict[str, Any]] = []
 
     for index, assertion in enumerate(assertions, start=1):
-        check_id = str(assertion.get("id") or assertion.get("name") or f"check_{index}")
-        check_type = str(assertion.get("type", "vector_stat")).strip().lower()
-        minimum = assertion.get("min")
-        maximum = assertion.get("max")
-        try:
-            minimum_f = float(minimum) if minimum is not None else None
-            maximum_f = float(maximum) if maximum is not None else None
-            value: float | None = None
-            details: dict[str, Any] = {"assertion": assertion}
-
-            if check_type == "meas":
-                meas_name = str(assertion.get("name", "")).strip()
-                if not meas_name:
-                    raise ValueError("meas assertion requires `name`")
-                value = measurement_map.get(meas_name)
-                details["measurement_name"] = meas_name
-            else:
-                if dataset is None:
-                    raise ValueError("No RAW dataset available for non-meas assertions")
-                step_index = assertion.get("step_index")
-                selected_step = _resolve_step_index(dataset, int(step_index) if step_index is not None else None)
-                vector = str(assertion.get("vector", "")).strip()
-                if not vector:
-                    raise ValueError(f"{check_type} assertion requires `vector`")
-                if check_type == "vector_stat":
-                    statistic = str(assertion.get("statistic", "final"))
-                    series = dataset.get_vector(vector, step_index=selected_step)
-                    value = _metric_from_series(series, statistic)
-                    details.update({"vector": vector, "statistic": statistic})
-                elif check_type == "bandwidth":
-                    metric = str(assertion.get("metric", "lowpass_bandwidth_hz"))
-                    result = compute_bandwidth(
-                        frequency_hz=dataset.scale_values(step_index=selected_step),
-                        response=dataset.get_vector(vector, step_index=selected_step),
-                        reference=str(assertion.get("reference", "first")),
-                        drop_db=float(assertion.get("drop_db", 3.0)),
-                    )
-                    value = result.get(metric)
-                    details.update({"vector": vector, "metric": metric, "result": result})
-                elif check_type == "gain_phase_margin":
-                    metric = str(assertion.get("metric", "phase_margin_deg"))
-                    result = compute_gain_phase_margin(
-                        frequency_hz=dataset.scale_values(step_index=selected_step),
-                        response=dataset.get_vector(vector, step_index=selected_step),
-                    )
-                    value = result.get(metric)
-                    details.update({"vector": vector, "metric": metric, "result": result})
-                elif check_type == "rise_fall_time":
-                    metric = str(assertion.get("metric", "rise_time_s"))
-                    result = compute_rise_fall_time(
-                        time_s=dataset.scale_values(step_index=selected_step),
-                        signal=dataset.get_vector(vector, step_index=selected_step),
-                        low_threshold_pct=float(assertion.get("low_threshold_pct", 10.0)),
-                        high_threshold_pct=float(assertion.get("high_threshold_pct", 90.0)),
-                    )
-                    value = result.get(metric)
-                    details.update({"vector": vector, "metric": metric, "result": result})
-                elif check_type == "settling_time":
-                    metric = str(assertion.get("metric", "settling_time_s"))
-                    result = compute_settling_time(
-                        time_s=dataset.scale_values(step_index=selected_step),
-                        signal=dataset.get_vector(vector, step_index=selected_step),
-                        tolerance_percent=float(assertion.get("tolerance_percent", 2.0)),
-                        target_value=float(assertion["target_value"])
-                        if "target_value" in assertion and assertion["target_value"] is not None
-                        else None,
-                    )
-                    value = result.get(metric)
-                    details.update({"vector": vector, "metric": metric, "result": result})
-                else:
-                    raise ValueError(f"Unsupported assertion type '{check_type}'")
-
-            passed, condition = _evaluate_limits(value=value, minimum=minimum_f, maximum=maximum_f)
+        if not isinstance(assertion, dict):
             checks.append(
                 {
-                    "id": check_id,
-                    "type": check_type,
-                    "passed": bool(passed),
-                    "value": value,
-                    "min": minimum_f,
-                    "max": maximum_f,
-                    "condition": condition,
-                    "details": details,
+                    "id": f"check_{index}",
+                    "type": "invalid",
+                    "passed": False,
+                    "value": None,
+                    "error": "Assertion entries must be objects.",
+                    "details": {"assertion": assertion},
                 }
             )
-            if fail_fast and not passed:
+            if fail_fast:
+                break
+            continue
+        try:
+            result = _evaluate_verification_assertion(
+                assertion=assertion,
+                dataset=dataset,
+                measurement_map=measurement_map,
+                default_id=f"check_{index}",
+                fail_fast=fail_fast,
+            )
+            checks.append(result)
+            if fail_fast and not bool(result.get("passed")):
                 break
         except Exception as exc:  # noqa: BLE001
             checks.append(
                 {
-                    "id": check_id,
-                    "type": check_type,
+                    "id": str(assertion.get("id") or assertion.get("name") or f"check_{index}"),
+                    "type": str(assertion.get("type", "vector_stat")).strip().lower(),
                     "passed": False,
                     "value": None,
-                    "min": minimum,
-                    "max": maximum,
+                    "min": assertion.get("min"),
+                    "max": assertion.get("max"),
                     "error": str(exc),
                     "details": {"assertion": assertion},
                 }
@@ -4206,6 +4461,114 @@ def runSweepStudy(
         "records": records,
         "aggregate": aggregate,
         "worst_case": worst_case,
+    }
+
+
+@mcp.tool()
+def generateVerifyAndCleanCircuit(
+    intent: str,
+    parameters: dict[str, Any] | None = None,
+    assertions: list[dict[str, Any]] | None = None,
+    measurements: list[dict[str, Any] | str] | None = None,
+    clean_in_place: bool = True,
+    clean_output_path: str | None = None,
+    strict_lint: bool = False,
+    strict_style_lint: bool = True,
+    min_style_score: float = 96.0,
+    auto_clean: bool = True,
+    grid: int = 16,
+    render_after_clean: bool = True,
+    downscale_factor: float = 1.0,
+    show_ui: bool | None = None,
+    fail_fast_verification: bool = False,
+) -> dict[str, Any]:
+    """
+    One-shot orchestration: create intent circuit, lint, simulate, verify, clean, and inspect.
+    """
+    safe_params = parameters or {}
+    created = createIntentCircuit(
+        intent=intent,
+        parameters=safe_params,
+        validate_schematic=True,
+        open_ui=False,
+    )
+    asc_path = str(created["asc_path"])
+    lint_before = lintSchematic(
+        asc_path=asc_path,
+        strict=strict_lint,
+        strict_style=strict_style_lint,
+        min_style_score=min_style_score,
+    )
+    simulation = simulateSchematicFile(
+        asc_path=asc_path,
+        show_ui=show_ui,
+        open_raw_after_run=False,
+        validate_first=True,
+        abort_on_validation_error=False,
+    )
+    verification_assertions = assertions or [
+        {
+            "id": "default_input_sanity",
+            "type": "vector_stat",
+            "vector": "V(in)",
+            "statistic": "abs_max",
+            "min": 0.0,
+        }
+    ]
+    verification = runVerificationPlan(
+        assertions=verification_assertions,
+        run_id=str(simulation["run_id"]),
+        measurements=measurements,
+        fail_fast=fail_fast_verification,
+    )
+
+    target_path = asc_path
+    clean_result: dict[str, Any] | None = None
+    if auto_clean:
+        if not clean_in_place:
+            if clean_output_path:
+                target_path = str(Path(clean_output_path).expanduser().resolve())
+            else:
+                source = Path(asc_path).expanduser().resolve()
+                target_path = str(source.with_name(f"{source.stem}_clean{source.suffix}"))
+        clean_result = autoCleanSchematicLayout(
+            asc_path=asc_path,
+            output_path=target_path,
+            prefer_sidecar_regeneration=False,
+            grid=grid,
+            render_after=render_after_clean,
+            downscale_factor=downscale_factor,
+        )
+        target_path = str(clean_result["target_path"])
+
+    lint_after = lintSchematic(
+        asc_path=target_path,
+        strict=strict_lint,
+        strict_style=strict_style_lint,
+        min_style_score=min_style_score,
+    )
+    inspection = inspectSchematicVisualQuality(
+        asc_path=target_path,
+        render=render_after_clean,
+        downscale_factor=downscale_factor,
+    )
+    overall_passed = bool(
+        simulation.get("succeeded", False)
+        and verification.get("overall_passed", False)
+        and lint_after.get("valid", False)
+    )
+    return {
+        "overall_passed": overall_passed,
+        "intent": intent,
+        "parameters": safe_params,
+        "created": created,
+        "lint_before": lint_before,
+        "simulation": simulation,
+        "verification": verification,
+        "clean": clean_result,
+        "lint_after": lint_after,
+        "inspection": inspection,
+        "final_schematic_path": target_path,
     }
 
 
@@ -4410,6 +4773,7 @@ def listJobs(
     limit: int = 50,
     status: str | None = None,
     order_by: Literal["created_at", "priority"] = "created_at",
+    include_history: bool = False,
 ) -> dict[str, Any]:
     """List queued/running/completed simulation jobs."""
     safe_limit = max(1, min(500, int(limit)))
@@ -4434,10 +4798,24 @@ def listJobs(
             selected.append(_job_public_payload(job))
             if len(selected) >= safe_limit:
                 break
+        if include_history and len(selected) < safe_limit:
+            for item in reversed(_job_history):
+                job_id = str(item.get("job_id", "")).strip()
+                if not job_id:
+                    continue
+                if any(existing.get("job_id") == job_id for existing in selected):
+                    continue
+                if status_filter and str(item.get("status", "")).lower() != status_filter:
+                    continue
+                enriched = dict(item)
+                selected.append(_job_public_payload(enriched))
+                if len(selected) >= safe_limit:
+                    break
     return {
         "limit": safe_limit,
         "status_filter": status_filter,
         "order_by": order_by,
+        "include_history": bool(include_history),
         "count": len(selected),
         "jobs": selected,
     }
@@ -4449,8 +4827,14 @@ def jobStatus(job_id: str, include_run: bool = True) -> dict[str, Any]:
     with _job_lock:
         job = _jobs.get(job_id)
         if job is None:
-            raise ValueError(f"Unknown job_id '{job_id}'")
-        payload = _job_public_payload(job)
+            history_index = _job_history_index.get(job_id)
+            if history_index is None:
+                raise ValueError(f"Unknown job_id '{job_id}'")
+            history_job = _job_history[history_index]
+            payload = _job_public_payload(history_job)
+            payload["from_history"] = True
+        else:
+            payload = _job_public_payload(job)
     if include_run and payload.get("run_id"):
         run = _resolve_run(str(payload["run_id"]))
         payload["run"] = _run_payload(run, include_output=False, log_tail_lines=120)
@@ -4471,10 +4855,40 @@ def cancelJob(job_id: str, force: bool = False) -> dict[str, Any]:
             job["status"] = "canceled"
             job["summary"] = "Canceled before start."
             job["finished_at"] = _now_iso()
+            _archive_job_locked(job)
         elif force:
             job["summary"] = "Force-cancel requested. Worker will terminate process on next poll."
         _save_job_state()
+        _save_job_history_state()
     return jobStatus(job_id=job_id, include_run=False)
+
+
+@mcp.tool()
+def listJobHistory(
+    limit: int = 100,
+    status: str | None = None,
+) -> dict[str, Any]:
+    """List archived (terminal) queue jobs retained across daemon restarts."""
+    safe_limit = max(1, min(2000, int(limit)))
+    status_filter = status.strip().lower() if status else None
+    with _job_lock:
+        rows: list[dict[str, Any]] = []
+        for item in reversed(_job_history):
+            if status_filter and str(item.get("status", "")).lower() != status_filter:
+                continue
+            payload = _job_public_payload(item)
+            payload["from_history"] = True
+            payload["archived_at"] = item.get("archived_at")
+            rows.append(payload)
+            if len(rows) >= safe_limit:
+                break
+    return {
+        "limit": safe_limit,
+        "status_filter": status_filter,
+        "retention": int(_job_history_retention),
+        "count": len(rows),
+        "jobs": rows,
+    }
 
 
 @mcp.tool()
@@ -4492,6 +4906,9 @@ def getLtspiceStatus() -> dict[str, Any]:
         "run_state_path": str(_state_path),
         "jobs_recorded": len(_job_order),
         "job_state_path": str(_job_state_path),
+        "job_history_count": len(_job_history),
+        "job_history_retention": int(_job_history_retention),
+        "job_history_path": str(_job_history_path),
         "ltspice_lib_zip_path": str(DEFAULT_LTSPICE_LIB_ZIP.expanduser().resolve()),
         "ui_enabled_default": _ui_enabled,
         "schematic_single_window_default": _schematic_single_window_enabled,
@@ -5564,6 +5981,11 @@ def validateSchematic(asc_path: str) -> dict[str, Any]:
 def lintSchematic(
     asc_path: str,
     strict: bool = False,
+    strict_style: bool = False,
+    min_style_score: float = 96.0,
+    max_component_overlap: int = 0,
+    max_component_crowding: int = 0,
+    max_wire_crossing: int = 0,
     lib_zip_path: str | None = None,
 ) -> dict[str, Any]:
     """Run structural lint checks on a schematic, including pin connectivity and dangling wires."""
@@ -5585,6 +6007,45 @@ def lintSchematic(
         payload["symbol_library_available"] = False
     else:
         payload["symbol_library_available"] = True
+
+    style_report = _analyze_schematic_visual_quality(path)
+    payload["style"] = style_report
+    payload["strict_style"] = bool(strict_style)
+    payload["style_thresholds"] = {
+        "min_style_score": float(min_style_score),
+        "max_component_overlap": int(max_component_overlap),
+        "max_component_crowding": int(max_component_crowding),
+        "max_wire_crossing": int(max_wire_crossing),
+    }
+
+    if strict_style:
+        findings = style_report.get("findings", [])
+        overlap_count = sum(1 for item in findings if str(item.get("type", "")).lower() == "component_overlap")
+        crowding_count = sum(1 for item in findings if str(item.get("type", "")).lower() == "component_crowding")
+        crossing_count = sum(1 for item in findings if str(item.get("type", "")).lower() == "wire_crossing")
+        score = float(style_report.get("score", 0.0))
+        if score < float(min_style_score):
+            payload.setdefault("errors", []).append(
+                f"Style score {score:.3f} is below minimum {float(min_style_score):.3f}."
+            )
+        if overlap_count > int(max_component_overlap):
+            payload.setdefault("errors", []).append(
+                f"component_overlap count {overlap_count} exceeds max_component_overlap {int(max_component_overlap)}."
+            )
+        if crowding_count > int(max_component_crowding):
+            payload.setdefault("errors", []).append(
+                f"component_crowding count {crowding_count} exceeds max_component_crowding {int(max_component_crowding)}."
+            )
+        if crossing_count > int(max_wire_crossing):
+            payload.setdefault("errors", []).append(
+                f"wire_crossing count {crossing_count} exceeds max_wire_crossing {int(max_wire_crossing)}."
+            )
+        payload["style_counts"] = {
+            "component_overlap": overlap_count,
+            "component_crowding": crowding_count,
+            "wire_crossing": crossing_count,
+        }
+        payload["valid"] = len(payload.get("errors", [])) == 0
     return payload
 
 
@@ -6456,7 +6917,7 @@ def _configure_runner(
     schematic_single_window: bool | None = None,
     schematic_live_path: str | None = None,
 ) -> None:
-    global _runner, _loaded_netlist, _raw_cache, _state_path, _ui_enabled, _job_state_path
+    global _runner, _loaded_netlist, _raw_cache, _state_path, _ui_enabled, _job_state_path, _job_history_path
     global _schematic_single_window_enabled, _schematic_live_path
     global _symbol_library, _symbol_library_zip_path
     _stop_job_worker()
@@ -6467,6 +6928,7 @@ def _configure_runner(
     )
     _state_path = workdir / ".ltspice_mcp_runs.json"
     _job_state_path = workdir / ".ltspice_mcp_jobs.json"
+    _job_history_path = workdir / ".ltspice_mcp_job_history.json"
     _loaded_netlist = None
     _raw_cache = {}
     if _symbol_library is not None:
@@ -6487,6 +6949,7 @@ def _configure_runner(
         _schematic_live_path = (workdir / ".ui" / "live_schematic.asc").resolve()
     _load_run_state()
     _load_job_state()
+    _load_job_history_state()
     if any(
         str(_jobs[job_id].get("status", "")).lower() == "queued" and not _jobs[job_id].get("cancel_requested")
         for job_id in _job_order

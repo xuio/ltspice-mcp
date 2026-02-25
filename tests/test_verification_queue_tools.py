@@ -148,6 +148,78 @@ class TestVerificationAndQueueTools(unittest.TestCase):
         self.assertEqual(payload["passed_count"], 2)
         self.assertEqual(payload["failed_count"], 0)
 
+    def test_run_verification_plan_supports_groups_and_tolerance(self) -> None:
+        run = _make_run(self.temp_dir, run_id="verify-group")
+        dataset = RawDataset(
+            path=self.temp_dir / "verify_group.raw",
+            plot_name="Transient Analysis",
+            flags=set(),
+            metadata={},
+            variables=[
+                RawVariable(index=0, name="time", kind="time"),
+                RawVariable(index=1, name="V(out)", kind="voltage"),
+            ],
+            values=[
+                [0.0 + 0j, 1e-3 + 0j],
+                [0.95 + 0j, 1.05 + 0j],
+            ],
+            steps=[],
+        )
+        with (
+            patch(
+                "ltspice_mcp.server._resolve_run_target_for_input",
+                return_value={
+                    "source": "existing_run",
+                    "run": run,
+                    "run_payload": {"run_id": run.run_id, "succeeded": True},
+                },
+            ),
+            patch(
+                "ltspice_mcp.server.parseMeasResults",
+                return_value={
+                    "run_id": run.run_id,
+                    "count": 1,
+                    "measurements": {"gain_check": 2.0},
+                    "items": [{"name": "gain_check", "value": 2.0}],
+                },
+            ),
+            patch("ltspice_mcp.server._resolve_dataset", return_value=dataset),
+        ):
+            payload = server.runVerificationPlan(
+                assertions=[
+                    {
+                        "id": "group_all",
+                        "type": "all_of",
+                        "assertions": [
+                            {
+                                "id": "vout_tol",
+                                "type": "vector_stat",
+                                "vector": "V(out)",
+                                "statistic": "final",
+                                "target": 1.0,
+                                "rel_tol_pct": 10.0,
+                            },
+                            {
+                                "id": "group_any_meas",
+                                "type": "any_of",
+                                "assertions": [
+                                    {"id": "meas_fail", "type": "meas", "name": "gain_check", "min": 3.0},
+                                    {"id": "meas_pass", "type": "meas", "name": "gain_check", "min": 1.5},
+                                ],
+                            },
+                        ],
+                    }
+                ]
+            )
+
+        self.assertTrue(payload["overall_passed"])
+        self.assertEqual(payload["passed_count"], 1)
+        self.assertEqual(payload["failed_count"], 0)
+        root = payload["checks"][0]
+        self.assertEqual(root["type"], "all_of")
+        self.assertEqual(root["child_count"], 2)
+        self.assertTrue(root["passed"])
+
     def test_run_sweep_study_step_mode(self) -> None:
         netlist = self.temp_dir / "step_study.cir"
         netlist.write_text("* step study\nR1 in out 1k\n.end\n", encoding="utf-8")
@@ -276,6 +348,39 @@ class TestVerificationAndQueueTools(unittest.TestCase):
         self.assertIn("quality", inspect_payload)
         self.assertGreaterEqual(inspect_payload["quality"]["component_count"], 2)
 
+    def test_lint_schematic_supports_strict_style_mode(self) -> None:
+        asc = self.temp_dir / "style_lint.asc"
+        asc.write_text(
+            "\n".join(
+                [
+                    "Version 4",
+                    "SHEET 1 400 300",
+                    "SYMBOL res 100 100 R0",
+                    "SYMATTR InstName R1",
+                    "SYMBOL cap 110 100 R0",
+                    "SYMATTR InstName C1",
+                    "WIRE 100 100 140 100",
+                    "TEXT 48 200 Left 2 !.op",
+                    "FLAG 100 160 0",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        payload = server.lintSchematic(
+            asc_path=str(asc),
+            strict=False,
+            strict_style=True,
+            min_style_score=99.0,
+            max_component_overlap=0,
+            max_component_crowding=0,
+            max_wire_crossing=0,
+            lib_zip_path=str(self.temp_dir / "missing_lib.zip"),
+        )
+        self.assertFalse(payload["valid"])
+        self.assertTrue(any("component_overlap" in err or "Style score" in err for err in payload["errors"]))
+        self.assertTrue(payload["strict_style"])
+
     def test_daemon_doctor_reports_missing_setup(self) -> None:
         with (
             patch(
@@ -393,6 +498,64 @@ class TestVerificationAndQueueTools(unittest.TestCase):
         self.assertEqual(restored["priority"], 7)
         self.assertEqual(restored["max_retries"], 3)
         self.assertIn("persisted queue state", str(restored.get("summary", "")).lower())
+
+    def test_queue_history_persists_and_is_queryable(self) -> None:
+        netlist = self.temp_dir / "history_job.cir"
+        netlist.write_text("* history\n.end\n", encoding="utf-8")
+        with patch("ltspice_mcp.server._ensure_job_worker", return_value=None):
+            queued = server.queueSimulationJob(netlist_path=str(netlist), priority=5, max_retries=0)
+        canceled = server.cancelJob(job_id=queued["job_id"])
+        self.assertEqual(canceled["status"], "canceled")
+
+        history = server.listJobHistory(limit=50)
+        self.assertGreaterEqual(history["count"], 1)
+        self.assertTrue(any(item["job_id"] == queued["job_id"] for item in history["jobs"]))
+
+        server._configure_runner(workdir=self.temp_dir, ltspice_binary=None, timeout=10)
+        history_after = server.listJobHistory(limit=50)
+        self.assertTrue(any(item["job_id"] == queued["job_id"] for item in history_after["jobs"]))
+
+    def test_generate_verify_and_clean_circuit_orchestration(self) -> None:
+        asc = self.temp_dir / "orchestration.asc"
+        asc.write_text("Version 4\nSHEET 1 200 200\n", encoding="utf-8")
+        cleaned = self.temp_dir / "orchestration_clean.asc"
+        cleaned.write_text("Version 4\nSHEET 1 200 200\n", encoding="utf-8")
+        with (
+            patch(
+                "ltspice_mcp.server.createIntentCircuit",
+                return_value={"intent": "rc_lowpass", "asc_path": str(asc), "schematic_validation": {"valid": True}},
+            ),
+            patch("ltspice_mcp.server.lintSchematic") as lint_mock,
+            patch(
+                "ltspice_mcp.server.simulateSchematicFile",
+                return_value={"run_id": "run-orch", "succeeded": True},
+            ),
+            patch(
+                "ltspice_mcp.server.runVerificationPlan",
+                return_value={"overall_passed": True, "checks": []},
+            ),
+            patch(
+                "ltspice_mcp.server.autoCleanSchematicLayout",
+                return_value={"target_path": str(cleaned), "after": {"score": 99.0}},
+            ),
+            patch(
+                "ltspice_mcp.server.inspectSchematicVisualQuality",
+                return_value={"quality": {"score": 99.0}, "render": None},
+            ),
+        ):
+            lint_mock.side_effect = [
+                {"valid": True, "errors": [], "warnings": []},
+                {"valid": True, "errors": [], "warnings": []},
+            ]
+            payload = server.generateVerifyAndCleanCircuit(
+                intent="rc_lowpass",
+                parameters={"r_value": "1k", "c_value": "100n"},
+                auto_clean=True,
+                render_after_clean=False,
+            )
+        self.assertTrue(payload["overall_passed"])
+        self.assertEqual(payload["final_schematic_path"], str(cleaned))
+        self.assertEqual(lint_mock.call_count, 2)
 
 
 if __name__ == "__main__":

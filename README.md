@@ -83,15 +83,19 @@ ltspice-mcp \
   - settling time.
 - Verification and automation:
   - `.meas` generation + parsing (`runMeasAutomation`, `parseMeasResults`),
-  - one-shot assertion plans (`runVerificationPlan`),
+  - one-shot assertion plans (`runVerificationPlan`) with assertion groups (`all_of`/`any_of`) and tolerance checks (`target`, `rel_tol_pct`, `abs_tol`),
   - stepped/Monte-Carlo studies (`runSweepStudy`).
 - Schematic visual quality tools:
   - quality inspection (`inspectSchematicVisualQuality`),
-  - auto-cleaner (`autoCleanSchematicLayout`).
+  - auto-cleaner (`autoCleanSchematicLayout`),
+  - strict style lint in `lintSchematic(strict_style=true, ...)`.
+- End-to-end orchestration:
+  - `generateVerifyAndCleanCircuit` (create → lint → simulate → verify → clean → inspect).
 - Queue-based simulation control:
   - `queueSimulationJob`, `listJobs`, `jobStatus`, `cancelJob`,
   - persisted queue state across daemon restart,
   - priority scheduling and per-job retry policy.
+  - persisted terminal job history with retention (`listJobHistory`).
 - Daemon diagnostics:
   - `tailDaemonLog`,
   - `getRecentErrors`,
@@ -133,6 +137,7 @@ ltspice-mcp \
 - `autoDebugSchematic`
 - `autoCleanSchematicLayout`
 - `inspectSchematicVisualQuality`
+- `generateVerifyAndCleanCircuit`
 
 ### Simulation
 - `loadCircuit`
@@ -144,6 +149,7 @@ ltspice-mcp \
 - `listJobs`
 - `jobStatus`
 - `cancelJob`
+- `listJobHistory`
 
 ### Plot/data/analysis
 - `getPlotNames`
