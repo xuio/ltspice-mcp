@@ -6,6 +6,7 @@ import json
 import math
 import mimetypes
 import os
+import re
 import shutil
 import struct
 import uuid
@@ -1035,6 +1036,309 @@ _SIM_DIRECTIVE_PREFIXES = (
     ".tran",
 )
 
+_INTENT_TEMPLATE_MAP: dict[str, str] = {
+    "rc_lowpass": "rc_lowpass_ac",
+    "rc_highpass": "rc_highpass_ac",
+    "non_inverting_amplifier": "non_inverting_opamp_spec",
+    "zener_regulator": "zener_regulator_dc",
+}
+
+_INTENT_DEFAULT_PARAMETERS: dict[str, dict[str, Any]] = {
+    "rc_lowpass": {
+        "vin_ac": "1",
+        "r_value": "1k",
+        "c_value": "100n",
+        "ac_points": "30",
+        "f_start": "10",
+        "f_stop": "1e6",
+    },
+    "rc_highpass": {
+        "vin_ac": "1",
+        "r_value": "1k",
+        "c_value": "100n",
+        "ac_points": "30",
+        "f_start": "10",
+        "f_stop": "1e6",
+    },
+    "non_inverting_amplifier": {
+        "vin_signal": "SINE(0 0.1 1k) AC 1",
+        "rf_value": "10k",
+        "rg_value": "1k",
+        "vplus": "10",
+        "vminus": "-10",
+        "tran_stop": "10m",
+    },
+    "zener_regulator": {
+        "vin_dc": "12",
+        "r_series": "330",
+        "r_load": "1k",
+        "zener_voltage": "5.1",
+        "dc_start": "6",
+        "dc_stop": "18",
+        "dc_step": "0.25",
+    },
+}
+
+_FLOATING_NODE_RE = re.compile(r"(?i)\bnode\s+([a-zA-Z0-9_.$:+-]+)\b.*\bfloating\b")
+_MISSING_INCLUDE_RE = re.compile(
+    r"(?i)(?:could not open include file|unable to open .*?)(?:\s*[:\"]\s*)([^\"\s]+)"
+)
+_MISSING_SUBCKT_RE = re.compile(r"(?i)unknown subcircuit(?: called in:)?\s*(.*)")
+_MISSING_MODEL_RE = re.compile(
+    r"(?i)(?:can't find definition of model|unknown model|could not find model)\s*\"?([a-zA-Z0-9_.:$+-]+)\"?"
+)
+_SUBCKT_DEF_RE = re.compile(r"(?im)^\s*\.subckt\s+([^\s]+)")
+
+
+def _normalize_intent(intent: str) -> str:
+    normalized = intent.strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized not in _INTENT_TEMPLATE_MAP:
+        raise ValueError(
+            "intent must be one of: "
+            + ", ".join(sorted(_INTENT_TEMPLATE_MAP.keys()))
+        )
+    return normalized
+
+
+def _merge_intent_parameters(intent: str, parameters: dict[str, Any] | None) -> dict[str, Any]:
+    defaults = dict(_INTENT_DEFAULT_PARAMETERS.get(intent, {}))
+    for key, value in (parameters or {}).items():
+        defaults[str(key)] = value
+    return defaults
+
+
+def _extract_model_issues_from_text(log_text: str) -> dict[str, Any]:
+    missing_includes: set[str] = set()
+    missing_subcircuits: set[str] = set()
+    missing_models: set[str] = set()
+    matched_lines: list[str] = []
+    for raw in log_text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        matched = False
+        include_match = _MISSING_INCLUDE_RE.search(line)
+        if include_match:
+            missing_includes.add(include_match.group(1).strip().strip('"'))
+            matched = True
+        subckt_match = _MISSING_SUBCKT_RE.search(line)
+        if subckt_match:
+            value = subckt_match.group(1).strip()
+            if value:
+                missing_subcircuits.add(value)
+            matched = True
+        model_match = _MISSING_MODEL_RE.search(line)
+        if model_match:
+            missing_models.add(model_match.group(1).strip())
+            matched = True
+        if matched:
+            matched_lines.append(line)
+    return {
+        "missing_include_files": sorted(missing_includes),
+        "missing_subcircuits": sorted(missing_subcircuits),
+        "missing_models": sorted(missing_models),
+        "matched_lines": matched_lines,
+        "has_model_issues": bool(missing_includes or missing_subcircuits or missing_models),
+    }
+
+
+def _extract_floating_nodes(messages: list[str]) -> list[str]:
+    nodes: list[str] = []
+    seen: set[str] = set()
+    for message in messages:
+        for match in _FLOATING_NODE_RE.finditer(message):
+            node = match.group(1).strip()
+            lowered = node.lower()
+            if lowered in {"0", "gnd", "ground"}:
+                continue
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            nodes.append(node)
+    return nodes
+
+
+def _append_lines_if_missing(path: Path, lines: list[str]) -> list[str]:
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    raw_lines = text.splitlines()
+    existing = {line.strip().lower() for line in raw_lines if line.strip()}
+    additions: list[str] = []
+    for line in lines:
+        normalized = line.strip().lower()
+        if not normalized or normalized in existing:
+            continue
+        additions.append(line)
+        existing.add(normalized)
+    if not additions:
+        return []
+    end_index = next(
+        (idx for idx, line in enumerate(raw_lines) if line.strip().lower() == ".end"),
+        None,
+    )
+    if end_index is None:
+        raw_lines.extend(additions)
+        raw_lines.append(".end")
+    else:
+        raw_lines[end_index:end_index] = additions
+    path.write_text("\n".join(raw_lines).rstrip() + "\n", encoding="utf-8")
+    return additions
+
+
+def _resolve_sidecar_netlist_path(asc_path: Path) -> Path | None:
+    if asc_path.suffix.lower() != ".asc":
+        return asc_path
+    for suffix in (".cir", ".net", ".sp", ".spi"):
+        candidate = asc_path.with_suffix(suffix)
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _ensure_debug_fix_netlist(path: Path) -> Path:
+    netlist_path = _resolve_sidecar_netlist_path(path)
+    if netlist_path is None:
+        raise ValueError(
+            "No sidecar netlist found next to schematic; create one (e.g. .cir) for auto-debug netlist fixes."
+        )
+    return netlist_path
+
+
+def _apply_schematic_preflight_fixes(path: Path, validation: dict[str, Any]) -> list[dict[str, Any]]:
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    actions: list[dict[str, Any]] = []
+    changed = False
+    if not validation.get("has_ground", False):
+        text = text.rstrip() + "\nFLAG 48 48 0\n"
+        actions.append({"action": "add_ground_flag", "path": str(path), "line": "FLAG 48 48 0"})
+        changed = True
+    if not validation.get("simulation_directives"):
+        text = text.rstrip() + "\nTEXT 48 560 Left 2 !.op\n"
+        actions.append(
+            {
+                "action": "add_simulation_directive",
+                "path": str(path),
+                "line": "TEXT 48 560 Left 2 !.op",
+            }
+        )
+        changed = True
+    if changed:
+        path.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+    return actions
+
+
+def _apply_floating_node_bleeders(netlist_path: Path, nodes: list[str]) -> list[str]:
+    if not nodes:
+        return []
+    text = netlist_path.read_text(encoding="utf-8", errors="ignore")
+    lines = text.splitlines()
+    existing = {line.strip().lower() for line in lines if line.strip()}
+    additions: list[str] = []
+    used_indices: set[int] = set()
+    for entry in existing:
+        match = re.match(r"^r__bleed(\d+)\b", entry)
+        if match:
+            used_indices.add(int(match.group(1)))
+    next_index = 1
+    while next_index in used_indices:
+        next_index += 1
+    for node in nodes:
+        line = f"R__BLEED{next_index} {node} 0 1G"
+        used_indices.add(next_index)
+        next_index += 1
+        if line.strip().lower() in existing:
+            continue
+        additions.append(line)
+        existing.add(line.strip().lower())
+    if not additions:
+        return []
+    has_end = any(entry.strip().lower() == ".end" for entry in lines)
+    if has_end:
+        end_index = next(
+            idx for idx, entry in enumerate(lines) if entry.strip().lower() == ".end"
+        )
+        lines[end_index:end_index] = additions
+    else:
+        lines.extend(additions)
+        lines.append(".end")
+    netlist_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return additions
+
+
+def _discover_subckt_names(model_text: str) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for match in _SUBCKT_DEF_RE.finditer(model_text):
+        name = match.group(1).strip()
+        lowered = name.lower()
+        if not name or lowered in seen:
+            continue
+        seen.add(lowered)
+        names.append(name)
+    return names
+
+
+_PLOT_PRESETS: dict[str, dict[str, Any]] = {
+    "bode": {
+        "mode": "db",
+        "dual_axis": True,
+        "x_log": True,
+        "pane_layout": "single",
+    },
+    "transient_startup": {
+        "mode": "real",
+        "dual_axis": False,
+        "x_log": False,
+        "pane_layout": "single",
+    },
+    "noise": {
+        "mode": "db",
+        "dual_axis": False,
+        "x_log": True,
+        "pane_layout": "single",
+    },
+    "step_compare": {
+        "mode": "real",
+        "dual_axis": False,
+        "x_log": False,
+        "pane_layout": "per_trace",
+    },
+}
+
+
+def _normalize_plot_preset(value: str) -> str:
+    normalized = value.strip().lower().replace("-", "_")
+    if normalized not in _PLOT_PRESETS:
+        raise ValueError(
+            "preset must be one of: " + ", ".join(sorted(_PLOT_PRESETS.keys()))
+        )
+    return normalized
+
+
+def _default_vectors_for_plot_preset(dataset: RawDataset, preset: str) -> list[str]:
+    vector_names = [variable.name for variable in dataset.variables[1:]]
+    if not vector_names:
+        raise ValueError("RAW dataset does not include any plottable vectors.")
+    voltages = [name for name in vector_names if name.upper().startswith("V(")]
+    currents = [name for name in vector_names if name.upper().startswith("I(")]
+    preferred_out = [name for name in vector_names if name.lower() in {"v(out)", "v(vout)"}]
+    if preset in {"bode", "noise"}:
+        if preferred_out:
+            return [preferred_out[0]]
+        if voltages:
+            return [voltages[0]]
+        return [vector_names[0]]
+    if preset == "step_compare":
+        if voltages:
+            return voltages[: min(4, len(voltages))]
+        if currents:
+            return currents[: min(4, len(currents))]
+        return vector_names[: min(4, len(vector_names))]
+    if preferred_out:
+        return [preferred_out[0]]
+    if voltages:
+        return [voltages[0]]
+    return [vector_names[0]]
+
 
 def _validate_schematic_file(path: Path) -> dict[str, Any]:
     text = path.read_text(encoding="utf-8", errors="ignore")
@@ -1653,6 +1957,95 @@ def generatePlotSettings(
 
 
 @mcp.tool()
+def listPlotPresets() -> dict[str, Any]:
+    """List built-in deterministic LTspice plot presets."""
+    return {
+        "presets": [
+            {"name": name, **settings}
+            for name, settings in sorted(_PLOT_PRESETS.items())
+        ]
+    }
+
+
+@mcp.tool()
+def generatePlotPresetSettings(
+    preset: str,
+    vectors: list[str] | None = None,
+    plot: str | None = None,
+    run_id: str | None = None,
+    raw_path: str | None = None,
+    step_index: int | None = None,
+    output_path: str | None = None,
+) -> dict[str, Any]:
+    """Generate deterministic .plt settings for a named preset."""
+    normalized_preset = _normalize_plot_preset(preset)
+    dataset = _resolve_dataset(plot=plot, run_id=run_id, raw_path=raw_path)
+    selected_vectors = vectors or _default_vectors_for_plot_preset(dataset, normalized_preset)
+    settings = _PLOT_PRESETS[normalized_preset]
+    payload = generatePlotSettings(
+        vectors=selected_vectors,
+        plot=plot,
+        run_id=run_id,
+        raw_path=raw_path,
+        step_index=step_index,
+        mode=str(settings["mode"]),
+        x_log=bool(settings["x_log"]),
+        dual_axis=bool(settings["dual_axis"]),
+        pane_layout=str(settings["pane_layout"]),
+        output_path=output_path,
+    )
+    payload["plot_preset"] = normalized_preset
+    payload["preset_settings"] = settings
+    payload["vectors_selected"] = selected_vectors
+    return payload
+
+
+@mcp.tool()
+def renderLtspicePlotPresetImage(
+    preset: str,
+    vectors: list[str] | None = None,
+    plot: str | None = None,
+    run_id: str | None = None,
+    raw_path: str | None = None,
+    step_index: int | None = None,
+    output_path: str | None = None,
+    backend: str = "auto",
+    settle_seconds: float = 1.0,
+    downscale_factor: float = 1.0,
+    validate_capture: bool = True,
+) -> types.CallToolResult:
+    """Render a plot image using a built-in deterministic preset."""
+    normalized_preset = _normalize_plot_preset(preset)
+    dataset = _resolve_dataset(plot=plot, run_id=run_id, raw_path=raw_path)
+    selected_vectors = vectors or _default_vectors_for_plot_preset(dataset, normalized_preset)
+    settings = _PLOT_PRESETS[normalized_preset]
+    result = renderLtspicePlotImage(
+        vectors=selected_vectors,
+        plot=plot,
+        run_id=run_id,
+        raw_path=raw_path,
+        step_index=step_index,
+        output_path=output_path,
+        backend=backend,
+        settle_seconds=settle_seconds,
+        downscale_factor=downscale_factor,
+        mode=str(settings["mode"]),
+        x_log=bool(settings["x_log"]),
+        dual_axis=bool(settings["dual_axis"]),
+        pane_layout=str(settings["pane_layout"]),
+        validate_capture=validate_capture,
+    )
+    payload = result.structuredContent
+    if not isinstance(payload, dict):
+        return result
+    merged = dict(payload)
+    merged["plot_preset"] = normalized_preset
+    merged["preset_settings"] = settings
+    merged["vectors_selected"] = selected_vectors
+    return _image_tool_result(merged)
+
+
+@mcp.tool()
 def setLtspiceUiEnabled(enabled: bool) -> dict[str, Any]:
     """Set default UI behavior for simulation calls where show_ui is omitted."""
     global _ui_enabled
@@ -1786,6 +2179,7 @@ def createSchematicFromNetlist(
     output_path: str | None = None,
     sheet_width: int = 1200,
     sheet_height: int = 900,
+    placement_mode: str = "smart",
     open_ui: bool | None = None,
 ) -> dict[str, Any]:
     """
@@ -1800,6 +2194,7 @@ def createSchematicFromNetlist(
         output_path=output_path,
         sheet_width=sheet_width,
         sheet_height=sheet_height,
+        placement_mode=placement_mode,
     )
 
     should_open = _effective_open_ui(open_ui)
@@ -1828,6 +2223,7 @@ def createSchematicFromTemplate(
     sheet_width: int | None = None,
     sheet_height: int | None = None,
     template_path: str | None = None,
+    placement_mode: str | None = None,
     open_ui: bool | None = None,
 ) -> dict[str, Any]:
     """
@@ -1844,7 +2240,74 @@ def createSchematicFromTemplate(
         sheet_width=sheet_width,
         sheet_height=sheet_height,
         template_path=template_path,
+        placement_mode=placement_mode,
     )
+
+    should_open = _effective_open_ui(open_ui)
+    if should_open:
+        try:
+            result["ui"] = _open_schematic_ui(Path(result["asc_path"]))
+        except Exception as exc:
+            result["ui"] = {"opened": False, "error": str(exc)}
+    result["ui_enabled"] = should_open
+    result["single_window_mode"] = _schematic_single_window_enabled
+    return result
+
+
+@mcp.tool()
+def listIntentCircuitTemplates() -> dict[str, Any]:
+    """List high-level circuit intent templates and default parameters."""
+    intents: list[dict[str, Any]] = []
+    for intent_name in sorted(_INTENT_TEMPLATE_MAP.keys()):
+        intents.append(
+            {
+                "intent": intent_name,
+                "template_name": _INTENT_TEMPLATE_MAP[intent_name],
+                "default_parameters": _INTENT_DEFAULT_PARAMETERS.get(intent_name, {}),
+            }
+        )
+    return {"intents": intents}
+
+
+@mcp.tool()
+def createIntentCircuit(
+    intent: str,
+    parameters: dict[str, Any] | None = None,
+    circuit_name: str | None = None,
+    output_path: str | None = None,
+    sheet_width: int | None = None,
+    sheet_height: int | None = None,
+    placement_mode: str = "smart",
+    open_ui: bool | None = None,
+    validate_schematic: bool = True,
+) -> dict[str, Any]:
+    """
+    Create a circuit from high-level intent templates (filters, amplifier, regulator).
+
+    Returns schematic and sidecar netlist paths, and optionally validation payload.
+    """
+    normalized_intent = _normalize_intent(intent)
+    merged_parameters = _merge_intent_parameters(normalized_intent, parameters)
+    template_name = _INTENT_TEMPLATE_MAP[normalized_intent]
+    result = build_schematic_from_template(
+        workdir=_runner.workdir,
+        template_name=template_name,
+        parameters=merged_parameters,
+        circuit_name=circuit_name or normalized_intent,
+        output_path=output_path,
+        sheet_width=sheet_width,
+        sheet_height=sheet_height,
+        placement_mode=placement_mode,
+    )
+    if validate_schematic:
+        result["schematic_validation"] = _validate_schematic_file(
+            Path(str(result["asc_path"])).expanduser().resolve()
+        )
+    result["intent"] = normalized_intent
+    result["template_name"] = template_name
+    result["parameters_resolved"] = {
+        str(key): str(value) for key, value in merged_parameters.items()
+    }
 
     should_open = _effective_open_ui(open_ui)
     if should_open:
@@ -1865,6 +2328,7 @@ def syncSchematicFromNetlistFile(
     state_path: str | None = None,
     sheet_width: int = 1200,
     sheet_height: int = 900,
+    placement_mode: str = "smart",
     force: bool = False,
     open_ui: bool | None = None,
 ) -> dict[str, Any]:
@@ -1881,6 +2345,7 @@ def syncSchematicFromNetlistFile(
         state_path=state_path,
         sheet_width=sheet_width,
         sheet_height=sheet_height,
+        placement_mode=placement_mode,
         force=force,
     )
 
@@ -1903,6 +2368,7 @@ def watchSchematicFromNetlistFile(
     state_path: str | None = None,
     sheet_width: int = 1200,
     sheet_height: int = 900,
+    placement_mode: str = "smart",
     duration_seconds: float = 10.0,
     poll_interval_seconds: float = 0.5,
     max_updates: int = 20,
@@ -1922,6 +2388,7 @@ def watchSchematicFromNetlistFile(
         state_path=state_path,
         sheet_width=sheet_width,
         sheet_height=sheet_height,
+        placement_mode=placement_mode,
         duration_seconds=duration_seconds,
         poll_interval_seconds=poll_interval_seconds,
         max_updates=max_updates,
@@ -1960,6 +2427,7 @@ def loadCircuit(netlist: str, circuit_name: str = "circuit") -> dict[str, Any]:
             output_path=str(path.with_suffix(".asc")),
             sheet_width=1200,
             sheet_height=900,
+            placement_mode="smart",
         )
         response["asc_path"] = schematic["asc_path"]
         response["schematic"] = schematic
@@ -2143,6 +2611,300 @@ def simulateSchematicFile(
     if ui_events:
         response["ui_events"] = ui_events
     return response
+
+
+@mcp.tool()
+def scanModelIssues(
+    run_id: str | None = None,
+    log_path: str | None = None,
+) -> dict[str, Any]:
+    """Scan LTspice log text for missing model/include/subcircuit issues."""
+    resolved_log: Path | None = None
+    source_run_id: str | None = None
+    if log_path:
+        resolved_log = Path(log_path).expanduser().resolve()
+    else:
+        run = _resolve_run(run_id)
+        source_run_id = run.run_id
+        resolved_log = run.log_path
+    if resolved_log is None or not resolved_log.exists():
+        return {
+            "run_id": source_run_id or run_id,
+            "log_path": str(resolved_log) if resolved_log else None,
+            "has_model_issues": False,
+            "missing_include_files": [],
+            "missing_subcircuits": [],
+            "missing_models": [],
+            "matched_lines": [],
+        }
+    text = read_text_auto(resolved_log)
+    payload = _extract_model_issues_from_text(text)
+    payload["run_id"] = source_run_id or run_id
+    payload["log_path"] = str(resolved_log)
+    payload["suggestions"] = []
+    if payload["missing_include_files"]:
+        payload["suggestions"].append(
+            "Import missing files with importModelFile and add .include lines via patchNetlistModelBindings."
+        )
+    if payload["missing_subcircuits"] or payload["missing_models"]:
+        payload["suggestions"].append(
+            "Use patchNetlistModelBindings with subckt_aliases/model_aliases to remap references."
+        )
+    return payload
+
+
+@mcp.tool()
+def importModelFile(
+    source_path: str,
+    destination_name: str | None = None,
+    models_dir: str | None = None,
+) -> dict[str, Any]:
+    """Import a model file into the MCP workdir for reproducible .include usage."""
+    source = Path(source_path).expanduser().resolve()
+    if not source.exists():
+        raise FileNotFoundError(f"Model file not found: {source}")
+    if not source.is_file():
+        raise ValueError(f"Model source_path must be a file: {source}")
+    target_dir = (
+        Path(models_dir).expanduser().resolve()
+        if models_dir
+        else (_runner.workdir / "models").resolve()
+    )
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_name = destination_name or source.name
+    target = (target_dir / target_name).resolve()
+    if target.exists() and target.read_bytes() == source.read_bytes():
+        imported = False
+    else:
+        shutil.copy2(source, target)
+        imported = True
+
+    model_text = read_text_auto(target)
+    return {
+        "source_path": str(source),
+        "model_path": str(target),
+        "imported": imported,
+        "include_directive": f'.include "{target}"',
+        "subckt_names": _discover_subckt_names(model_text),
+    }
+
+
+@mcp.tool()
+def patchNetlistModelBindings(
+    netlist_path: str,
+    include_files: list[str] | None = None,
+    subckt_aliases: dict[str, str] | None = None,
+    model_aliases: dict[str, str] | None = None,
+    backup: bool = True,
+) -> dict[str, Any]:
+    """Patch netlist model bindings by adding includes and remapping model/subckt names."""
+    path = Path(netlist_path).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Netlist file not found: {path}")
+    if not path.is_file():
+        raise ValueError(f"netlist_path must be a file: {path}")
+
+    backup_path: Path | None = None
+    original_text = path.read_text(encoding="utf-8", errors="ignore")
+    if backup:
+        backup_path = path.with_suffix(path.suffix + ".bak")
+        backup_path.write_text(original_text, encoding="utf-8")
+
+    include_lines: list[str] = []
+    for raw_include in include_files or []:
+        include_target = Path(raw_include).expanduser().resolve()
+        include_lines.append(f'.include "{include_target}"')
+    added_include_lines = _append_lines_if_missing(path, include_lines) if include_lines else []
+
+    subckt_lookup = {
+        str(key).strip().lower(): str(value).strip()
+        for key, value in (subckt_aliases or {}).items()
+        if str(key).strip() and str(value).strip()
+    }
+    model_lookup = {
+        str(key).strip().lower(): str(value).strip()
+        for key, value in (model_aliases or {}).items()
+        if str(key).strip() and str(value).strip()
+    }
+    model_pattern = None
+    if model_lookup:
+        model_pattern = re.compile(
+            r"\b(" + "|".join(re.escape(key) for key in sorted(model_lookup.keys(), key=len, reverse=True)) + r")\b",
+            re.IGNORECASE,
+        )
+
+    updated_lines: list[str] = []
+    replacement_count = 0
+    for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line
+        stripped = raw_line.strip()
+        if stripped and not stripped.startswith("*"):
+            tokens = raw_line.split()
+            if tokens and tokens[0][:1].upper() == "X" and subckt_lookup:
+                model_idx = len(tokens) - 1
+                while model_idx > 0 and "=" in tokens[model_idx]:
+                    model_idx -= 1
+                old_symbol = tokens[model_idx]
+                new_symbol = subckt_lookup.get(old_symbol.lower())
+                if new_symbol and new_symbol != old_symbol:
+                    tokens[model_idx] = new_symbol
+                    line = " ".join(tokens)
+                    replacement_count += 1
+            if model_pattern is not None:
+                replaced_line = model_pattern.sub(
+                    lambda match: model_lookup.get(match.group(1).lower(), match.group(1)),
+                    line,
+                )
+                if replaced_line != line:
+                    replacement_count += 1
+                line = replaced_line
+        updated_lines.append(line)
+
+    path.write_text("\n".join(updated_lines).rstrip() + "\n", encoding="utf-8")
+    return {
+        "netlist_path": str(path),
+        "backup_path": str(backup_path) if backup_path else None,
+        "include_lines_added": added_include_lines,
+        "replacements": replacement_count,
+        "subckt_aliases": subckt_lookup,
+        "model_aliases": model_lookup,
+    }
+
+
+@mcp.tool()
+def autoDebugSchematic(
+    asc_path: str,
+    max_iterations: int = 3,
+    ascii_raw: bool = False,
+    timeout_seconds: int | None = None,
+    show_ui: bool | None = None,
+    open_raw_after_run: bool = False,
+    auto_fix_preflight: bool = True,
+    auto_fix_runtime: bool = True,
+    auto_import_models: bool = False,
+) -> dict[str, Any]:
+    """
+    Iteratively validate, simulate, and apply targeted fixes to a schematic until it runs or stalls.
+    """
+    if max_iterations <= 0:
+        raise ValueError("max_iterations must be > 0")
+    path = Path(asc_path).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Schematic file not found: {path}")
+
+    history: list[dict[str, Any]] = []
+    final_result: dict[str, Any] | None = None
+    all_actions: list[dict[str, Any]] = []
+
+    for iteration in range(1, max_iterations + 1):
+        validation = _validate_schematic_file(path)
+        preflight_actions: list[dict[str, Any]] = []
+        if auto_fix_preflight and not validation.get("valid", False):
+            preflight_actions = _apply_schematic_preflight_fixes(path, validation)
+            for action in preflight_actions:
+                action["iteration"] = iteration
+            if preflight_actions:
+                validation = _validate_schematic_file(path)
+                all_actions.extend(preflight_actions)
+
+        run_result = simulateSchematicFile(
+            asc_path=str(path),
+            ascii_raw=ascii_raw,
+            timeout_seconds=timeout_seconds,
+            show_ui=show_ui,
+            open_raw_after_run=open_raw_after_run,
+            validate_first=True,
+            abort_on_validation_error=False,
+        )
+        final_result = run_result
+        diagnostics_messages = [
+            str(item.get("message", ""))
+            for item in run_result.get("diagnostics", [])
+            if isinstance(item, dict)
+        ]
+        issue_messages = [str(item) for item in run_result.get("issues", [])]
+        floating_nodes = _extract_floating_nodes(diagnostics_messages + issue_messages)
+        model_issues = _extract_model_issues_from_text(str(run_result.get("log_tail", "")))
+
+        runtime_actions: list[dict[str, Any]] = []
+        if auto_fix_runtime:
+            try:
+                netlist_path = _ensure_debug_fix_netlist(path)
+            except Exception:
+                netlist_path = None
+
+            if netlist_path is not None and floating_nodes:
+                additions = _apply_floating_node_bleeders(netlist_path, floating_nodes)
+                if additions:
+                    runtime_actions.append(
+                        {
+                            "action": "add_bleeder_resistors",
+                            "path": str(netlist_path),
+                            "lines": additions,
+                        }
+                    )
+
+            if (
+                auto_import_models
+                and netlist_path is not None
+                and model_issues.get("missing_include_files")
+            ):
+                models_dir = (_runner.workdir / "models").resolve()
+                include_candidates: list[str] = []
+                for missing in model_issues["missing_include_files"]:
+                    missing_name = Path(str(missing)).name.lower()
+                    matches = [
+                        candidate
+                        for candidate in models_dir.glob("*")
+                        if candidate.is_file() and candidate.name.lower() == missing_name
+                    ]
+                    if matches:
+                        include_candidates.append(str(matches[0].resolve()))
+                if include_candidates:
+                    include_lines = [
+                        f'.include "{Path(item).expanduser().resolve()}"'
+                        for item in include_candidates
+                    ]
+                    added_lines = _append_lines_if_missing(netlist_path, include_lines)
+                    if added_lines:
+                        runtime_actions.append(
+                            {
+                                "action": "add_model_includes",
+                                "path": str(netlist_path),
+                                "lines": added_lines,
+                            }
+                        )
+
+        for action in runtime_actions:
+            action["iteration"] = iteration
+        all_actions.extend(runtime_actions)
+
+        history.append(
+            {
+                "iteration": iteration,
+                "validation": validation,
+                "run_result": run_result,
+                "floating_nodes": floating_nodes,
+                "model_issues": model_issues,
+                "preflight_actions": preflight_actions,
+                "runtime_actions": runtime_actions,
+            }
+        )
+
+        if run_result.get("succeeded", False) and not run_result.get("issues"):
+            break
+        if not preflight_actions and not runtime_actions:
+            break
+
+    return {
+        "asc_path": str(path),
+        "iterations_run": len(history),
+        "max_iterations": max_iterations,
+        "succeeded": bool(final_result and final_result.get("succeeded", False)),
+        "actions_applied": all_actions,
+        "history": history,
+        "final_result": final_result,
+    }
 
 
 @mcp.tool()

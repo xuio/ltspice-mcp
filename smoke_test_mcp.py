@@ -23,8 +23,10 @@ def _extract_call_result(payload: Any) -> Any:
     if not content:
         return None
 
-    text = getattr(content[0], "text", None)
-    if text is not None:
+    for entry in content:
+        text = getattr(entry, "text", None)
+        if text is None:
+            continue
         try:
             return json.loads(text)
         except json.JSONDecodeError:
@@ -75,6 +77,9 @@ async def _run_smoke_test(args: argparse.Namespace) -> None:
                 "renderLtspiceSymbolImage",
                 "renderLtspiceSchematicImage",
                 "renderLtspicePlotImage",
+                "listPlotPresets",
+                "generatePlotPresetSettings",
+                "renderLtspicePlotPresetImage",
                 "generatePlotSettings",
                 "setSchematicUiSingleWindow",
                 "closeLtspiceWindow",
@@ -84,11 +89,17 @@ async def _run_smoke_test(args: argparse.Namespace) -> None:
                 "createSchematicFromNetlist",
                 "listSchematicTemplates",
                 "createSchematicFromTemplate",
+                "listIntentCircuitTemplates",
+                "createIntentCircuit",
                 "syncSchematicFromNetlistFile",
                 "watchSchematicFromNetlistFile",
                 "validateSchematic",
                 "simulateNetlist",
                 "simulateSchematicFile",
+                "scanModelIssues",
+                "importModelFile",
+                "patchNetlistModelBindings",
+                "autoDebugSchematic",
                 "getPlotNames",
                 "getVectorsInfo",
                 "getVectorData",
@@ -172,6 +183,37 @@ async def _run_smoke_test(args: argparse.Namespace) -> None:
             template_entries = templates.get("templates", [])
             _require(isinstance(template_entries, list) and len(template_entries) >= 1, "No schematic templates available")
             print(f"Template list check passed ({len(template_entries)} templates)")
+
+            intent_listing = _extract_call_result(await session.call_tool("listIntentCircuitTemplates", {}))
+            _require(isinstance(intent_listing, dict), "listIntentCircuitTemplates did not return an object")
+            intent_entries = intent_listing.get("intents", [])
+            _require(isinstance(intent_entries, list) and len(intent_entries) >= 1, "No intent templates available")
+            print(f"Intent template list check passed ({len(intent_entries)} intents)")
+
+            intent_schematic = _extract_call_result(
+                await session.call_tool(
+                    "createIntentCircuit",
+                    {
+                        "intent": "rc_highpass",
+                        "parameters": {
+                            "vin_ac": "1",
+                            "r_value": "1k",
+                            "c_value": "100n",
+                            "ac_points": "20",
+                            "f_start": "10",
+                            "f_stop": "100k",
+                        },
+                        "circuit_name": "smoke_intent_rc_highpass",
+                        "validate_schematic": True,
+                        "open_ui": False,
+                    },
+                )
+            )
+            _require(isinstance(intent_schematic, dict), "createIntentCircuit did not return an object")
+            _require(intent_schematic.get("intent") == "rc_highpass", "Intent tool did not resolve intent")
+            _require(intent_schematic.get("schematic_validation", {}).get("valid") is True, "Intent schematic validation failed")
+            _require(Path(str(intent_schematic.get("asc_path", ""))).exists(), "Intent schematic file missing")
+            print("Intent schematic generation check passed")
 
             template_schematic = _extract_call_result(
                 await session.call_tool(
@@ -384,6 +426,44 @@ C1 out 0 1u
             _require(Path(str(plt_settings.get("plt_path", ""))).exists(), "generatePlotSettings did not write .plt")
             print("Plot settings generation check passed")
 
+            plot_presets = _extract_call_result(await session.call_tool("listPlotPresets", {}))
+            _require(isinstance(plot_presets, dict), "listPlotPresets did not return an object")
+            preset_names = {entry.get("name") for entry in plot_presets.get("presets", [])}
+            _require("bode" in preset_names, "bode preset missing")
+            print("Plot preset list check passed")
+
+            preset_settings = _extract_call_result(
+                await session.call_tool(
+                    "generatePlotPresetSettings",
+                    {
+                        "preset": "bode",
+                        "run_id": run_id,
+                    },
+                )
+            )
+            _require(isinstance(preset_settings, dict), "generatePlotPresetSettings did not return an object")
+            _require(
+                Path(str(preset_settings.get("plt_path", ""))).exists(),
+                "generatePlotPresetSettings did not write .plt",
+            )
+            print("Plot preset settings check passed")
+
+            preset_image = _extract_call_result(
+                await session.call_tool(
+                    "renderLtspicePlotPresetImage",
+                    {
+                        "preset": "bode",
+                        "run_id": run_id,
+                        "downscale_factor": 0.5,
+                        "backend": "auto",
+                    },
+                )
+            )
+            _require(isinstance(preset_image, dict), "renderLtspicePlotPresetImage did not return an object")
+            _require(Path(str(preset_image.get("image_path", ""))).exists(), "Preset image output missing")
+            _require(preset_image.get("plot_preset") == "bode", "Preset image metadata missing")
+            print("Plot preset image check passed")
+
             plot_image = _extract_call_result(
                 await session.call_tool(
                     "renderLtspicePlotImage",
@@ -393,6 +473,7 @@ C1 out 0 1u
                         "y_mode": "magnitude",
                         "downscale_factor": 0.5,
                         "backend": "auto",
+                        "validate_capture": False,
                     },
                 )
             )
@@ -459,6 +540,57 @@ C1 out 0 1u
             _require(isinstance(details, dict), "getRunDetails did not return an object")
             _require(details.get("run_id") == run_id, "getRunDetails returned wrong run_id")
             print("Run detail check passed")
+
+            model_scan = _extract_call_result(
+                await session.call_tool("scanModelIssues", {"run_id": run_id})
+            )
+            _require(isinstance(model_scan, dict), "scanModelIssues did not return an object")
+            _require("has_model_issues" in model_scan, "scanModelIssues missing has_model_issues")
+            print("Model issue scan check passed")
+
+            model_source = workdir / "smoke_model.lib"
+            model_source.write_text(".subckt smokeamp in out\n.ends smokeamp\n", encoding="utf-8")
+            imported_model = _extract_call_result(
+                await session.call_tool(
+                    "importModelFile",
+                    {"source_path": str(model_source)},
+                )
+            )
+            _require(isinstance(imported_model, dict), "importModelFile did not return an object")
+            _require(Path(str(imported_model.get("model_path", ""))).exists(), "importModelFile output missing")
+            print("Model import check passed")
+
+            patch_target = workdir / "smoke_model_patch.cir"
+            patch_target.write_text("* patch\nXU1 in out oldamp\n.end\n", encoding="utf-8")
+            patched = _extract_call_result(
+                await session.call_tool(
+                    "patchNetlistModelBindings",
+                    {
+                        "netlist_path": str(patch_target),
+                        "include_files": [str(imported_model.get("model_path"))],
+                        "subckt_aliases": {"oldamp": "smokeamp"},
+                        "backup": True,
+                    },
+                )
+            )
+            _require(isinstance(patched, dict), "patchNetlistModelBindings did not return an object")
+            _require(patched.get("replacements", 0) >= 1, "patchNetlistModelBindings made no replacements")
+            print("Model patch check passed")
+
+            auto_debug = _extract_call_result(
+                await session.call_tool(
+                    "autoDebugSchematic",
+                    {
+                        "asc_path": template_schematic.get("asc_path"),
+                        "max_iterations": 1,
+                        "auto_fix_preflight": True,
+                        "auto_fix_runtime": False,
+                    },
+                )
+            )
+            _require(isinstance(auto_debug, dict), "autoDebugSchematic did not return an object")
+            _require(auto_debug.get("iterations_run") >= 1, "autoDebugSchematic did not execute")
+            print("Auto-debug schematic check passed")
 
             transient_netlist = """
 * RC transient stepped smoke test

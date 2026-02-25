@@ -411,15 +411,21 @@ Task {
         }
 
         let selected: SCWindow
+        var titleHintMatched = false
+        var selectionReason = "largest_window"
         if !titleHint.isEmpty {
             if let exact = candidates.first(where: { ($0.title ?? "").localizedCaseInsensitiveContains(titleHint) }) {
                 selected = exact
+                titleHintMatched = true
+                selectionReason = "title_hint_match"
             } else {
                 selected = candidates.max(by: { ($0.frame.width * $0.frame.height) < ($1.frame.width * $1.frame.height) })!
+                selectionReason = "largest_window_fallback"
             }
         } else {
             selected = candidates.max(by: { ($0.frame.width * $0.frame.height) < ($1.frame.width * $1.frame.height) })!
         }
+        let candidateTitles = candidates.prefix(12).map { $0.title ?? "" }
 
         let filter = SCContentFilter(desktopIndependentWindow: selected)
         let configuration = SCStreamConfiguration()
@@ -469,6 +475,11 @@ Task {
                 "width": selected.frame.width,
                 "height": selected.frame.height
             ],
+            "title_hint": titleHint,
+            "title_hint_matched": titleHintMatched,
+            "selection_reason": selectionReason,
+            "candidate_count": candidates.count,
+            "candidate_titles": candidateTitles,
             "capture_mode": "screencapturekit_window",
             "capture_strategy": "desktop_independent_window",
             "captured_width": image.width,
@@ -497,15 +508,17 @@ if failed {
         handle.write(swift_source)
         script_path = Path(handle.name)
 
+    started_monotonic = time.monotonic()
+    command = [
+        "xcrun",
+        "swift",
+        str(script_path),
+        str(output_path),
+        (title_hint or ""),
+    ]
     try:
         proc = subprocess.run(
-            [
-                "xcrun",
-                "swift",
-                str(script_path),
-                str(output_path),
-                (title_hint or ""),
-            ],
+            command,
             capture_output=True,
             text=True,
             check=False,
@@ -514,9 +527,13 @@ if failed {
     finally:
         script_path.unlink(missing_ok=True)
 
+    duration_seconds = round(time.monotonic() - started_monotonic, 6)
+
     if proc.returncode != 0:
         message = (proc.stderr.strip() or proc.stdout.strip() or "unknown ScreenCaptureKit failure")
-        raise RuntimeError(f"ScreenCaptureKit capture failed: {message}")
+        raise RuntimeError(
+            f"ScreenCaptureKit capture failed after {duration_seconds:.3f}s: {message}"
+        )
 
     payload: dict[str, Any] = {}
     for raw in reversed(proc.stdout.splitlines()):
@@ -531,12 +548,30 @@ if failed {
             payload = candidate
             break
 
+    # ScreenCaptureKit finalization can lag a fraction after swift exits.
+    # Use a fixed post-capture settle to avoid flaky "missing file" failures.
     if not output_path.exists():
-        raise FileNotFoundError(f"ScreenCaptureKit did not produce image: {output_path}")
+        time.sleep(0.2)
+    if not output_path.exists():
+        raise FileNotFoundError(
+            "ScreenCaptureKit did not produce image: "
+            f"{output_path} (stdout={proc.stdout.strip()[:400]!r}, stderr={proc.stderr.strip()[:400]!r})"
+        )
 
+    diagnostics = {
+        "swift_command": command,
+        "duration_seconds": duration_seconds,
+        "return_code": proc.returncode,
+        "stdout_line_count": len([line for line in proc.stdout.splitlines() if line.strip()]),
+        "stderr": proc.stderr.strip(),
+    }
     if payload:
+        payload["capture_diagnostics"] = diagnostics
         return payload
-    return {"capture_mode": "screencapturekit_window"}
+    return {
+        "capture_mode": "screencapturekit_window",
+        "capture_diagnostics": diagnostics,
+    }
 
 
 def _downscale_image_file(path: Path, downscale_factor: float) -> dict[str, Any]:
@@ -615,6 +650,16 @@ def capture_ltspice_window_screenshot(
 ) -> dict[str, Any]:
     target = Path(output_path).expanduser().resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
+    started_monotonic = time.monotonic()
+    preflight = {
+        "platform": platform.system(),
+        "prefer_screencapturekit": bool(prefer_screencapturekit),
+        "avoid_space_switch": bool(avoid_space_switch),
+        "open_path": str(Path(open_path).expanduser().resolve()) if open_path is not None else None,
+        "title_hint_requested": title_hint,
+        "xcrun_available": shutil.which("xcrun"),
+        "ltspice_ui_running_before_open": is_ltspice_ui_running(),
+    }
 
     open_event: dict[str, Any] | None = None
     close_event: dict[str, Any] | None = None
@@ -653,7 +698,11 @@ def capture_ltspice_window_screenshot(
                 if isinstance(raw_window_id, int):
                     window_id = raw_window_id
             except Exception as exc:
-                raise RuntimeError(f"ScreenCaptureKit capture failed: {exc}") from exc
+                elapsed = round(time.monotonic() - started_monotonic, 6)
+                raise RuntimeError(
+                    "ScreenCaptureKit capture failed: "
+                    f"{exc}; diagnostics={json.dumps({'elapsed_seconds': elapsed, 'preflight': preflight})}"
+                ) from exc
 
         if capture_backend != "screencapturekit":
             # Optional non-ScreenCaptureKit path when explicitly requested.
@@ -689,6 +738,7 @@ def capture_ltspice_window_screenshot(
 
     downscale_info = _downscale_image_file(target, downscale_factor=downscale_factor)
     width, height = _probe_image_dimensions(target)
+    elapsed = round(time.monotonic() - started_monotonic, 6)
     return {
         "image_path": str(target),
         "format": target.suffix.lstrip(".").lower() or "png",
@@ -704,6 +754,12 @@ def capture_ltspice_window_screenshot(
         "width": width,
         "height": height,
         "capture_stderr": capture_stderr,
+        "capture_diagnostics": {
+            "elapsed_seconds": elapsed,
+            "settle_seconds": float(settle_seconds),
+            "title_hint_used": title_hint,
+            "preflight": preflight,
+        },
     }
 
 

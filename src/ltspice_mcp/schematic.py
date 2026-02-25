@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from statistics import median
 from typing import Any
 from zipfile import ZipFile
 
@@ -319,12 +321,24 @@ class SchematicBuilder:
         self.flags: list[tuple[int, int, str]] = []
         self.components: list[ComponentPlacement] = []
         self.directives: list[tuple[int, int, str]] = []
+        self._wire_keys: set[tuple[int, int, int, int]] = set()
+        self._flag_keys: set[tuple[int, int, str]] = set()
+        self._directive_keys: set[tuple[int, int, str]] = set()
 
     def add_wire(self, x1: int, y1: int, x2: int, y2: int) -> None:
-        self.wires.append((int(x1), int(y1), int(x2), int(y2)))
+        wire = (int(x1), int(y1), int(x2), int(y2))
+        rev = (wire[2], wire[3], wire[0], wire[1])
+        if wire in self._wire_keys or rev in self._wire_keys:
+            return
+        self._wire_keys.add(wire)
+        self.wires.append(wire)
 
     def add_flag(self, x: int, y: int, name: str) -> None:
-        self.flags.append((int(x), int(y), str(name)))
+        flag = (int(x), int(y), str(name))
+        if flag in self._flag_keys:
+            return
+        self._flag_keys.add(flag)
+        self.flags.append(flag)
 
     def add_component(self, component: ComponentPlacement) -> None:
         self.components.append(component)
@@ -335,7 +349,11 @@ class SchematicBuilder:
             return
         if not directive.startswith("!"):
             directive = "!" + directive
-        self.directives.append((int(x), int(y), directive.replace("\n", "\\n")))
+        entry = (int(x), int(y), directive.replace("\n", "\\n"))
+        if entry in self._directive_keys:
+            return
+        self._directive_keys.add(entry)
+        self.directives.append(entry)
 
     def render(self) -> str:
         lines = ["Version 4", f"SHEET 1 {self.sheet_width} {self.sheet_height}"]
@@ -601,7 +619,12 @@ def _canonical_net(name: str) -> str:
     return name.strip()
 
 
-def _choose_two_pin_orientation(symbol: str, nodes: list[str]) -> str:
+def _choose_two_pin_orientation(
+    symbol: str,
+    nodes: list[str],
+    *,
+    net_columns: dict[str, int] | None = None,
+) -> str:
     if len(nodes) < 2:
         return "R0"
     n1 = _canonical_net(nodes[0])
@@ -613,6 +636,11 @@ def _choose_two_pin_orientation(symbol: str, nodes: list[str]) -> str:
             return "R180"
         if n2 == "0" and n1 != "0":
             return "R0"
+        if net_columns and n1 in net_columns and n2 in net_columns:
+            if net_columns[n2] < net_columns[n1]:
+                return "M270"
+            if net_columns[n2] > net_columns[n1]:
+                return "M90"
         # Horizontal by default when both pins are signal nets.
         return "M90"
 
@@ -641,36 +669,36 @@ def _route_two_point_net(
     builder.add_wire(x2, y1, x2, y2)
 
 
-def build_schematic_from_netlist(
-    *,
-    workdir: Path,
+@dataclass(slots=True)
+class _TwoPinElement:
+    reference: str
+    symbol: str
+    nodes: list[str]
+    value: str | None
+    source_index: int
+
+
+def _preferred_signal_pin_order(nodes: list[str]) -> int:
+    if len(nodes) < 2:
+        return 1
+    if _canonical_net(nodes[0]) == "0" and _canonical_net(nodes[1]) != "0":
+        return 2
+    return 1
+
+
+def _build_two_pin_elements(
     netlist_content: str,
-    circuit_name: str = "schematic_from_netlist",
-    output_path: str | None = None,
-    sheet_width: int = 1200,
-    sheet_height: int = 900,
-    library: SymbolLibrary | None = None,
-) -> dict[str, Any]:
-    if not netlist_content.strip():
-        raise ValueError("netlist_content cannot be empty")
-
-    lib = library or SymbolLibrary()
-    builder = SchematicBuilder(sheet_width=sheet_width, sheet_height=sheet_height)
-    warnings: list[str] = []
-
-    components: list[tuple[ComponentPlacement, list[str]]] = []
-    directives: list[str] = []
-
-    for raw_line in netlist_content.splitlines():
+    warnings: list[str],
+    directives: list[str],
+) -> list[_TwoPinElement]:
+    elements: list[_TwoPinElement] = []
+    for line_index, raw_line in enumerate(netlist_content.splitlines()):
         line = raw_line.strip()
-        if not line:
-            continue
-        if line.startswith("*"):
+        if not line or line.startswith("*"):
             continue
         tokens = _split_netlist_tokens(line)
         if not tokens:
             continue
-
         if tokens[0].startswith("."):
             directive = " ".join(tokens)
             if directive.lower() != ".end":
@@ -682,45 +710,314 @@ def build_schematic_from_netlist(
         if symbol is None:
             warnings.append(f"Unsupported element '{ref}' was skipped.")
             continue
-
         nodes = _parse_two_pin_nodes(tokens)
         if nodes is None:
             warnings.append(f"Could not parse nodes for element '{ref}'.")
             continue
-
-        canonical_nodes = [_canonical_net(nodes[0]), _canonical_net(nodes[1])]
         value = " ".join(tokens[3:]) if len(tokens) > 3 else None
-        index = len(components)
+        elements.append(
+            _TwoPinElement(
+                reference=ref,
+                symbol=symbol,
+                nodes=[_canonical_net(nodes[0]), _canonical_net(nodes[1])],
+                value=value,
+                source_index=line_index,
+            )
+        )
+    return elements
+
+
+def _infer_root_net(elements: list[_TwoPinElement]) -> str | None:
+    for element in elements:
+        if element.symbol not in {"voltage", "current"}:
+            continue
+        n1 = _canonical_net(element.nodes[0])
+        n2 = _canonical_net(element.nodes[1])
+        if n1 != "0":
+            return n1
+        if n2 != "0":
+            return n2
+    for element in elements:
+        for net_name in element.nodes:
+            if _canonical_net(net_name) != "0":
+                return net_name
+    return None
+
+
+def _compute_net_distances(
+    elements: list[_TwoPinElement],
+) -> tuple[dict[str, int], str | None]:
+    adjacency: dict[str, set[str]] = defaultdict(set)
+    for element in elements:
+        if len(element.nodes) < 2:
+            continue
+        n1 = _canonical_net(element.nodes[0])
+        n2 = _canonical_net(element.nodes[1])
+        adjacency[n1].add(n2)
+        adjacency[n2].add(n1)
+
+    root = _infer_root_net(elements)
+    if root is None and adjacency:
+        root = sorted(adjacency.keys())[0]
+
+    distances: dict[str, int] = {}
+    if root is not None and root in adjacency:
+        queue: deque[str] = deque([root])
+        distances[root] = 0
+        while queue:
+            current = queue.popleft()
+            base = distances[current]
+            for neighbor in adjacency.get(current, set()):
+                if neighbor in distances:
+                    continue
+                distances[neighbor] = base + 1
+                queue.append(neighbor)
+
+    fallback = (max(distances.values()) + 1) if distances else 1
+    for net_name in adjacency:
+        if net_name not in distances:
+            distances[net_name] = fallback
+    return distances, root
+
+
+def _legacy_place_two_pin_elements(
+    *,
+    elements: list[_TwoPinElement],
+    library: SymbolLibrary,
+    sheet_width: int,
+) -> list[tuple[ComponentPlacement, list[str]]]:
+    placements: list[tuple[ComponentPlacement, list[str]]] = []
+    for index, element in enumerate(elements):
         columns = max(1, (sheet_width - 160) // 160)
         x = 120 + (index % columns) * 160
         row = index // columns
         base_row_y = 80 + row * 200
         signal_row_y = 96 + row * 200
-        orientation = _choose_two_pin_orientation(symbol, canonical_nodes)
+        orientation = _choose_two_pin_orientation(element.symbol, element.nodes)
         y = base_row_y
-
-        preferred_pin_order = 1
-        if canonical_nodes[0] == "0" and canonical_nodes[1] != "0":
-            preferred_pin_order = 2
+        preferred_pin_order = _preferred_signal_pin_order(element.nodes)
         try:
-            _, pin_y = lib.pin_offset(symbol, orientation=orientation, spice_order=preferred_pin_order)
+            _, pin_y = library.pin_offset(
+                element.symbol,
+                orientation=orientation,
+                spice_order=preferred_pin_order,
+            )
             y = signal_row_y - pin_y
         except Exception:
             y = base_row_y
 
         placement = ComponentPlacement(
-            symbol=symbol,
-            reference=ref,
+            symbol=element.symbol,
+            reference=element.reference,
             x=x,
             y=y,
             orientation=orientation,
-            value=value,
+            value=element.value,
         )
-        components.append((placement, canonical_nodes))
-        builder.add_component(placement)
+        placements.append((placement, list(element.nodes)))
+    return placements
 
-    if not components:
+
+def _smart_place_two_pin_elements(
+    *,
+    elements: list[_TwoPinElement],
+    library: SymbolLibrary,
+    sheet_width: int,
+    sheet_height: int,
+) -> tuple[list[tuple[ComponentPlacement, list[str]]], dict[str, Any]]:
+    net_distances, root_net = _compute_net_distances(elements)
+    fallback_distance = (max(net_distances.values()) + 1) if net_distances else 1
+    layer_to_items: dict[int, list[_TwoPinElement]] = defaultdict(list)
+
+    for element in elements:
+        signal_nets = [net for net in element.nodes if _canonical_net(net) != "0"]
+        if signal_nets:
+            layer = min(net_distances.get(net, fallback_distance) for net in signal_nets)
+        else:
+            layer = 0
+        layer_to_items[layer].append(element)
+
+    ordered_layers = sorted(layer_to_items.keys())
+    max_layer = max(ordered_layers) if ordered_layers else 0
+    usable_width = max(300, sheet_width - 220)
+    column_spacing = max(160, min(260, usable_width // max(1, max_layer + 1)))
+    row_spacing = 176
+    x_origin = 120
+    y_origin = 128
+    max_rows = max(1, (sheet_height - 260) // row_spacing)
+
+    placements: list[tuple[ComponentPlacement, list[str]]] = []
+    row_per_layer: dict[int, int] = defaultdict(int)
+    layer_sorted_elements = sorted(
+        ((layer, element) for layer, items in layer_to_items.items() for element in items),
+        key=lambda item: (item[0], item[1].source_index, item[1].reference.lower()),
+    )
+    for layer, element in layer_sorted_elements:
+        row_index = row_per_layer[layer]
+        row_per_layer[layer] += 1
+        wrapped_row = row_index % max_rows
+        overflow_band = row_index // max_rows
+        signal_row_y = y_origin + wrapped_row * row_spacing + overflow_band * 28
+        x = min(sheet_width - 120, x_origin + layer * column_spacing)
+        orientation = _choose_two_pin_orientation(
+            element.symbol,
+            element.nodes,
+            net_columns=net_distances,
+        )
+        preferred_pin_order = _preferred_signal_pin_order(element.nodes)
+        y = signal_row_y
+        try:
+            _, pin_y = library.pin_offset(
+                element.symbol,
+                orientation=orientation,
+                spice_order=preferred_pin_order,
+            )
+            y = signal_row_y - pin_y
+        except Exception:
+            y = signal_row_y
+        placement = ComponentPlacement(
+            symbol=element.symbol,
+            reference=element.reference,
+            x=int(x),
+            y=int(y),
+            orientation=orientation,
+            value=element.value,
+        )
+        placements.append((placement, list(element.nodes)))
+
+    metrics = {
+        "placement_mode": "smart",
+        "root_net": root_net,
+        "layer_count": len(ordered_layers),
+        "column_spacing": column_spacing,
+        "row_spacing": row_spacing,
+        "max_rows_per_layer": max_rows,
+        "net_distances": {key: int(value) for key, value in net_distances.items()},
+    }
+    return placements, metrics
+
+
+def _nudge_lane(
+    *,
+    target: int,
+    used: set[int],
+    minimum: int,
+    maximum: int,
+    step: int = 24,
+) -> int:
+    candidate = max(minimum, min(maximum, int(target)))
+    if candidate not in used:
+        used.add(candidate)
+        return candidate
+    for offset in range(step, step * 80, step):
+        for trial in (candidate - offset, candidate + offset):
+            if trial < minimum or trial > maximum:
+                continue
+            if trial in used:
+                continue
+            used.add(trial)
+            return trial
+    used.add(candidate)
+    return candidate
+
+
+def _route_multi_point_net(
+    *,
+    builder: SchematicBuilder,
+    net_name: str,
+    points: list[tuple[int, int]],
+    sheet_width: int,
+    sheet_height: int,
+    used_horizontal_lanes: set[int],
+    used_vertical_lanes: set[int],
+) -> None:
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    x_span = max(xs) - min(xs)
+    y_span = max(ys) - min(ys)
+
+    if x_span >= y_span:
+        lane_target = int(round(median(ys)))
+        lane_y = _nudge_lane(
+            target=lane_target,
+            used=used_horizontal_lanes,
+            minimum=32,
+            maximum=max(40, sheet_height - 72),
+            step=24,
+        )
+        x_min = min(xs)
+        x_max = max(xs)
+        builder.add_wire(x_min, lane_y, x_max, lane_y)
+        for x, y in points:
+            if y != lane_y:
+                builder.add_wire(x, y, x, lane_y)
+        builder.add_flag(x_min, lane_y, net_name)
+        return
+
+    lane_target = int(round(median(xs)))
+    lane_x = _nudge_lane(
+        target=lane_target,
+        used=used_vertical_lanes,
+        minimum=80,
+        maximum=max(96, sheet_width - 80),
+        step=24,
+    )
+    y_min = min(ys)
+    y_max = max(ys)
+    builder.add_wire(lane_x, y_min, lane_x, y_max)
+    for x, y in points:
+        if x != lane_x:
+            builder.add_wire(x, y, lane_x, y)
+    builder.add_flag(lane_x, y_min, net_name)
+
+
+def build_schematic_from_netlist(
+    *,
+    workdir: Path,
+    netlist_content: str,
+    circuit_name: str = "schematic_from_netlist",
+    output_path: str | None = None,
+    sheet_width: int = 1200,
+    sheet_height: int = 900,
+    library: SymbolLibrary | None = None,
+    placement_mode: str = "smart",
+) -> dict[str, Any]:
+    if not netlist_content.strip():
+        raise ValueError("netlist_content cannot be empty")
+    normalized_mode = placement_mode.strip().lower()
+    if normalized_mode not in {"smart", "legacy"}:
+        raise ValueError("placement_mode must be one of: smart, legacy")
+
+    lib = library or SymbolLibrary()
+    builder = SchematicBuilder(sheet_width=sheet_width, sheet_height=sheet_height)
+    warnings: list[str] = []
+    directives: list[str] = []
+    elements = _build_two_pin_elements(
+        netlist_content=netlist_content,
+        warnings=warnings,
+        directives=directives,
+    )
+    if not elements:
         raise ValueError("No supported components were parsed from netlist.")
+
+    layout_metrics: dict[str, Any] = {"placement_mode": normalized_mode}
+    if normalized_mode == "legacy":
+        components = _legacy_place_two_pin_elements(
+            elements=elements,
+            library=lib,
+            sheet_width=sheet_width,
+        )
+    else:
+        components, smart_metrics = _smart_place_two_pin_elements(
+            elements=elements,
+            library=lib,
+            sheet_width=sheet_width,
+            sheet_height=sheet_height,
+        )
+        layout_metrics.update(smart_metrics)
+
+    for placement, _nodes in components:
+        builder.add_component(placement)
 
     net_to_points: dict[str, list[tuple[int, int]]] = {}
     for placement, nodes in components:
@@ -732,8 +1029,13 @@ def build_schematic_from_netlist(
                 continue
             net_to_points.setdefault(net_name, []).append((px, py))
 
-    multi_net_index = 0
-    for net_name, points in net_to_points.items():
+    used_horizontal_lanes: set[int] = set()
+    used_vertical_lanes: set[int] = set()
+    sorted_nets = sorted(
+        net_to_points.items(),
+        key=lambda item: (-len(set(item[1])), item[0].lower()),
+    )
+    for net_name, points in sorted_nets:
         unique_points = sorted(set(points))
         if not unique_points:
             continue
@@ -745,23 +1047,20 @@ def build_schematic_from_netlist(
             x, y = unique_points[0]
             builder.add_flag(x, y, net_name)
             continue
-
         if len(unique_points) == 2:
-            point_a, point_b = unique_points
-            _route_two_point_net(builder, point_a, point_b)
+            _route_two_point_net(builder, unique_points[0], unique_points[1])
             label_point = min(unique_points, key=lambda point: (point[0], point[1]))
             builder.add_flag(label_point[0], label_point[1], net_name)
             continue
-
-        trunk_x = min(point[0] for point in unique_points) - 40
-        y_min = min(point[1] for point in unique_points)
-        lane_y = max(32, y_min - 48 - (multi_net_index * 32))
-        multi_net_index += 1
-        builder.add_wire(trunk_x, lane_y, max(point[0] for point in unique_points), lane_y)
-        for x, y in unique_points:
-            if y != lane_y:
-                builder.add_wire(x, y, x, lane_y)
-        builder.add_flag(trunk_x, lane_y, net_name)
+        _route_multi_point_net(
+            builder=builder,
+            net_name=net_name,
+            points=unique_points,
+            sheet_width=sheet_width,
+            sheet_height=sheet_height,
+            used_horizontal_lanes=used_horizontal_lanes,
+            used_vertical_lanes=used_vertical_lanes,
+        )
 
     for idx, directive in enumerate(directives):
         builder.add_directive(48, sheet_height - 140 + idx * 24, directive)
@@ -783,9 +1082,8 @@ def build_schematic_from_netlist(
         "flags": len(builder.flags),
         "directives": len(builder.directives),
         "warnings": warnings,
+        "layout": layout_metrics,
     }
-
-
 def build_schematic_from_template(
     *,
     workdir: Path,
@@ -797,6 +1095,7 @@ def build_schematic_from_template(
     sheet_height: int | None = None,
     template_path: str | Path | None = None,
     library: SymbolLibrary | None = None,
+    placement_mode: str | None = None,
 ) -> dict[str, Any]:
     source_path, payload = _load_template_payload(template_path)
     templates = payload.get("templates", [])
@@ -831,6 +1130,9 @@ def build_schematic_from_template(
         netlist_content = str(rendered.get("netlist_content", "")).strip()
         if not netlist_content:
             raise ValueError(f"Template '{template_name}' is missing netlist_content")
+        resolved_placement_mode = str(
+            placement_mode if placement_mode is not None else rendered.get("placement_mode", "smart")
+        ).strip().lower()
         result = build_schematic_from_netlist(
             workdir=workdir,
             netlist_content=netlist_content,
@@ -839,6 +1141,7 @@ def build_schematic_from_template(
             sheet_width=resolved_width,
             sheet_height=resolved_height,
             library=library,
+            placement_mode=resolved_placement_mode,
         )
     elif tpl_type == "spec":
         components = rendered.get("components")
@@ -861,6 +1164,17 @@ def build_schematic_from_template(
             f"Template '{template_name}' has unsupported type '{tpl_type}'. Use netlist or spec."
         )
 
+    sidecar_content = str(rendered.get("sidecar_netlist_content", "")).strip()
+    if sidecar_content and "netlist_path" not in result:
+        normalized_sidecar = sidecar_content.rstrip() + "\n"
+        if not any(
+            line.strip().lower() == ".end" for line in normalized_sidecar.splitlines()
+        ):
+            normalized_sidecar += ".end\n"
+        sidecar_path = Path(str(result["asc_path"])).expanduser().resolve().with_suffix(".cir")
+        sidecar_path.write_text(normalized_sidecar, encoding="utf-8")
+        result["netlist_path"] = str(sidecar_path)
+
     result["template_name"] = str(matched.get("name", template_name))
     result["template_type"] = tpl_type
     result["template_path"] = str(source_path)
@@ -879,6 +1193,7 @@ def sync_schematic_from_netlist_file(
     sheet_height: int = 900,
     force: bool = False,
     library: SymbolLibrary | None = None,
+    placement_mode: str = "smart",
 ) -> dict[str, Any]:
     source = Path(netlist_path).expanduser().resolve()
     if not source.exists():
@@ -931,6 +1246,7 @@ def sync_schematic_from_netlist_file(
             sheet_width=sheet_width,
             sheet_height=sheet_height,
             library=library,
+            placement_mode=placement_mode,
         )
         payload = {
             "version": 1,
@@ -949,6 +1265,7 @@ def sync_schematic_from_netlist_file(
             "flags": int(built.get("flags", 0)),
             "directives": int(built.get("directives", 0)),
             "warnings": built.get("warnings", []),
+            "placement_mode": placement_mode,
         }
         _write_json(resolved_state_path, payload)
         return {
@@ -968,6 +1285,7 @@ def sync_schematic_from_netlist_file(
         "flags": int(previous.get("flags", 0)),
         "directives": int(previous.get("directives", 0)),
         "warnings": list(previous.get("warnings", [])),
+        "placement_mode": str(previous.get("placement_mode", placement_mode)),
         "updated": False,
         "reason": reason,
         "state_path": str(resolved_state_path),
@@ -990,6 +1308,7 @@ def watch_schematic_from_netlist_file(
     max_updates: int = 20,
     force_initial_refresh: bool = False,
     library: SymbolLibrary | None = None,
+    placement_mode: str = "smart",
 ) -> dict[str, Any]:
     if duration_seconds < 0:
         raise ValueError("duration_seconds must be >= 0")
@@ -1015,6 +1334,7 @@ def watch_schematic_from_netlist_file(
             sheet_height=sheet_height,
             force=(force_initial_refresh and polls == 1),
             library=library,
+            placement_mode=placement_mode,
         )
         last_result = result
         if result.get("updated"):

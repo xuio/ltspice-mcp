@@ -20,6 +20,16 @@
       "netlist_content": "* RL high-pass template\nV1 in 0 AC {vin_ac}\nL1 in out {l_value}\nR1 out 0 {r_value}\n.ac dec {ac_points} {f_start} {f_stop}\n.end"
     },
     {
+      "name": "rc_highpass_ac",
+      "description": "AC high-pass RC network with capacitor in series and resistor to ground.",
+      "type": "netlist",
+      "circuit_name": "rc_highpass_ac",
+      "sheet_width": 1200,
+      "sheet_height": 900,
+      "placement_mode": "smart",
+      "netlist_content": "* RC high-pass template\nV1 in 0 AC {vin_ac}\nC1 in out {c_value}\nR1 out 0 {r_value}\n.ac dec {ac_points} {f_start} {f_stop}\n.op\n.end"
+    },
+    {
       "name": "resistor_divider_spec",
       "description": "Explicit schematic spec template for a resistor divider.",
       "type": "spec",
@@ -243,9 +253,20 @@
         }
       ],
       "directives": [
-        ".tran 0 10m",
+        ".tran 0 {tran_stop}",
         ".op"
-      ]
+      ],
+      "sidecar_netlist_content": "* Non-inverting amplifier sidecar\nVin in 0 {vin_signal}\nVCC vcc 0 {vplus}\nVEE vee 0 {vminus}\nXU1 in nfb out vcc vee UniversalOpamp2\nRf out nfb {rf_value}\nRg nfb 0 {rg_value}\n.tran 0 {tran_stop}\n.op\n.end"
+    },
+    {
+      "name": "zener_regulator_dc",
+      "description": "Simple zener shunt regulator sweep testbench.",
+      "type": "netlist",
+      "circuit_name": "zener_regulator_dc",
+      "sheet_width": 1200,
+      "sheet_height": 900,
+      "placement_mode": "smart",
+      "netlist_content": "* Zener regulator\nV1 in 0 DC {vin_dc}\nR1 in out {r_series}\nD1 out 0 DZEN\nRload out 0 {r_load}\n.model DZEN D(BV={zener_voltage} IBV=1m)\n.dc V1 {dc_start} {dc_stop} {dc_step}\n.op\n.end"
     }
   ]
 }

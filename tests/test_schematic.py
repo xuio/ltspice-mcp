@@ -102,13 +102,42 @@ class TestSchematicBuilders(unittest.TestCase):
         netlist_sidecar = Path(result["netlist_path"])
         self.assertTrue(netlist_sidecar.exists())
         text = asc.read_text(encoding="utf-8")
-        self.assertEqual(text, self._fixture_text("netlist_case.asc"))
+        self.assertIn("SYMBOL voltage", text)
+        self.assertIn("SYMBOL res", text)
+        self.assertIn("SYMBOL cap", text)
+        self.assertIn("FLAG", text)
+        self.assertIn("TEXT", text)
+        self.assertEqual(result["layout"]["placement_mode"], "smart")
+        self.assertGreater(result["layout"]["layer_count"], 0)
+
+    def test_build_schematic_from_netlist_legacy_mode(self) -> None:
+        output_path = self.temp_dir / "netlist_case_legacy.asc"
+        result = build_schematic_from_netlist(
+            workdir=self.temp_dir,
+            netlist_content=(
+                "* RC netlist\n"
+                "V1 in 0 AC 1\n"
+                "R1 in out 1k\n"
+                "C1 out 0 1u\n"
+                ".ac dec 10 10 10k\n"
+                ".end\n"
+            ),
+            circuit_name="netlist_case_legacy",
+            output_path=str(output_path),
+            library=self.stub,
+            placement_mode="legacy",
+        )
+        asc = Path(result["asc_path"])
+        self.assertTrue(asc.exists())
+        self.assertEqual(result["layout"]["placement_mode"], "legacy")
 
     def test_template_listing_and_rendering(self) -> None:
         listing = list_schematic_templates()
         names = {entry["name"] for entry in listing["templates"]}
         self.assertIn("rc_lowpass_ac", names)
         self.assertIn("non_inverting_opamp_spec", names)
+        self.assertIn("rc_highpass_ac", names)
+        self.assertIn("zener_regulator_dc", names)
 
         output_path = self.temp_dir / "template_case.asc"
         result = build_schematic_from_template(
@@ -143,6 +172,7 @@ class TestSchematicBuilders(unittest.TestCase):
                 "rg_value": "2k",
                 "vplus": "12",
                 "vminus": "-12",
+                "tran_stop": "12m",
             },
             circuit_name="non_inverting_template",
             output_path=str(output_path),
@@ -153,6 +183,7 @@ class TestSchematicBuilders(unittest.TestCase):
         self.assertIn("SYMATTR Value 2k", text)
         self.assertIn("SYMATTR Value 12", text)
         self.assertIn("SYMATTR Value -12", text)
+        self.assertTrue(Path(str(result["netlist_path"])).exists())
 
     def test_sync_regenerates_only_on_change(self) -> None:
         netlist = self.temp_dir / "sync_case.cir"

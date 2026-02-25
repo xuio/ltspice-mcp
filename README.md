@@ -12,9 +12,13 @@ This implementation is inspired by:
 - Optional LTspice UI integration (disabled by default)
 - Schematic UI single-window mode (enabled by default)
 - Batch simulation from netlist text or existing netlist file
-- Schematic generation (`.asc`) from structured data or netlist auto-layout
+- Schematic generation (`.asc`) from structured data or pin-aware netlist auto-layout (`placement_mode=smart|legacy`)
+- Intent-driven circuit generation (filters, non-inverting amplifier, zener regulator)
+- Iterative schematic auto-debug loop with targeted fix application and rerun
 - LTspice symbol library inspection tools (lib.zip entry/symbol/pin/source queries)
+- Model management tools for missing include/model discovery, import, and netlist binding patching
 - MCP-served image rendering for symbols, schematics, and plots
+- Deterministic plot presets (`bode`, `transient_startup`, `noise`, `step_compare`) backed by `.plt`
 - JSON template-driven schematic generation
 - Netlist-file schematic sync/watch workflow with JSON state files
 - Run history with artifacts (`.log`, `.raw`, `.op.raw`)
@@ -87,6 +91,9 @@ Simulation and setup:
 - `renderLtspiceSymbolImage`
 - `renderLtspiceSchematicImage`
 - `renderLtspicePlotImage`
+- `listPlotPresets`
+- `generatePlotPresetSettings`
+- `renderLtspicePlotPresetImage`
 - `generatePlotSettings`
 - `setLtspiceUiEnabled`
 - `setSchematicUiSingleWindow`
@@ -98,6 +105,8 @@ Simulation and setup:
 - `createSchematicFromNetlist`
 - `listSchematicTemplates`
 - `createSchematicFromTemplate`
+- `listIntentCircuitTemplates`
+- `createIntentCircuit`
 - `syncSchematicFromNetlistFile`
 - `watchSchematicFromNetlistFile`
 - `validateSchematic`
@@ -107,6 +116,10 @@ Simulation and setup:
 - `simulateNetlist`
 - `simulateNetlistFile`
 - `simulateSchematicFile`
+- `autoDebugSchematic`
+- `scanModelIssues`
+- `importModelFile`
+- `patchNetlistModelBindings`
 - `listRuns`
 - `getRunDetails`
 
@@ -172,8 +185,11 @@ Per simulation call:
 
 - `createSchematic`: build `.asc` from explicit components/wires/labels/directives
 - `createSchematicFromNetlist`: parse a netlist and auto-place common two-pin primitives (`R`, `C`, `L`, `D`, `V`, `I`)
+  - `placement_mode=smart` (default): net-layered, pin-aware placement and cleaner trunk routing
+  - `placement_mode=legacy`: original simple grid layout
 - `listSchematicTemplates`: inspect built-in or user-supplied JSON templates
 - `createSchematicFromTemplate`: generate `.asc` from template type `netlist` or `spec`
+- `listIntentCircuitTemplates` / `createIntentCircuit`: high-level templates for common analog intents
 - `syncSchematicFromNetlistFile`: only regenerate `.asc` when source netlist content changes
 - `watchSchematicFromNetlistFile`: poll netlist changes and emit rebuild events
 - `loadCircuit`: also attempts netlist-to-schematic generation and returns `asc_path` when successful
@@ -188,9 +204,16 @@ Schematic debug workflow:
 
 Template notes:
 - built-in template JSON: `src/ltspice_mcp/schematic_templates.json`
-- built-in examples include `rc_lowpass_ac`, `rl_highpass_ac`, `resistor_divider_spec`, and `non_inverting_opamp_spec`
+- built-in examples include `rc_lowpass_ac`, `rc_highpass_ac`, `rl_highpass_ac`, `zener_regulator_dc`, `resistor_divider_spec`, and `non_inverting_opamp_spec`
 - string fields support `{placeholder}` substitution via `parameters`
 - missing placeholders are left as-is (useful for LTspice param braces like `{rval}`)
+- spec templates can include `sidecar_netlist_content` to emit a validated sidecar `.cir` next to `.asc`
+
+Model/debug workflow:
+- `scanModelIssues`: parse missing include/model/subckt diagnostics from logs
+- `importModelFile`: copy model files into `<workdir>/models` and return include directives + discovered `.subckt` names
+- `patchNetlistModelBindings`: add `.include` lines and remap model/subckt tokens in netlists
+- `autoDebugSchematic`: iterative validate/simulate/fix loop (preflight + floating-node bleeder fixes + optional model include injection)
 
 ## LTspice library inspection
 
@@ -221,6 +244,10 @@ Rendering backend options:
 Plot rendering specifics:
 - `renderLtspicePlotImage` writes a companion `.plt` file next to the RAW file so LTspice opens with the requested traces preselected.
 - This avoids UI button/menu interaction for trace selection and keeps rendering on LTspice's native plot engine.
+- Preset tools:
+  - `listPlotPresets`: discover built-ins
+  - `generatePlotPresetSettings`: deterministic preset `.plt` generation
+  - `renderLtspicePlotPresetImage`: render image using preset settings
 - Plot controls supported by `renderLtspicePlotImage` and `generatePlotSettings`:
   - `mode`: `auto`, `db`, `phase`, `real`, `imag`
   - `pane_layout`: `single`, `split`, `per_trace`
@@ -236,6 +263,7 @@ LTspice screenshot behavior:
 - uses ScreenCaptureKit direct-window capture (`SCContentFilter(desktopIndependentWindow:)`) when `backend=ltspice`
 - opens LTspice in the background (`open -g -j`) to reduce Space switching
 - captures the first frame from an `SCStream` for reliability, including LTspice windows that are off-screen/in other Spaces
+- returns detailed `capture_diagnostics` metadata (timing, preflight state, title matching, candidate window info)
 
 ## Run tests
 

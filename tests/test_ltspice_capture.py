@@ -66,6 +66,7 @@ class TestScreenCaptureKitPath(unittest.TestCase):
 
         self.assertEqual(payload["window_id"], 42)
         self.assertEqual(payload["capture_mode"], "screencapturekit_window")
+        self.assertIn("capture_diagnostics", payload)
         self.assertTrue(output_path.exists())
         cmd = run_mock.call_args[0][0]
         self.assertEqual(cmd[:2], ["xcrun", "swift"])
@@ -117,6 +118,7 @@ class TestScreenCaptureKitPath(unittest.TestCase):
         self.assertEqual(payload["width"], 300)
         self.assertEqual(payload["height"], 200)
         self.assertTrue(payload["close_event"]["closed"])
+        self.assertIn("capture_diagnostics", payload)
 
     def test_capture_ltspice_window_screenshot_raises_on_sck_failure_when_preferred(self) -> None:
         temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_sck_fail_test_"))
