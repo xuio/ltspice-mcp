@@ -383,15 +383,16 @@ C1 out 0 1u
             _require(isinstance(plot_image, dict), "renderLtspicePlotImage did not return an object")
             plot_image_path = Path(plot_image.get("image_path", ""))
             _require(plot_image_path.exists(), "renderLtspicePlotImage output missing")
-            _require(plot_image.get("backend_used") in {"ltspice", "svg"}, "Unexpected plot image backend")
-            if plot_image.get("backend_used") == "svg":
-                _require(plot_image.get("width", 0) < 1280, "Plot image downscale did not apply (svg)")
-            else:
-                downscale_info = plot_image.get("downscale", {})
-                _require(
-                    isinstance(downscale_info, dict) and (downscale_info.get("downscaled") is True or plot_image.get("downscale_factor") < 1.0),
-                    "Plot image downscale metadata missing for ltspice backend",
-                )
+            _require(plot_image.get("backend_used") == "ltspice", "Plot image backend must be ltspice")
+            _require(
+                isinstance(plot_image.get("plot_settings"), dict) and plot_image["plot_settings"].get("plt_path"),
+                "Plot image response missing .plt metadata",
+            )
+            downscale_info = plot_image.get("downscale", {})
+            _require(
+                isinstance(downscale_info, dict) and (downscale_info.get("downscaled") is True or plot_image.get("downscale_factor") < 1.0),
+                "Plot image downscale metadata missing for ltspice backend",
+            )
             print("Plot image render check passed")
 
             extrema = _extract_call_result(

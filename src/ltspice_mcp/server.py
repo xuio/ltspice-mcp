@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import math
 import mimetypes
 import os
 import shutil
@@ -229,6 +230,101 @@ def _resolve_png_output_path(
         / kind
         / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{_safe_name(name)}.png"
     ).resolve()
+
+
+def _format_plt_number(value: float) -> str:
+    if not math.isfinite(value):
+        return "0"
+    return format(value, ".12g")
+
+
+def _safe_axis_range(values: list[float], *, fallback_span: float) -> tuple[float, float]:
+    finite = [item for item in values if math.isfinite(item)]
+    if not finite:
+        return 0.0, fallback_span
+    lo = min(finite)
+    hi = max(finite)
+    if math.isclose(lo, hi):
+        pad = max(abs(lo), abs(hi), fallback_span) * 0.5
+        lo -= pad
+        hi += pad
+    return lo, hi
+
+
+def _write_ltspice_plot_settings_file(
+    *,
+    dataset: RawDataset,
+    vectors: list[str],
+    step_index: int | None,
+) -> dict[str, Any]:
+    if not vectors:
+        raise ValueError("vectors must contain at least one vector name")
+
+    trace_entries: list[str] = []
+    is_ac_plot = dataset.scale_name.lower() == "frequency" or "ac analysis" in dataset.plot_name.lower()
+    base_trace_id = 524290 if is_ac_plot else 268959746
+    for index, expression in enumerate(vectors):
+        escaped = expression.replace('"', '\\"')
+        trace_entries.append(f'{{{base_trace_id + index},0,"{escaped}"}}')
+
+    scale_values = dataset.scale_values(step_index=step_index)
+    first_series = dataset.get_vector(vectors[0], step_index=step_index)
+    plt_path = dataset.path.with_suffix(".plt")
+
+    lines: list[str] = [
+        f"[{dataset.plot_name}]",
+        "{",
+        "   Npanes: 1",
+        "   {",
+        f"      traces: {len(trace_entries)} {' '.join(trace_entries)}",
+    ]
+
+    if is_ac_plot:
+        positive_scale = [value for value in scale_values if value > 0]
+        x_min = min(positive_scale) if positive_scale else 1.0
+        x_max = max(positive_scale) if positive_scale else (x_min * 10.0)
+        if x_max <= x_min:
+            x_max = x_min * 10.0
+
+        lines.extend(
+            [
+                f"      X: ('K',0,{_format_plt_number(x_min)},0,{_format_plt_number(x_max)})",
+                "      Y[0]: (' ',0,0.001,6,1)",
+                "      Y[1]: (' ',0,-90,9,0)",
+                "      Log: 1 2 0",
+                "      PltMag: 1",
+                "      PltPhi: 1 0",
+                "      NeyeDiagPeriods: 0",
+            ]
+        )
+    else:
+        x_min, x_max = _safe_axis_range(scale_values, fallback_span=1.0)
+        x_step = max((x_max - x_min) / 10.0, 1e-12)
+
+        y_values = [value.real for value in first_series]
+        y_min, y_max = _safe_axis_range(y_values, fallback_span=1.0)
+        y_step = max((y_max - y_min) / 10.0, 1e-12)
+
+        lines.extend(
+            [
+                f"      X: ('m',0,{_format_plt_number(x_min)},{_format_plt_number(x_step)},{_format_plt_number(x_max)})",
+                f"      Y[0]: (' ',0,{_format_plt_number(y_min)},{_format_plt_number(y_step)},{_format_plt_number(y_max)})",
+                "      Y[1]: ('_',0,1e+308,0,-1e+308)",
+                f"      Volts: (' ',0,0,0,{_format_plt_number(y_min)},{_format_plt_number(y_step)},{_format_plt_number(y_max)})",
+                "      Log: 0 0 0",
+                "      NeyeDiagPeriods: 0",
+            ]
+        )
+
+    lines.extend(["   }", "}"])
+    plt_path.write_text("\n".join(lines) + "\n", encoding="utf-16le")
+    return {
+        "plt_path": str(plt_path),
+        "trace_count": len(trace_entries),
+        "trace_expressions": vectors,
+        "plot_name": dataset.plot_name,
+        "plot_type": "ac" if is_ac_plot else "generic",
+    }
 
 
 def _normalize_image_backend(value: str) -> str:
@@ -872,49 +968,68 @@ def renderLtspicePlotImage(
     normalized_backend = _normalize_image_backend(backend)
     warnings: list[str] = []
 
-    if normalized_backend in {"auto", "ltspice"}:
-        try:
-            open_path = dataset.path
-            title_hint = dataset.path.name
-            close_after_capture = True
-            if render_session_id:
-                session = _render_sessions.get(render_session_id)
-                if not session:
-                    raise ValueError(f"Unknown render_session_id '{render_session_id}'")
-                if session.get("path") and Path(session["path"]) != dataset.path:
-                    raise ValueError("render_session_id is bound to a different path")
-                open_path = None
-                title_hint = str(session.get("title_hint") or dataset.path.name)
-                close_after_capture = False
-            screenshot_payload = capture_ltspice_window_screenshot(
-                output_path=_resolve_png_output_path(
-                    kind="plots",
-                    name=f"{dataset.path.stem}_{vectors[0]}",
-                    output_path=output_path,
-                ),
-                open_path=open_path,
-                title_hint=title_hint,
-                settle_seconds=settle_seconds,
-                downscale_factor=downscale_factor,
-                avoid_space_switch=True,
-                prefer_screencapturekit=True,
-                close_after_capture=close_after_capture,
+    use_ltspice_backend = normalized_backend in {"auto", "ltspice"}
+    if use_ltspice_backend:
+        plt_payload = _write_ltspice_plot_settings_file(
+            dataset=dataset,
+            vectors=vectors,
+            step_index=selected_step,
+        )
+        open_path = dataset.path
+        title_hint = dataset.path.name
+        close_after_capture = True
+        if render_session_id:
+            session = _render_sessions.get(render_session_id)
+            if not session:
+                raise ValueError(f"Unknown render_session_id '{render_session_id}'")
+            if session.get("path") and Path(session["path"]) != dataset.path:
+                raise ValueError("render_session_id is bound to a different path")
+            title_hint = str(session.get("title_hint") or dataset.path.name)
+            close_after_capture = False
+        screenshot_payload = capture_ltspice_window_screenshot(
+            output_path=_resolve_png_output_path(
+                kind="plots",
+                name=f"{dataset.path.stem}_{vectors[0]}",
+                output_path=output_path,
+            ),
+            open_path=open_path,
+            title_hint=title_hint,
+            settle_seconds=settle_seconds,
+            downscale_factor=downscale_factor,
+            avoid_space_switch=True,
+            prefer_screencapturekit=True,
+            close_after_capture=close_after_capture,
+        )
+        if selected_step is not None:
+            warnings.append(
+                "LTspice UI rendering currently cannot force step selection; "
+                "the displayed step follows LTspice's default waveform view."
             )
-            payload = {
-                **screenshot_payload,
-                "raw_path": str(dataset.path),
-                "plot_name": dataset.plot_name,
-                "vectors": vectors,
-                "backend_requested": normalized_backend,
-                "backend_used": "ltspice",
-                "render_session_id": render_session_id,
-                **_step_payload(dataset, selected_step),
-            }
-            return _image_tool_result(payload)
-        except Exception as exc:
-            if normalized_backend == "ltspice":
-                raise
-            warnings.append(f"ltspice backend failed; fell back to svg: {exc}")
+        if any(
+            [
+                y_mode != "magnitude",
+                x_log is not None,
+                title is not None,
+                max_points != 2000,
+            ]
+        ):
+            warnings.append(
+                "LTspice plot rendering uses .plt settings and ignores y_mode/x_log/title/max_points."
+            )
+        payload = {
+            **screenshot_payload,
+            "raw_path": str(dataset.path),
+            "plot_name": dataset.plot_name,
+            "vectors": vectors,
+            "plot_settings": plt_payload,
+            "backend_requested": normalized_backend,
+            "backend_used": "ltspice",
+            "render_session_id": render_session_id,
+            **_step_payload(dataset, selected_step),
+        }
+        if warnings:
+            payload["warnings"] = warnings
+        return _image_tool_result(payload)
 
     svg_output_path = output_path
     if output_path and Path(output_path).suffix.lower() not in {".svg"}:

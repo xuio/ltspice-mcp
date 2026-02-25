@@ -206,7 +206,7 @@ def open_in_ltspice_ui(
         raise RuntimeError("LTspice UI integration is currently implemented for macOS only.")
 
     command = ["open"]
-    effective_background = True
+    effective_background = bool(background)
     if effective_background:
         # `-g` avoids foreground activation and `-j` asks LaunchServices to launch hidden.
         # Together they reduce chances of macOS Space switches during automation.

@@ -213,9 +213,13 @@ Render sessions:
 - `endLtspiceRenderSession` closes the associated window.
 
 Rendering backend options:
-- `backend=auto` (default): try real LTspice UI screenshot first, fall back to SVG rendering
+- `backend=auto` (default): use real LTspice UI screenshot mode
 - `backend=ltspice`: force LTspice UI screenshot mode
-- `backend=svg`: force deterministic SVG renderer
+- `backend=svg`: force deterministic SVG renderer (explicit opt-in)
+
+Plot rendering specifics:
+- `renderLtspicePlotImage` writes a companion `.plt` file next to the RAW file so LTspice opens with the requested traces preselected.
+- This avoids UI button/menu interaction for trace selection and keeps rendering on LTspice's native plot engine.
 
 Downscale:
 - `downscale_factor` (e.g. `0.5`) is supported for symbol, schematic, and plot image tools.
