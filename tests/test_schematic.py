@@ -44,6 +44,53 @@ class _StubLibrary:
         return _transform_point(pin.x, pin.y, orientation)
 
 
+class _StubMultiPinLibrary(_StubLibrary):
+    def __init__(self) -> None:
+        super().__init__()
+        self._pin_map: dict[str, list[PinDef]] = {
+            "opamp2": [
+                PinDef(x=-40, y=-20, spice_order=1, name="IN+"),
+                PinDef(x=-40, y=20, spice_order=2, name="IN-"),
+                PinDef(x=40, y=0, spice_order=3, name="OUT"),
+                PinDef(x=0, y=40, spice_order=4, name="V+"),
+                PinDef(x=0, y=-40, spice_order=5, name="V-"),
+            ],
+            "npn": [
+                PinDef(x=-40, y=0, spice_order=1, name="C"),
+                PinDef(x=0, y=40, spice_order=2, name="B"),
+                PinDef(x=40, y=0, spice_order=3, name="E"),
+            ],
+            "nmos": [
+                PinDef(x=-40, y=0, spice_order=1, name="D"),
+                PinDef(x=0, y=40, spice_order=2, name="G"),
+                PinDef(x=40, y=0, spice_order=3, name="S"),
+                PinDef(x=0, y=-40, spice_order=4, name="B"),
+            ],
+        }
+
+    def resolve_entry(self, symbol: str) -> str:
+        normalized = symbol.strip().lower()
+        if normalized in self._pin_map or normalized in {"res", "cap", "ind", "diode", "voltage", "current"}:
+            return f"lib/sym/{normalized}.asy"
+        raise ValueError(f"Unknown symbol: {symbol}")
+
+    def get(self, symbol: str) -> SymbolDef:
+        normalized = symbol.strip().lower()
+        if normalized in self._pin_map:
+            return SymbolDef(
+                symbol=symbol,
+                zip_entry=f"{normalized}.asy",
+                pins=list(self._pin_map[normalized]),
+            )
+        return super().get(symbol)
+
+    def pin_offset(self, symbol: str, orientation: str, spice_order: int) -> tuple[int, int]:
+        pin = self.get(symbol).pin_for_order(spice_order)
+        if pin is None:
+            raise ValueError(f"Unsupported spice_order {spice_order}")
+        return _transform_point(pin.x, pin.y, orientation)
+
+
 class TestSchematicBuilders(unittest.TestCase):
     @staticmethod
     def _fixtures_dir() -> Path:
@@ -56,6 +103,7 @@ class TestSchematicBuilders(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_schematic_test_"))
         self.stub = _StubLibrary()
+        self.multi_stub = _StubMultiPinLibrary()
 
     def test_build_schematic_from_spec(self) -> None:
         output_path = self.temp_dir / "spec_case.asc"
@@ -130,6 +178,32 @@ class TestSchematicBuilders(unittest.TestCase):
         asc = Path(result["asc_path"])
         self.assertTrue(asc.exists())
         self.assertEqual(result["layout"]["placement_mode"], "legacy")
+
+    def test_build_schematic_from_netlist_with_multi_pin_subckt(self) -> None:
+        output_path = self.temp_dir / "netlist_multi_pin.asc"
+        result = build_schematic_from_netlist(
+            workdir=self.temp_dir,
+            netlist_content=(
+                "* Non-inverting amp netlist\n"
+                "V1 in 0 AC 1\n"
+                "VCC vcc 0 10\n"
+                "VEE vee 0 -10\n"
+                "R1 out nfb 10k\n"
+                "R2 nfb 0 1k\n"
+                "XU1 in nfb out vcc vee opamp2\n"
+                ".op\n"
+                ".end\n"
+            ),
+            circuit_name="netlist_multi_pin",
+            output_path=str(output_path),
+            library=self.multi_stub,
+        )
+        asc = Path(result["asc_path"])
+        self.assertTrue(asc.exists())
+        text = asc.read_text(encoding="utf-8")
+        self.assertIn("SYMBOL opamp2", text)
+        self.assertGreaterEqual(result["components"], 6)
+        self.assertEqual(result["layout"]["placement_mode"], "smart")
 
     def test_template_listing_and_rendering(self) -> None:
         listing = list_schematic_templates()

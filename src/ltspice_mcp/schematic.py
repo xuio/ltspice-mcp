@@ -606,10 +606,64 @@ def _element_to_symbol(name: str) -> str | None:
     return mapping.get(lead)
 
 
-def _parse_two_pin_nodes(tokens: list[str]) -> list[str] | None:
-    if len(tokens) < 4:
+def _first_non_param_index(tokens: list[str], *, start_index: int) -> int | None:
+    idx = len(tokens) - 1
+    while idx >= start_index:
+        token = tokens[idx]
+        upper = token.upper()
+        if upper.startswith("PARAMS:") or "=" in token:
+            idx -= 1
+            continue
+        return idx
+    return None
+
+
+def _symbol_exists(library: SymbolLibrary, symbol: str) -> bool:
+    try:
+        library.resolve_entry(symbol)
+    except Exception:
+        return False
+    return True
+
+
+def _resolve_multi_pin_symbol(
+    *,
+    ref: str,
+    model_token: str | None,
+    library: SymbolLibrary,
+) -> str | None:
+    lead = ref[:1].upper()
+    if lead == "X":
+        if not model_token:
+            return None
+        candidates = [
+            model_token,
+            Path(model_token).stem,
+            model_token.replace(".asy", ""),
+            model_token.lower(),
+            Path(model_token).stem.lower(),
+        ]
+        seen: set[str] = set()
+        for candidate in candidates:
+            normalized = candidate.strip()
+            if not normalized or normalized.lower() in seen:
+                continue
+            seen.add(normalized.lower())
+            if _symbol_exists(library, normalized):
+                return normalized
         return None
-    return [tokens[1], tokens[2]]
+    if lead == "Q":
+        if model_token and _symbol_exists(library, model_token):
+            return model_token
+        if model_token and "pnp" in model_token.lower():
+            return "pnp"
+        return "npn"
+    if lead == "M":
+        if model_token and _symbol_exists(library, model_token):
+            return model_token
+        lowered = (model_token or "").lower()
+        return "pmos" if lowered.startswith("p") or "pmos" in lowered else "nmos"
+    return None
 
 
 def _canonical_net(name: str) -> str:
@@ -670,28 +724,52 @@ def _route_two_point_net(
 
 
 @dataclass(slots=True)
-class _TwoPinElement:
+class _ParsedElement:
     reference: str
     symbol: str
     nodes: list[str]
     value: str | None
     source_index: int
+    lead: str
 
 
 def _preferred_signal_pin_order(nodes: list[str]) -> int:
-    if len(nodes) < 2:
+    if not nodes:
         return 1
-    if _canonical_net(nodes[0]) == "0" and _canonical_net(nodes[1]) != "0":
-        return 2
+    for pin_index, net_name in enumerate(nodes, start=1):
+        if _canonical_net(net_name) != "0":
+            return pin_index
     return 1
 
 
-def _build_two_pin_elements(
+def _choose_element_orientation(
+    element: _ParsedElement,
+    *,
+    net_columns: dict[str, int] | None = None,
+) -> str:
+    if len(element.nodes) == 2:
+        return _choose_two_pin_orientation(
+            element.symbol,
+            element.nodes,
+            net_columns=net_columns,
+        )
+    return "R0"
+
+
+def _pin_count_for_symbol(library: SymbolLibrary, symbol: str) -> int | None:
+    try:
+        return len(library.get(symbol).pins)
+    except Exception:
+        return None
+
+
+def _build_elements(
     netlist_content: str,
+    library: SymbolLibrary,
     warnings: list[str],
     directives: list[str],
-) -> list[_TwoPinElement]:
-    elements: list[_TwoPinElement] = []
+) -> list[_ParsedElement]:
+    elements: list[_ParsedElement] = []
     for line_index, raw_line in enumerate(netlist_content.splitlines()):
         line = raw_line.strip()
         if not line or line.startswith("*"):
@@ -706,37 +784,77 @@ def _build_two_pin_elements(
             continue
 
         ref = tokens[0]
-        symbol = _element_to_symbol(ref)
-        if symbol is None:
+        lead = ref[:1].upper()
+        symbol: str | None = _element_to_symbol(ref)
+        nodes: list[str] | None = None
+        value: str | None = None
+
+        if lead in {"R", "C", "L", "D", "V", "I"}:
+            if len(tokens) < 4:
+                warnings.append(f"Could not parse nodes for element '{ref}'.")
+                continue
+            nodes = [tokens[1], tokens[2]]
+            value = " ".join(tokens[3:]) if len(tokens) > 3 else None
+        elif lead in {"X", "Q", "M"}:
+            model_idx = _first_non_param_index(tokens, start_index=2)
+            if model_idx is None:
+                warnings.append(f"Could not determine model token for element '{ref}'.")
+                continue
+            model_token = tokens[model_idx]
+            nodes = tokens[1:model_idx]
+            if lead == "Q":
+                nodes = nodes[:4]
+            if lead == "M":
+                nodes = nodes[:4]
+            symbol = _resolve_multi_pin_symbol(ref=ref, model_token=model_token, library=library)
+            if symbol is None:
+                warnings.append(
+                    f"Could not resolve LTspice symbol for element '{ref}' model '{model_token}'."
+                )
+                continue
+            value = model_token
+        else:
             warnings.append(f"Unsupported element '{ref}' was skipped.")
             continue
-        nodes = _parse_two_pin_nodes(tokens)
-        if nodes is None:
+
+        if not symbol:
+            warnings.append(f"Unsupported element '{ref}' was skipped.")
+            continue
+        if not nodes:
             warnings.append(f"Could not parse nodes for element '{ref}'.")
             continue
-        value = " ".join(tokens[3:]) if len(tokens) > 3 else None
+
+        pin_count = _pin_count_for_symbol(library, symbol)
+        if pin_count is not None and len(nodes) > pin_count:
+            warnings.append(
+                f"Element '{ref}' has {len(nodes)} nodes but symbol '{symbol}' exposes {pin_count} pins; truncating."
+            )
+            nodes = nodes[:pin_count]
+        if pin_count is not None and len(nodes) == 0:
+            warnings.append(f"Element '{ref}' has no routable pins after normalization.")
+            continue
+
         elements.append(
-            _TwoPinElement(
+            _ParsedElement(
                 reference=ref,
                 symbol=symbol,
-                nodes=[_canonical_net(nodes[0]), _canonical_net(nodes[1])],
+                nodes=[_canonical_net(node) for node in nodes],
                 value=value,
                 source_index=line_index,
+                lead=lead,
             )
         )
     return elements
 
 
-def _infer_root_net(elements: list[_TwoPinElement]) -> str | None:
+def _infer_root_net(elements: list[_ParsedElement]) -> str | None:
     for element in elements:
-        if element.symbol not in {"voltage", "current"}:
+        if element.lead not in {"V", "I"}:
             continue
-        n1 = _canonical_net(element.nodes[0])
-        n2 = _canonical_net(element.nodes[1])
-        if n1 != "0":
-            return n1
-        if n2 != "0":
-            return n2
+        for net_name in element.nodes:
+            normalized = _canonical_net(net_name)
+            if normalized != "0":
+                return normalized
     for element in elements:
         for net_name in element.nodes:
             if _canonical_net(net_name) != "0":
@@ -745,16 +863,17 @@ def _infer_root_net(elements: list[_TwoPinElement]) -> str | None:
 
 
 def _compute_net_distances(
-    elements: list[_TwoPinElement],
+    elements: list[_ParsedElement],
 ) -> tuple[dict[str, int], str | None]:
     adjacency: dict[str, set[str]] = defaultdict(set)
     for element in elements:
         if len(element.nodes) < 2:
             continue
-        n1 = _canonical_net(element.nodes[0])
-        n2 = _canonical_net(element.nodes[1])
-        adjacency[n1].add(n2)
-        adjacency[n2].add(n1)
+        normalized = [_canonical_net(node) for node in element.nodes]
+        for idx, left in enumerate(normalized):
+            for right in normalized[idx + 1 :]:
+                adjacency[left].add(right)
+                adjacency[right].add(left)
 
     root = _infer_root_net(elements)
     if root is None and adjacency:
@@ -780,9 +899,9 @@ def _compute_net_distances(
     return distances, root
 
 
-def _legacy_place_two_pin_elements(
+def _legacy_place_elements(
     *,
-    elements: list[_TwoPinElement],
+    elements: list[_ParsedElement],
     library: SymbolLibrary,
     sheet_width: int,
 ) -> list[tuple[ComponentPlacement, list[str]]]:
@@ -793,7 +912,7 @@ def _legacy_place_two_pin_elements(
         row = index // columns
         base_row_y = 80 + row * 200
         signal_row_y = 96 + row * 200
-        orientation = _choose_two_pin_orientation(element.symbol, element.nodes)
+        orientation = _choose_element_orientation(element)
         y = base_row_y
         preferred_pin_order = _preferred_signal_pin_order(element.nodes)
         try:
@@ -818,16 +937,16 @@ def _legacy_place_two_pin_elements(
     return placements
 
 
-def _smart_place_two_pin_elements(
+def _smart_place_elements(
     *,
-    elements: list[_TwoPinElement],
+    elements: list[_ParsedElement],
     library: SymbolLibrary,
     sheet_width: int,
     sheet_height: int,
 ) -> tuple[list[tuple[ComponentPlacement, list[str]]], dict[str, Any]]:
     net_distances, root_net = _compute_net_distances(elements)
     fallback_distance = (max(net_distances.values()) + 1) if net_distances else 1
-    layer_to_items: dict[int, list[_TwoPinElement]] = defaultdict(list)
+    layer_to_items: dict[int, list[_ParsedElement]] = defaultdict(list)
 
     for element in elements:
         signal_nets = [net for net in element.nodes if _canonical_net(net) != "0"]
@@ -859,11 +978,7 @@ def _smart_place_two_pin_elements(
         overflow_band = row_index // max_rows
         signal_row_y = y_origin + wrapped_row * row_spacing + overflow_band * 28
         x = min(sheet_width - 120, x_origin + layer * column_spacing)
-        orientation = _choose_two_pin_orientation(
-            element.symbol,
-            element.nodes,
-            net_columns=net_distances,
-        )
+        orientation = _choose_element_orientation(element, net_columns=net_distances)
         preferred_pin_order = _preferred_signal_pin_order(element.nodes)
         y = signal_row_y
         try:
@@ -992,8 +1107,9 @@ def build_schematic_from_netlist(
     builder = SchematicBuilder(sheet_width=sheet_width, sheet_height=sheet_height)
     warnings: list[str] = []
     directives: list[str] = []
-    elements = _build_two_pin_elements(
+    elements = _build_elements(
         netlist_content=netlist_content,
+        library=lib,
         warnings=warnings,
         directives=directives,
     )
@@ -1002,13 +1118,13 @@ def build_schematic_from_netlist(
 
     layout_metrics: dict[str, Any] = {"placement_mode": normalized_mode}
     if normalized_mode == "legacy":
-        components = _legacy_place_two_pin_elements(
+        components = _legacy_place_elements(
             elements=elements,
             library=lib,
             sheet_width=sheet_width,
         )
     else:
-        components, smart_metrics = _smart_place_two_pin_elements(
+        components, smart_metrics = _smart_place_elements(
             elements=elements,
             library=lib,
             sheet_width=sheet_width,

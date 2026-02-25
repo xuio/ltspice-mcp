@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import platform
 import re
 import shutil
 import subprocess
-import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -60,6 +60,345 @@ _CATEGORY_RULES: list[tuple[str, str, re.Pattern[str], str]] = [
         "Review warning context to ensure simulation accuracy is acceptable.",
     ),
 ]
+
+_SCK_HELPER_SOURCE = r"""
+import Foundation
+import AppKit
+import ScreenCaptureKit
+import CoreGraphics
+import CoreMedia
+import CoreVideo
+import VideoToolbox
+import ImageIO
+import UniformTypeIdentifiers
+
+let args = CommandLine.arguments
+if args.count < 3 {
+    fputs("usage: <outputPath> <titleHint> [captureTimeoutSeconds]\n", stderr)
+    exit(2)
+}
+
+let outputURL = URL(fileURLWithPath: args[1])
+let titleHint = args[2].trimmingCharacters(in: .whitespacesAndNewlines)
+let captureTimeoutSeconds = args.count >= 4 ? max(1.0, Double(args[3]) ?? 10.0) : 10.0
+
+let _ = NSApplication.shared
+
+func emitJSON(_ payload: [String: Any]) {
+    if let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+       let text = String(data: data, encoding: .utf8) {
+        print(text)
+    }
+}
+
+enum CaptureError: LocalizedError {
+    case timedOut
+    case conversionFailed(Int32)
+
+    var errorDescription: String? {
+        switch self {
+        case .timedOut:
+            return "Timed out waiting for first stream frame."
+        case .conversionFailed(let status):
+            return "VTCreateCGImageFromCVPixelBuffer failed (status=\(status))."
+        }
+    }
+}
+
+final class FrameSink: NSObject, SCStreamOutput {
+    private var continuation: CheckedContinuation<CGImage, Error>?
+    private let lock = NSLock()
+
+    func waitForFrame(timeoutSeconds: TimeInterval) async throws -> CGImage {
+        try await withThrowingTaskGroup(of: CGImage.self) { group in
+            group.addTask {
+                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<CGImage, Error>) in
+                    self.lock.lock()
+                    self.continuation = cont
+                    self.lock.unlock()
+                }
+            }
+            group.addTask {
+                let nanos = UInt64(max(1, Int(timeoutSeconds * 1_000_000_000)))
+                try await Task.sleep(nanoseconds: nanos)
+                throw CaptureError.timedOut
+            }
+            let frame = try await group.next()!
+            group.cancelAll()
+            return frame
+        }
+    }
+
+    func stream(
+        _ stream: SCStream,
+        didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
+        of outputType: SCStreamOutputType
+    ) {
+        guard outputType == .screen else {
+            return
+        }
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            return
+        }
+        var image: CGImage?
+        let status = VTCreateCGImageFromCVPixelBuffer(pixelBuffer, options: nil, imageOut: &image)
+        if status == noErr, let image {
+            resumeOnce(with: .success(image))
+        } else {
+            resumeOnce(with: .failure(CaptureError.conversionFailed(status)))
+        }
+    }
+
+    private func resumeOnce(with result: Result<CGImage, Error>) {
+        lock.lock()
+        guard let cont = continuation else {
+            lock.unlock()
+            return
+        }
+        continuation = nil
+        lock.unlock()
+
+        switch result {
+        case .success(let image):
+            cont.resume(returning: image)
+        case .failure(let error):
+            cont.resume(throwing: error)
+        }
+    }
+}
+
+let sema = DispatchSemaphore(value: 0)
+var failed = false
+
+Task {
+    defer { sema.signal() }
+    do {
+        let shareable = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        let candidates = shareable.windows.filter {
+            ($0.owningApplication?.applicationName ?? "") == "LTspice" &&
+            $0.frame.width > 80 &&
+            $0.frame.height > 80
+        }
+
+        guard !candidates.isEmpty else {
+            fputs("No LTspice windows found.\n", stderr)
+            failed = true
+            return
+        }
+
+        let selected: SCWindow
+        var titleHintMatched = false
+        var selectionReason = "largest_window"
+        if !titleHint.isEmpty {
+            if let exact = candidates.first(where: { ($0.title ?? "").localizedCaseInsensitiveContains(titleHint) }) {
+                selected = exact
+                titleHintMatched = true
+                selectionReason = "title_hint_match"
+            } else {
+                selected = candidates.max(by: { ($0.frame.width * $0.frame.height) < ($1.frame.width * $1.frame.height) })!
+                selectionReason = "largest_window_fallback"
+            }
+        } else {
+            selected = candidates.max(by: { ($0.frame.width * $0.frame.height) < ($1.frame.width * $1.frame.height) })!
+        }
+        let candidateTitles = candidates.prefix(12).map { $0.title ?? "" }
+
+        let filter = SCContentFilter(desktopIndependentWindow: selected)
+        let configuration = SCStreamConfiguration()
+        configuration.width = max(1, Int(selected.frame.width))
+        configuration.height = max(1, Int(selected.frame.height))
+        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 30)
+        configuration.queueDepth = 2
+        configuration.capturesAudio = false
+        configuration.excludesCurrentProcessAudio = true
+        configuration.showsCursor = false
+
+        let sink = FrameSink()
+        let stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
+        try stream.addStreamOutput(
+            sink,
+            type: .screen,
+            sampleHandlerQueue: DispatchQueue(label: "ltspice.sck.output")
+        )
+        try await stream.startCapture()
+        let image = try await sink.waitForFrame(timeoutSeconds: captureTimeoutSeconds)
+        try await stream.stopCapture()
+
+        guard let destination = CGImageDestinationCreateWithURL(
+            outputURL as CFURL,
+            UTType.png.identifier as CFString,
+            1,
+            nil
+        ) else {
+            fputs("Failed to create image destination.\n", stderr)
+            failed = true
+            return
+        }
+
+        CGImageDestinationAddImage(destination, image, nil)
+        if !CGImageDestinationFinalize(destination) {
+            fputs("Failed to finalize image destination.\n", stderr)
+            failed = true
+            return
+        }
+
+        let payload: [String: Any] = [
+            "window_id": selected.windowID,
+            "window_title": selected.title ?? "",
+            "window_frame": [
+                "x": selected.frame.origin.x,
+                "y": selected.frame.origin.y,
+                "width": selected.frame.width,
+                "height": selected.frame.height
+            ],
+            "title_hint": titleHint,
+            "title_hint_matched": titleHintMatched,
+            "selection_reason": selectionReason,
+            "candidate_count": candidates.count,
+            "candidate_titles": candidateTitles,
+            "capture_mode": "screencapturekit_window",
+            "capture_strategy": "desktop_independent_window",
+            "captured_width": image.width,
+            "captured_height": image.height
+        ]
+        emitJSON(payload)
+    } catch {
+        fputs("ScreenCaptureKit error: \(error)\n", stderr)
+        failed = true
+    }
+}
+
+_ = sema.wait(timeout: .now() + 30)
+if failed {
+    exit(1)
+}
+"""
+_SCK_HELPER_FILENAME = "ltspice-sck-helper"
+_SCK_HELPER_HASH_FILENAME = ".ltspice-sck-helper.sha256"
+_SCK_HELPER_SWIFT_FILENAME = "ltspice-sck-helper.swift"
+
+
+def _resolve_sck_helper_path() -> tuple[Path, bool]:
+    explicit = os.getenv("LTSPICE_MCP_SCK_HELPER_PATH")
+    if explicit:
+        return Path(explicit).expanduser().resolve(), True
+    helper_dir_raw = os.getenv("LTSPICE_MCP_SCK_HELPER_DIR")
+    helper_dir = (
+        Path(helper_dir_raw).expanduser()
+        if helper_dir_raw
+        else (Path.home() / "Library" / "Application Support" / "ltspice-mcp" / "bin")
+    )
+    return (helper_dir / _SCK_HELPER_FILENAME).resolve(), False
+
+
+def _ensure_screencapturekit_helper() -> tuple[Path, dict[str, Any]]:
+    helper_path, explicit = _resolve_sck_helper_path()
+    if explicit:
+        if not _is_executable(helper_path):
+            raise RuntimeError(
+                "LTSPICE_MCP_SCK_HELPER_PATH is set but not executable: "
+                f"{helper_path}"
+            )
+        return helper_path, {
+            "helper_path": str(helper_path),
+            "helper_source": "env_path",
+            "compiled": False,
+        }
+
+    swiftc = shutil.which("swiftc")
+    if swiftc is None:
+        raise RuntimeError(
+            "swiftc not found; install Xcode command line tools "
+            "or set LTSPICE_MCP_SCK_HELPER_PATH to a prebuilt helper executable."
+        )
+
+    helper_dir = helper_path.parent
+    helper_dir.mkdir(parents=True, exist_ok=True)
+    helper_source_path = helper_dir / _SCK_HELPER_SWIFT_FILENAME
+    helper_hash_path = helper_dir / _SCK_HELPER_HASH_FILENAME
+    helper_lock_path = helper_dir / ".ltspice-sck-helper.lock"
+
+    source_hash = hashlib.sha256(_SCK_HELPER_SOURCE.encode("utf-8")).hexdigest()
+    existing_hash = ""
+    if helper_hash_path.exists():
+        try:
+            existing_hash = helper_hash_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            existing_hash = ""
+
+    if _is_executable(helper_path) and existing_hash == source_hash:
+        return helper_path, {
+            "helper_path": str(helper_path),
+            "helper_source": "compiled_cache",
+            "compiled": False,
+            "swiftc_path": swiftc,
+            "source_hash": source_hash,
+        }
+
+    compile_stdout = ""
+    compile_stderr = ""
+    compile_command: list[str] = []
+    compiled = False
+
+    # Serialize helper compilation to avoid races when multiple server calls start concurrently.
+    with helper_lock_path.open("a+", encoding="utf-8") as lock_handle:
+        try:
+            import fcntl
+
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            pass
+
+        existing_hash = ""
+        if helper_hash_path.exists():
+            try:
+                existing_hash = helper_hash_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                existing_hash = ""
+
+        if not (_is_executable(helper_path) and existing_hash == source_hash):
+            helper_source_path.write_text(_SCK_HELPER_SOURCE, encoding="utf-8")
+            temp_output_path = helper_dir / (
+                f".{_SCK_HELPER_FILENAME}.tmp-{os.getpid()}-{int(time.time() * 1000)}"
+            )
+            compile_command = [
+                swiftc,
+                "-O",
+                "-o",
+                str(temp_output_path),
+                str(helper_source_path),
+            ]
+            try:
+                compile_proc = subprocess.run(
+                    compile_command,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                compile_stdout = compile_proc.stdout.strip()
+                compile_stderr = compile_proc.stderr.strip()
+                if compile_proc.returncode != 0:
+                    raise RuntimeError(
+                        "swiftc failed to build ScreenCaptureKit helper "
+                        f"(rc={compile_proc.returncode}): {compile_stderr or compile_stdout}"
+                    )
+                temp_output_path.chmod(0o755)
+                temp_output_path.replace(helper_path)
+                helper_hash_path.write_text(f"{source_hash}\n", encoding="utf-8")
+                compiled = True
+            finally:
+                temp_output_path.unlink(missing_ok=True)
+
+    return helper_path, {
+        "helper_path": str(helper_path),
+        "helper_source": "compiled_now" if compiled else "compiled_cache_after_lock",
+        "compiled": compiled,
+        "swiftc_path": swiftc,
+        "source_hash": source_hash,
+        "compile_command": compile_command or None,
+        "compile_stdout": compile_stdout,
+        "compile_stderr": compile_stderr,
+    }
 
 
 def _is_executable(path: Path) -> bool:
@@ -283,249 +622,23 @@ def _capture_ltspice_window_with_screencapturekit(
 ) -> dict[str, Any]:
     if platform.system() != "Darwin":
         raise RuntimeError("ScreenCaptureKit capture is currently implemented for macOS only.")
-    if shutil.which("xcrun") is None:
-        raise RuntimeError("xcrun not found; ScreenCaptureKit backend is unavailable.")
-
-    swift_source = r'''
-import Foundation
-import AppKit
-import ScreenCaptureKit
-import CoreGraphics
-import CoreMedia
-import CoreVideo
-import VideoToolbox
-import ImageIO
-import UniformTypeIdentifiers
-
-let args = CommandLine.arguments
-if args.count < 3 {
-    fputs("usage: <outputPath> <titleHint>\n", stderr)
-    exit(2)
-}
-
-let outputURL = URL(fileURLWithPath: args[1])
-let titleHint = args[2].trimmingCharacters(in: .whitespacesAndNewlines)
-
-let _ = NSApplication.shared
-
-func emitJSON(_ payload: [String: Any]) {
-    if let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
-       let text = String(data: data, encoding: .utf8) {
-        print(text)
-    }
-}
-
-enum CaptureError: LocalizedError {
-    case timedOut
-    case conversionFailed(Int32)
-
-    var errorDescription: String? {
-        switch self {
-        case .timedOut:
-            return "Timed out waiting for first stream frame."
-        case .conversionFailed(let status):
-            return "VTCreateCGImageFromCVPixelBuffer failed (status=\(status))."
-        }
-    }
-}
-
-final class FrameSink: NSObject, SCStreamOutput {
-    private var continuation: CheckedContinuation<CGImage, Error>?
-    private let lock = NSLock()
-
-    func waitForFrame(timeoutSeconds: TimeInterval) async throws -> CGImage {
-        try await withThrowingTaskGroup(of: CGImage.self) { group in
-            group.addTask {
-                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<CGImage, Error>) in
-                    self.lock.lock()
-                    self.continuation = cont
-                    self.lock.unlock()
-                }
-            }
-            group.addTask {
-                let nanos = UInt64(max(1, Int(timeoutSeconds * 1_000_000_000)))
-                try await Task.sleep(nanoseconds: nanos)
-                throw CaptureError.timedOut
-            }
-            let frame = try await group.next()!
-            group.cancelAll()
-            return frame
-        }
-    }
-
-    func stream(
-        _ stream: SCStream,
-        didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
-        of outputType: SCStreamOutputType
-    ) {
-        guard outputType == .screen else {
-            return
-        }
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
-            return
-        }
-        var image: CGImage?
-        let status = VTCreateCGImageFromCVPixelBuffer(pixelBuffer, options: nil, imageOut: &image)
-        if status == noErr, let image {
-            resumeOnce(with: .success(image))
-        } else {
-            resumeOnce(with: .failure(CaptureError.conversionFailed(status)))
-        }
-    }
-
-    private func resumeOnce(with result: Result<CGImage, Error>) {
-        lock.lock()
-        guard let cont = continuation else {
-            lock.unlock()
-            return
-        }
-        continuation = nil
-        lock.unlock()
-
-        switch result {
-        case .success(let image):
-            cont.resume(returning: image)
-        case .failure(let error):
-            cont.resume(throwing: error)
-        }
-    }
-}
-
-let sema = DispatchSemaphore(value: 0)
-var failed = false
-
-Task {
-    defer { sema.signal() }
-    do {
-        let shareable = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-        let candidates = shareable.windows.filter {
-            ($0.owningApplication?.applicationName ?? "") == "LTspice" &&
-            $0.frame.width > 80 &&
-            $0.frame.height > 80
-        }
-
-        guard !candidates.isEmpty else {
-            fputs("No LTspice windows found.\n", stderr)
-            failed = true
-            return
-        }
-
-        let selected: SCWindow
-        var titleHintMatched = false
-        var selectionReason = "largest_window"
-        if !titleHint.isEmpty {
-            if let exact = candidates.first(where: { ($0.title ?? "").localizedCaseInsensitiveContains(titleHint) }) {
-                selected = exact
-                titleHintMatched = true
-                selectionReason = "title_hint_match"
-            } else {
-                selected = candidates.max(by: { ($0.frame.width * $0.frame.height) < ($1.frame.width * $1.frame.height) })!
-                selectionReason = "largest_window_fallback"
-            }
-        } else {
-            selected = candidates.max(by: { ($0.frame.width * $0.frame.height) < ($1.frame.width * $1.frame.height) })!
-        }
-        let candidateTitles = candidates.prefix(12).map { $0.title ?? "" }
-
-        let filter = SCContentFilter(desktopIndependentWindow: selected)
-        let configuration = SCStreamConfiguration()
-        configuration.width = max(1, Int(selected.frame.width))
-        configuration.height = max(1, Int(selected.frame.height))
-        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 30)
-        configuration.queueDepth = 2
-        configuration.capturesAudio = false
-        configuration.excludesCurrentProcessAudio = true
-        configuration.showsCursor = false
-
-        let sink = FrameSink()
-        let stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
-        try stream.addStreamOutput(
-            sink,
-            type: .screen,
-            sampleHandlerQueue: DispatchQueue(label: "ltspice.sck.output")
-        )
-        try await stream.startCapture()
-        let image = try await sink.waitForFrame(timeoutSeconds: 10.0)
-        try await stream.stopCapture()
-
-        guard let destination = CGImageDestinationCreateWithURL(
-            outputURL as CFURL,
-            UTType.png.identifier as CFString,
-            1,
-            nil
-        ) else {
-            fputs("Failed to create image destination.\n", stderr)
-            failed = true
-            return
-        }
-
-        CGImageDestinationAddImage(destination, image, nil)
-        if !CGImageDestinationFinalize(destination) {
-            fputs("Failed to finalize image destination.\n", stderr)
-            failed = true
-            return
-        }
-
-        let payload: [String: Any] = [
-            "window_id": selected.windowID,
-            "window_title": selected.title ?? "",
-            "window_frame": [
-                "x": selected.frame.origin.x,
-                "y": selected.frame.origin.y,
-                "width": selected.frame.width,
-                "height": selected.frame.height
-            ],
-            "title_hint": titleHint,
-            "title_hint_matched": titleHintMatched,
-            "selection_reason": selectionReason,
-            "candidate_count": candidates.count,
-            "candidate_titles": candidateTitles,
-            "capture_mode": "screencapturekit_window",
-            "capture_strategy": "desktop_independent_window",
-            "captured_width": image.width,
-            "captured_height": image.height
-        ]
-        emitJSON(payload)
-    } catch {
-        fputs("ScreenCaptureKit error: \(error)\n", stderr)
-        failed = true
-    }
-}
-
-_ = sema.wait(timeout: .now() + 25)
-if failed {
-    exit(1)
-}
-'''
-
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        suffix=".swift",
-        prefix="ltspice_sck_",
-        delete=False,
-        encoding="utf-8",
-    ) as handle:
-        handle.write(swift_source)
-        script_path = Path(handle.name)
+    helper_path, helper_details = _ensure_screencapturekit_helper()
+    helper_timeout = max(2.0, min(15.0, timeout_seconds - 2.0))
 
     started_monotonic = time.monotonic()
     command = [
-        "xcrun",
-        "swift",
-        str(script_path),
+        str(helper_path),
         str(output_path),
         (title_hint or ""),
+        f"{helper_timeout:.3f}",
     ]
-    try:
-        proc = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=timeout_seconds,
-        )
-    finally:
-        script_path.unlink(missing_ok=True)
+    proc = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout_seconds,
+    )
 
     duration_seconds = round(time.monotonic() - started_monotonic, 6)
 
@@ -548,7 +661,7 @@ if failed {
             payload = candidate
             break
 
-    # ScreenCaptureKit finalization can lag a fraction after swift exits.
+    # ScreenCaptureKit finalization can lag a fraction after helper exit.
     # Use a fixed post-capture settle to avoid flaky "missing file" failures.
     if not output_path.exists():
         time.sleep(0.2)
@@ -559,11 +672,12 @@ if failed {
         )
 
     diagnostics = {
-        "swift_command": command,
+        "helper_command": command,
         "duration_seconds": duration_seconds,
         "return_code": proc.returncode,
         "stdout_line_count": len([line for line in proc.stdout.splitlines() if line.strip()]),
         "stderr": proc.stderr.strip(),
+        "helper_details": helper_details,
     }
     if payload:
         payload["capture_diagnostics"] = diagnostics
@@ -657,7 +771,9 @@ def capture_ltspice_window_screenshot(
         "avoid_space_switch": bool(avoid_space_switch),
         "open_path": str(Path(open_path).expanduser().resolve()) if open_path is not None else None,
         "title_hint_requested": title_hint,
-        "xcrun_available": shutil.which("xcrun"),
+        "swiftc_available": shutil.which("swiftc"),
+        "sck_helper_path_env": os.getenv("LTSPICE_MCP_SCK_HELPER_PATH"),
+        "sck_helper_dir_env": os.getenv("LTSPICE_MCP_SCK_HELPER_DIR"),
         "ltspice_ui_running_before_open": is_ltspice_ui_running(),
     }
 

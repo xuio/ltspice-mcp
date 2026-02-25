@@ -135,6 +135,42 @@ class TestDevelopmentTools(unittest.TestCase):
         self.assertIn("missing.lib", payload["missing_include_files"])
         self.assertIn("DFAST", payload["missing_models"])
 
+    def test_scan_model_issues_provides_resolution_suggestions(self) -> None:
+        log_path = self.temp_dir / "model_suggest.log"
+        model_dir = self.temp_dir / "models"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        candidate = model_dir / "fast_diode.lib"
+        candidate.write_text(
+            ".model DFAST D(Is=1e-12)\n.subckt foo_subckt in out\n.ends foo_subckt\n",
+            encoding="utf-8",
+        )
+        log_path.write_text(
+            "\n".join(
+                [
+                    "Could not open include file: fast_diode.lib",
+                    "Unknown subcircuit called in: XU1 out in foo_subckt",
+                    "can't find definition of model DFAST",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        payload = server.scanModelIssues(
+            log_path=str(log_path),
+            search_paths=[str(model_dir)],
+            suggest_matches=True,
+            max_scan_files=50,
+        )
+        self.assertTrue(payload["has_model_issues"])
+        self.assertGreaterEqual(payload["model_search"]["scanned_file_count"], 1)
+        suggestions = payload.get("resolution_suggestions", [])
+        self.assertTrue(suggestions)
+        include_suggestions = [item for item in suggestions if item.get("issue_type") == "missing_include_file"]
+        self.assertTrue(include_suggestions)
+        self.assertTrue(
+            include_suggestions[0].get("direct_matches") or include_suggestions[0].get("best_matches")
+        )
+
     def test_import_model_and_patch_bindings(self) -> None:
         model_source = self.temp_dir / "foo.lib"
         model_source.write_text(".subckt myamp in out\n.ends myamp\n", encoding="utf-8")
@@ -194,6 +230,35 @@ class TestDevelopmentTools(unittest.TestCase):
         self.assertTrue(payload["succeeded"])
         self.assertGreaterEqual(payload["iterations_run"], 2)
         self.assertIn("R__BLEED", sidecar.read_text(encoding="utf-8"))
+        self.assertIn("confidence", payload)
+        self.assertIn("score", payload["confidence"])
+
+    def test_lint_schematic_detects_structural_issues(self) -> None:
+        asc_path = self.temp_dir / "lint_case.asc"
+        asc_path.write_text(
+            "\n".join(
+                [
+                    "Version 4",
+                    "SHEET 1 200 200",
+                    "SYMBOL res 100 100 R0",
+                    "WIRE 10 10 30 10",
+                    "FLAG 30 10 net_a",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        payload = server.lintSchematic(asc_path=str(asc_path), strict=False)
+        self.assertFalse(payload["valid"])
+        self.assertGreaterEqual(len(payload["errors"]), 1)
+
+    def test_tool_telemetry_records_calls(self) -> None:
+        server.resetToolTelemetry()
+        server.listIntentCircuitTemplates()
+        server.listIntentCircuitTemplates()
+        payload = server.getToolTelemetry(tool_name="listIntentCircuitTemplates")
+        self.assertEqual(payload["tool_count"], 1)
+        self.assertGreaterEqual(payload["tools"][0]["calls_total"], 2)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,18 @@ def _real_sck_tests_enabled() -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _sck_helper_runtime_available() -> tuple[bool, str]:
+    helper_override = os.getenv("LTSPICE_MCP_SCK_HELPER_PATH")
+    if helper_override:
+        helper_path = Path(helper_override).expanduser()
+        if helper_path.exists():
+            return True, ""
+        return False, f"LTSPICE_MCP_SCK_HELPER_PATH does not exist: {helper_path}"
+    if shutil.which("swiftc") is None:
+        return False, "swiftc is not available; ScreenCaptureKit helper cannot be built."
+    return True, ""
+
+
 @unittest.skipUnless(platform.system() == "Darwin", "ScreenCaptureKit tests require macOS")
 class TestScreenCaptureKitIntegration(unittest.TestCase):
     @classmethod
@@ -29,8 +41,9 @@ class TestScreenCaptureKitIntegration(unittest.TestCase):
             raise unittest.SkipTest(
                 "Set LTSPICE_MCP_RUN_REAL_SCK=1 to run real ScreenCaptureKit integration tests."
             )
-        if shutil.which("xcrun") is None:
-            raise unittest.SkipTest("xcrun is not available; ScreenCaptureKit backend cannot run.")
+        helper_ok, helper_reason = _sck_helper_runtime_available()
+        if not helper_ok:
+            raise unittest.SkipTest(helper_reason)
         if find_ltspice_executable() is None:
             raise unittest.SkipTest("LTspice executable was not found on this system.")
 

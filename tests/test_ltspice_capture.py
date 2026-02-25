@@ -40,9 +40,10 @@ class TestOpenInLtspiceUi(unittest.TestCase):
 
 
 class TestScreenCaptureKitPath(unittest.TestCase):
-    def test_screencapturekit_helper_invokes_xcrun_and_parses_json(self) -> None:
+    def test_screencapturekit_helper_invokes_persistent_helper_and_parses_json(self) -> None:
         temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_sck_helper_test_"))
         output_path = temp_dir / "capture.png"
+        helper_path = temp_dir / "ltspice-sck-helper"
 
         def _run_side_effect(cmd: list[str], **_: object) -> CompletedProcess[str]:
             output_path.write_bytes(b"\x89PNG\r\n\x1a\n")
@@ -55,7 +56,13 @@ class TestScreenCaptureKitPath(unittest.TestCase):
 
         with (
             patch("ltspice_mcp.ltspice.platform.system", return_value="Darwin"),
-            patch("ltspice_mcp.ltspice.shutil.which", return_value="/usr/bin/xcrun"),
+            patch(
+                "ltspice_mcp.ltspice._ensure_screencapturekit_helper",
+                return_value=(
+                    helper_path,
+                    {"helper_path": str(helper_path), "helper_source": "compiled_cache", "compiled": False},
+                ),
+            ),
             patch("ltspice_mcp.ltspice.subprocess.run", side_effect=_run_side_effect) as run_mock,
         ):
             payload = _capture_ltspice_window_with_screencapturekit(
@@ -69,8 +76,8 @@ class TestScreenCaptureKitPath(unittest.TestCase):
         self.assertIn("capture_diagnostics", payload)
         self.assertTrue(output_path.exists())
         cmd = run_mock.call_args[0][0]
-        self.assertEqual(cmd[:2], ["xcrun", "swift"])
-        self.assertEqual(cmd[-1], "foo.asc")
+        self.assertEqual(cmd[0], str(helper_path))
+        self.assertEqual(cmd[2], "foo.asc")
 
     def test_capture_ltspice_window_screenshot_uses_sck_and_background_open(self) -> None:
         temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_sck_path_test_"))

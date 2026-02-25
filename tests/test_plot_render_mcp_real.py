@@ -28,20 +28,36 @@ def _real_plot_tests_enabled() -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _sck_helper_runtime_available() -> tuple[bool, str]:
+    helper_override = os.getenv("LTSPICE_MCP_SCK_HELPER_PATH")
+    if helper_override:
+        helper_path = Path(helper_override).expanduser()
+        if helper_path.exists():
+            return True, ""
+        return False, f"LTSPICE_MCP_SCK_HELPER_PATH does not exist: {helper_path}"
+    if shutil.which("swiftc") is None:
+        return False, "swiftc is required to build the ScreenCaptureKit helper."
+    return True, ""
+
+
 def _extract_call_result(payload: Any) -> Any:
     structured = getattr(payload, "structuredContent", None)
     if structured is not None:
+        if isinstance(structured, dict) and "result" in structured:
+            return structured["result"]
         return structured
     content = getattr(payload, "content", None) or []
     if not content:
         return None
-    text = getattr(content[0], "text", None)
-    if text is None:
-        return None
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return text
+    for entry in content:
+        text = getattr(entry, "text", None)
+        if text is None:
+            continue
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return text
+    return None
 
 
 @unittest.skipUnless(platform.system() == "Darwin", "Real LTspice plot tests require macOS")
@@ -54,8 +70,9 @@ class TestPlotRenderMCPReal(unittest.TestCase):
             )
         if ClientSession is None or StdioServerParameters is None or stdio_client is None:
             raise unittest.SkipTest("MCP python client is not available in this environment.")
-        if shutil.which("xcrun") is None:
-            raise unittest.SkipTest("xcrun is required for ScreenCaptureKit capture.")
+        helper_ok, helper_reason = _sck_helper_runtime_available()
+        if not helper_ok:
+            raise unittest.SkipTest(helper_reason)
         ltspice_binary = os.getenv("LTSPICE_BINARY") or str(find_ltspice_executable() or "")
         if not ltspice_binary:
             raise unittest.SkipTest("LTspice binary not found.")

@@ -13,12 +13,15 @@ This implementation is inspired by:
 - Schematic UI single-window mode (enabled by default)
 - Batch simulation from netlist text or existing netlist file
 - Schematic generation (`.asc`) from structured data or pin-aware netlist auto-layout (`placement_mode=smart|legacy`)
+- Netlist auto-layout supports both two-pin primitives and multi-pin active elements (`X`, `Q`, `M`) when symbols resolve
 - Intent-driven circuit generation (filters, non-inverting amplifier, zener regulator)
-- Iterative schematic auto-debug loop with targeted fix application and rerun
+- Iterative schematic auto-debug loop with targeted fix application, convergence option fixes, and confidence scoring
 - LTspice symbol library inspection tools (lib.zip entry/symbol/pin/source queries)
-- Model management tools for missing include/model discovery, import, and netlist binding patching
+- Model management tools for missing include/model discovery, search-path suggestions, import, and netlist binding patching
+- Schematic lint tool with pin-connectivity, dangling-wire, and duplicate-reference checks
 - MCP-served image rendering for symbols, schematics, and plots
 - Deterministic plot presets (`bode`, `transient_startup`, `noise`, `step_compare`) backed by `.plt`
+- Tool-level performance telemetry with rolling timing stats and reset controls
 - JSON template-driven schematic generation
 - Netlist-file schematic sync/watch workflow with JSON state files
 - Run history with artifacts (`.log`, `.raw`, `.op.raw`)
@@ -77,6 +80,8 @@ Environment variables:
 - `LTSPICE_MCP_UI_ENABLED` (`true`/`false`)
 - `LTSPICE_MCP_SCHEMATIC_SINGLE_WINDOW` (`true`/`false`, default `true`)
 - `LTSPICE_MCP_SCHEMATIC_LIVE_PATH` (optional live schematic path override)
+- `LTSPICE_MCP_SCK_HELPER_DIR` (optional ScreenCaptureKit helper cache dir; default `~/Library/Application Support/ltspice-mcp/bin`)
+- `LTSPICE_MCP_SCK_HELPER_PATH` (optional absolute path to a prebuilt ScreenCaptureKit helper executable)
 
 ## MCP tools
 
@@ -110,6 +115,7 @@ Simulation and setup:
 - `syncSchematicFromNetlistFile`
 - `watchSchematicFromNetlistFile`
 - `validateSchematic`
+- `lintSchematic`
 - `loadCircuit`
 - `loadNetlistFromFile`
 - `runSimulation`
@@ -117,6 +123,8 @@ Simulation and setup:
 - `simulateNetlistFile`
 - `simulateSchematicFile`
 - `autoDebugSchematic`
+- `getToolTelemetry`
+- `resetToolTelemetry`
 - `scanModelIssues`
 - `importModelFile`
 - `patchNetlistModelBindings`
@@ -184,7 +192,7 @@ Per simulation call:
 ## Schematic generation
 
 - `createSchematic`: build `.asc` from explicit components/wires/labels/directives
-- `createSchematicFromNetlist`: parse a netlist and auto-place common two-pin primitives (`R`, `C`, `L`, `D`, `V`, `I`)
+- `createSchematicFromNetlist`: parse a netlist and auto-place primitives (`R`, `C`, `L`, `D`, `V`, `I`) and active multi-pin elements (`X`, `Q`, `M`) when symbols resolve
   - `placement_mode=smart` (default): net-layered, pin-aware placement and cleaner trunk routing
   - `placement_mode=legacy`: original simple grid layout
 - `listSchematicTemplates`: inspect built-in or user-supplied JSON templates
@@ -198,6 +206,7 @@ All create/sync/watch schematic tools return an `asc_path` and support `open_ui`
 
 Schematic debug workflow:
 - `validateSchematic`: preflight checks for `.asc` files (components, ground flag, simulation directives)
+- `lintSchematic`: deeper structural linting (pin connectivity, dangling wire endpoints, duplicate InstName detection)
 - `simulateSchematicFile`: runs `.asc` directly in batch mode and optionally includes preflight validation in the response
 - use `abort_on_validation_error=true` when you want to block execution until preflight issues are fixed
 - schematics generated from netlists/templates include a sidecar `.cir`; `simulateSchematicFile` prefers this sidecar for reliable batch execution
@@ -210,10 +219,14 @@ Template notes:
 - spec templates can include `sidecar_netlist_content` to emit a validated sidecar `.cir` next to `.asc`
 
 Model/debug workflow:
-- `scanModelIssues`: parse missing include/model/subckt diagnostics from logs
+- `scanModelIssues`: parse missing include/model/subckt diagnostics from logs and optionally scan model search paths for best-match suggestions
 - `importModelFile`: copy model files into `<workdir>/models` and return include directives + discovered `.subckt` names
 - `patchNetlistModelBindings`: add `.include` lines and remap model/subckt tokens in netlists
-- `autoDebugSchematic`: iterative validate/simulate/fix loop (preflight + floating-node bleeder fixes + optional model include injection)
+- `autoDebugSchematic`: iterative validate/simulate/fix loop (preflight + floating-node bleeder fixes + convergence option fixes + optional model include injection) with `confidence` scoring in output
+
+Telemetry:
+- `getToolTelemetry`: inspect rolling per-tool latency/call stats (`avg_ms`, `p50_ms`, `p95_ms`, error counts)
+- `resetToolTelemetry`: clear telemetry globally or for one tool
 
 ## LTspice library inspection
 
@@ -261,9 +274,13 @@ Downscale:
 
 LTspice screenshot behavior:
 - uses ScreenCaptureKit direct-window capture (`SCContentFilter(desktopIndependentWindow:)`) when `backend=ltspice`
+- runs capture through a persistent helper binary (`ltspice-sck-helper`) so macOS Screen Recording can be approved once per helper path
 - opens LTspice in the background (`open -g -j`) to reduce Space switching
 - captures the first frame from an `SCStream` for reliability, including LTspice windows that are off-screen/in other Spaces
 - returns detailed `capture_diagnostics` metadata (timing, preflight state, title matching, candidate window info)
+
+macOS Screen Recording tip:
+- if you use multiple MCP hosts/models, point them to the same helper path (`LTSPICE_MCP_SCK_HELPER_PATH`) or the same helper dir (`LTSPICE_MCP_SCK_HELPER_DIR`) to avoid repeated permission prompts.
 
 ## Run tests
 
@@ -292,3 +309,8 @@ python3 smoke_test_mcp.py \
 ```
 
 Run responses now include `diagnostics` with categories like `convergence`, `floating_node`, and `model_missing`, each with suggested fixes.
+
+## Changelog and compatibility
+
+- Changelog: [`CHANGELOG.md`](CHANGELOG.md)
+- Compatibility notes: [`COMPATIBILITY.md`](COMPATIBILITY.md)

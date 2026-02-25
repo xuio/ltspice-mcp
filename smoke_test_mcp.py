@@ -94,12 +94,15 @@ async def _run_smoke_test(args: argparse.Namespace) -> None:
                 "syncSchematicFromNetlistFile",
                 "watchSchematicFromNetlistFile",
                 "validateSchematic",
+                "lintSchematic",
                 "simulateNetlist",
                 "simulateSchematicFile",
                 "scanModelIssues",
                 "importModelFile",
                 "patchNetlistModelBindings",
                 "autoDebugSchematic",
+                "getToolTelemetry",
+                "resetToolTelemetry",
                 "getPlotNames",
                 "getVectorsInfo",
                 "getVectorData",
@@ -117,6 +120,7 @@ async def _run_smoke_test(args: argparse.Namespace) -> None:
 
             status = _extract_call_result(await session.call_tool("getLtspiceStatus", {}))
             _require(isinstance(status, dict), "getLtspiceStatus did not return an object")
+            _require(bool(status.get("mcp_server_version")), "getLtspiceStatus missing mcp_server_version")
             ltspice_executable = status.get("ltspice_executable")
             _require(ltspice_executable, "LTspice executable not detected by server")
             print(f"LTspice executable: {ltspice_executable}")
@@ -246,6 +250,16 @@ async def _run_smoke_test(args: argparse.Namespace) -> None:
             _require(isinstance(schematic_validation, dict), "validateSchematic did not return an object")
             _require(schematic_validation.get("valid") is True, "validateSchematic reported invalid template schematic")
             print("Schematic validation check passed")
+
+            schematic_lint = _extract_call_result(
+                await session.call_tool(
+                    "lintSchematic",
+                    {"asc_path": template_schematic.get("asc_path"), "strict": False},
+                )
+            )
+            _require(isinstance(schematic_lint, dict), "lintSchematic did not return an object")
+            _require("errors" in schematic_lint, "lintSchematic missing errors field")
+            print("Schematic lint check passed")
 
             schematic_run = _extract_call_result(
                 await session.call_tool(
@@ -448,49 +462,73 @@ C1 out 0 1u
             )
             print("Plot preset settings check passed")
 
-            preset_image = _extract_call_result(
+            plot_entries = [entry for entry in plots.get("plots", []) if isinstance(entry, dict)]
+            raw_candidates = [str(entry.get("raw_path", "")) for entry in plot_entries if entry.get("raw_path")]
+            session_raw_path = next(
+                (candidate for candidate in raw_candidates if not candidate.endswith(".op.raw")),
+                raw_candidates[0] if raw_candidates else None,
+            )
+            _require(bool(session_raw_path), "No RAW path available for render session")
+            render_session = _extract_call_result(
                 await session.call_tool(
-                    "renderLtspicePlotPresetImage",
-                    {
-                        "preset": "bode",
-                        "run_id": run_id,
-                        "downscale_factor": 0.5,
-                        "backend": "auto",
-                    },
+                    "startLtspiceRenderSession",
+                    {"path": session_raw_path},
                 )
             )
-            _require(isinstance(preset_image, dict), "renderLtspicePlotPresetImage did not return an object")
-            _require(Path(str(preset_image.get("image_path", ""))).exists(), "Preset image output missing")
-            _require(preset_image.get("plot_preset") == "bode", "Preset image metadata missing")
-            print("Plot preset image check passed")
+            _require(isinstance(render_session, dict), "startLtspiceRenderSession did not return an object")
+            render_session_id = render_session.get("render_session_id")
+            _require(bool(render_session_id), "startLtspiceRenderSession missing render_session_id")
+            try:
+                preset_image = _extract_call_result(
+                    await session.call_tool(
+                        "renderLtspicePlotPresetImage",
+                        {
+                            "preset": "bode",
+                            "run_id": run_id,
+                            "downscale_factor": 0.5,
+                            "backend": "auto",
+                            "render_session_id": render_session_id,
+                        },
+                    )
+                )
+                _require(isinstance(preset_image, dict), "renderLtspicePlotPresetImage did not return an object")
+                _require(Path(str(preset_image.get("image_path", ""))).exists(), "Preset image output missing")
+                _require(preset_image.get("plot_preset") == "bode", "Preset image metadata missing")
+                print("Plot preset image check passed")
 
-            plot_image = _extract_call_result(
-                await session.call_tool(
-                    "renderLtspicePlotImage",
-                    {
-                        "run_id": run_id,
-                        "vectors": ["V(out)"],
-                        "y_mode": "magnitude",
-                        "downscale_factor": 0.5,
-                        "backend": "auto",
-                        "validate_capture": False,
-                    },
+                plot_image = _extract_call_result(
+                    await session.call_tool(
+                        "renderLtspicePlotImage",
+                        {
+                            "run_id": run_id,
+                            "vectors": ["V(out)"],
+                            "y_mode": "magnitude",
+                            "downscale_factor": 0.5,
+                            "backend": "auto",
+                            "validate_capture": False,
+                            "render_session_id": render_session_id,
+                        },
+                    )
                 )
-            )
-            _require(isinstance(plot_image, dict), "renderLtspicePlotImage did not return an object")
-            plot_image_path = Path(plot_image.get("image_path", ""))
-            _require(plot_image_path.exists(), "renderLtspicePlotImage output missing")
-            _require(plot_image.get("backend_used") == "ltspice", "Plot image backend must be ltspice")
-            _require(
-                isinstance(plot_image.get("plot_settings"), dict) and plot_image["plot_settings"].get("plt_path"),
-                "Plot image response missing .plt metadata",
-            )
-            downscale_info = plot_image.get("downscale", {})
-            _require(
-                isinstance(downscale_info, dict) and (downscale_info.get("downscaled") is True or plot_image.get("downscale_factor") < 1.0),
-                "Plot image downscale metadata missing for ltspice backend",
-            )
-            print("Plot image render check passed")
+                _require(isinstance(plot_image, dict), "renderLtspicePlotImage did not return an object")
+                plot_image_path = Path(plot_image.get("image_path", ""))
+                _require(plot_image_path.exists(), "renderLtspicePlotImage output missing")
+                _require(plot_image.get("backend_used") == "ltspice", "Plot image backend must be ltspice")
+                _require(
+                    isinstance(plot_image.get("plot_settings"), dict) and plot_image["plot_settings"].get("plt_path"),
+                    "Plot image response missing .plt metadata",
+                )
+                downscale_info = plot_image.get("downscale", {})
+                _require(
+                    isinstance(downscale_info, dict) and (downscale_info.get("downscaled") is True or plot_image.get("downscale_factor") < 1.0),
+                    "Plot image downscale metadata missing for ltspice backend",
+                )
+                print("Plot image render check passed")
+            finally:
+                await session.call_tool(
+                    "endLtspiceRenderSession",
+                    {"render_session_id": render_session_id},
+                )
 
             extrema = _extract_call_result(
                 await session.call_tool(
@@ -645,6 +683,26 @@ C1 out 0 1u
             _require(isinstance(settling, dict), "getSettlingTime did not return an object")
             _require("settling_time_s" in settling, "getSettlingTime missing expected output")
             print("Settling-time check passed")
+
+            telemetry = _extract_call_result(
+                await session.call_tool(
+                    "getToolTelemetry",
+                    {"tool_name": "simulateNetlist"},
+                )
+            )
+            _require(isinstance(telemetry, dict), "getToolTelemetry did not return an object")
+            _require(telemetry.get("tool_count", 0) >= 1, "getToolTelemetry returned no entries")
+            print("Tool telemetry check passed")
+
+            telemetry_reset = _extract_call_result(
+                await session.call_tool(
+                    "resetToolTelemetry",
+                    {"tool_name": "simulateNetlist"},
+                )
+            )
+            _require(isinstance(telemetry_reset, dict), "resetToolTelemetry did not return an object")
+            _require(telemetry_reset.get("cleared", 0) >= 1, "resetToolTelemetry did not clear entries")
+            print("Tool telemetry reset check passed")
 
     print("MCP smoke test passed")
 

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import difflib
+import functools
+import inspect
 import json
 import math
 import mimetypes
@@ -9,8 +12,11 @@ import os
 import re
 import shutil
 import struct
+import time
 import uuid
 import zlib
+from collections import deque
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -18,6 +24,7 @@ from typing import Any
 import mcp.types as types
 from mcp.server.fastmcp import FastMCP
 
+from . import __version__ as LTSPICE_MCP_VERSION
 from .analysis import (
     compute_bandwidth,
     compute_gain_phase_margin,
@@ -99,6 +106,163 @@ _schematic_live_path: Path = (
 _symbol_library: SymbolLibrary | None = None
 _symbol_library_zip_path: Path | None = None
 _render_sessions: dict[str, dict[str, Any]] = {}
+_TOOL_TELEMETRY_WINDOW = max(10, int(os.getenv("LTSPICE_MCP_TELEMETRY_WINDOW", "200")))
+_tool_telemetry: dict[str, dict[str, Any]] = {}
+
+
+def _record_tool_telemetry(
+    *,
+    tool_name: str,
+    elapsed_ms: float,
+    success: bool,
+    error_type: str | None = None,
+) -> None:
+    now = datetime.now().isoformat()
+    entry = _tool_telemetry.setdefault(
+        tool_name,
+        {
+            "tool": tool_name,
+            "calls_total": 0,
+            "calls_ok": 0,
+            "calls_error": 0,
+            "total_ms": 0.0,
+            "min_ms": None,
+            "max_ms": None,
+            "last_ms": 0.0,
+            "last_status": "ok",
+            "last_error_type": None,
+            "last_started_at": None,
+            "last_finished_at": None,
+            "recent_ms": deque(maxlen=_TOOL_TELEMETRY_WINDOW),
+        },
+    )
+    recent_ms = entry["recent_ms"]
+    if not isinstance(recent_ms, deque):
+        recent_ms = deque(maxlen=_TOOL_TELEMETRY_WINDOW)
+        entry["recent_ms"] = recent_ms
+
+    entry["calls_total"] = int(entry["calls_total"]) + 1
+    if success:
+        entry["calls_ok"] = int(entry["calls_ok"]) + 1
+        entry["last_status"] = "ok"
+        entry["last_error_type"] = None
+    else:
+        entry["calls_error"] = int(entry["calls_error"]) + 1
+        entry["last_status"] = "error"
+        entry["last_error_type"] = error_type
+    entry["total_ms"] = float(entry["total_ms"]) + float(elapsed_ms)
+    min_ms = entry.get("min_ms")
+    max_ms = entry.get("max_ms")
+    entry["min_ms"] = float(elapsed_ms) if min_ms is None else min(float(min_ms), float(elapsed_ms))
+    entry["max_ms"] = float(elapsed_ms) if max_ms is None else max(float(max_ms), float(elapsed_ms))
+    entry["last_ms"] = float(elapsed_ms)
+    entry["last_finished_at"] = now
+    recent_ms.append(float(elapsed_ms))
+
+
+@contextmanager
+def _tool_telemetry_scope(tool_name: str):
+    started_perf = time.perf_counter()
+    started_wall = datetime.now().isoformat()
+    entry = _tool_telemetry.setdefault(
+        tool_name,
+        {
+            "tool": tool_name,
+            "calls_total": 0,
+            "calls_ok": 0,
+            "calls_error": 0,
+            "total_ms": 0.0,
+            "min_ms": None,
+            "max_ms": None,
+            "last_ms": 0.0,
+            "last_status": "ok",
+            "last_error_type": None,
+            "last_started_at": None,
+            "last_finished_at": None,
+            "recent_ms": deque(maxlen=_TOOL_TELEMETRY_WINDOW),
+        },
+    )
+    entry["last_started_at"] = started_wall
+    try:
+        yield
+    except Exception as exc:
+        elapsed_ms = (time.perf_counter() - started_perf) * 1000.0
+        _record_tool_telemetry(
+            tool_name=tool_name,
+            elapsed_ms=elapsed_ms,
+            success=False,
+            error_type=type(exc).__name__,
+        )
+        raise
+    elapsed_ms = (time.perf_counter() - started_perf) * 1000.0
+    _record_tool_telemetry(
+        tool_name=tool_name,
+        elapsed_ms=elapsed_ms,
+        success=True,
+        error_type=None,
+    )
+
+
+def _telemetry_tool(func):
+    signature = inspect.signature(func)
+    tool_name = func.__name__
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        with _tool_telemetry_scope(tool_name):
+            return func(*args, **kwargs)
+
+    wrapper.__signature__ = signature
+    return wrapper
+
+
+def _percentile(values: list[float], pct: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return float(ordered[0])
+    pct_clamped = max(0.0, min(1.0, float(pct)))
+    idx = int(round((len(ordered) - 1) * pct_clamped))
+    return float(ordered[idx])
+
+
+def _telemetry_payload() -> dict[str, Any]:
+    tools_payload: list[dict[str, Any]] = []
+    for tool_name, entry in sorted(_tool_telemetry.items()):
+        recent = list(entry.get("recent_ms") or [])
+        total = int(entry.get("calls_total", 0))
+        total_ms = float(entry.get("total_ms", 0.0))
+        avg_ms = (total_ms / total) if total > 0 else 0.0
+        tools_payload.append(
+            {
+                "tool": tool_name,
+                "calls_total": total,
+                "calls_ok": int(entry.get("calls_ok", 0)),
+                "calls_error": int(entry.get("calls_error", 0)),
+                "total_ms": round(total_ms, 3),
+                "avg_ms": round(avg_ms, 3),
+                "min_ms": round(float(entry["min_ms"]), 3) if entry.get("min_ms") is not None else None,
+                "max_ms": round(float(entry["max_ms"]), 3) if entry.get("max_ms") is not None else None,
+                "p50_ms": round(float(_percentile(recent, 0.50)), 3)
+                if _percentile(recent, 0.50) is not None
+                else None,
+                "p95_ms": round(float(_percentile(recent, 0.95)), 3)
+                if _percentile(recent, 0.95) is not None
+                else None,
+                "last_ms": round(float(entry.get("last_ms", 0.0)), 3),
+                "last_status": str(entry.get("last_status", "ok")),
+                "last_error_type": entry.get("last_error_type"),
+                "last_started_at": entry.get("last_started_at"),
+                "last_finished_at": entry.get("last_finished_at"),
+                "recent_sample_count": len(recent),
+            }
+        )
+    return {
+        "window_size": _TOOL_TELEMETRY_WINDOW,
+        "tool_count": len(tools_payload),
+        "tools": tools_payload,
+    }
 
 
 def _save_run_state() -> None:
@@ -1088,6 +1252,17 @@ _MISSING_MODEL_RE = re.compile(
     r"(?i)(?:can't find definition of model|unknown model|could not find model)\s*\"?([a-zA-Z0-9_.:$+-]+)\"?"
 )
 _SUBCKT_DEF_RE = re.compile(r"(?im)^\s*\.subckt\s+([^\s]+)")
+_MODEL_DEF_RE = re.compile(r"(?im)^\s*\.model\s+([^\s]+)")
+_CONVERGENCE_RE = re.compile(
+    r"(?i)(time step too small|convergence failed|gmin stepping failed|source stepping failed|newton iteration failed)"
+)
+_MODEL_FILE_SUFFIXES = {".lib", ".sub", ".mod", ".cir", ".spi", ".txt"}
+_DEFAULT_MODEL_SEARCH_PATHS = [
+    "~/Documents/LTspice/lib/sub",
+    "~/Documents/LTspiceXVII/lib/sub",
+    "/Applications/LTspice.app/Contents/lib/sub",
+    "/Applications/LTspice.app/Contents/lib/cmp",
+]
 
 
 def _normalize_intent(intent: str) -> str:
@@ -1140,6 +1315,229 @@ def _extract_model_issues_from_text(log_text: str) -> dict[str, Any]:
         "matched_lines": matched_lines,
         "has_model_issues": bool(missing_includes or missing_subcircuits or missing_models),
     }
+
+
+def _discover_model_names(model_text: str) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for match in _MODEL_DEF_RE.finditer(model_text):
+        name = match.group(1).strip()
+        lowered = name.lower()
+        if not name or lowered in seen:
+            continue
+        seen.add(lowered)
+        names.append(name)
+    return names
+
+
+def _resolve_model_search_paths(
+    *,
+    run_workdir: Path,
+    extra_paths: list[str] | None = None,
+    source_path: Path | None = None,
+) -> list[Path]:
+    candidates: list[Path] = []
+    if source_path is not None:
+        candidates.append(source_path.expanduser().resolve().parent)
+    candidates.append((run_workdir / "models").resolve())
+    candidates.append(run_workdir.resolve())
+    for default_path in _DEFAULT_MODEL_SEARCH_PATHS:
+        candidates.append(Path(default_path).expanduser().resolve())
+    for raw in extra_paths or []:
+        candidates.append(Path(raw).expanduser().resolve())
+
+    resolved: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if not candidate.exists() or not candidate.is_dir():
+            continue
+        resolved.append(candidate)
+    return resolved
+
+
+def _scan_model_inventory(
+    *,
+    search_paths: list[Path],
+    max_scan_files: int,
+) -> dict[str, Any]:
+    scanned_files: list[Path] = []
+    filename_to_paths: dict[str, list[Path]] = {}
+    subckt_index: dict[str, list[Path]] = {}
+    model_index: dict[str, list[Path]] = {}
+    max_files = max(1, int(max_scan_files))
+    truncated = False
+
+    for root in search_paths:
+        try:
+            iterator = root.rglob("*")
+        except Exception:
+            continue
+        for candidate in iterator:
+            if len(scanned_files) >= max_files:
+                truncated = True
+                break
+            if not candidate.is_file():
+                continue
+            if candidate.suffix.lower() not in _MODEL_FILE_SUFFIXES:
+                continue
+            scanned_files.append(candidate)
+            key = candidate.name.lower()
+            filename_to_paths.setdefault(key, []).append(candidate)
+
+            try:
+                text = read_text_auto(candidate)
+            except Exception:
+                continue
+            for subckt in _discover_subckt_names(text):
+                subckt_index.setdefault(subckt.lower(), []).append(candidate)
+            for model in _discover_model_names(text):
+                model_index.setdefault(model.lower(), []).append(candidate)
+        if truncated:
+            break
+
+    return {
+        "search_paths": [str(path) for path in search_paths],
+        "scanned_file_count": len(scanned_files),
+        "scan_truncated": truncated,
+        "files": scanned_files,
+        "filename_to_paths": filename_to_paths,
+        "subckt_index": subckt_index,
+        "model_index": model_index,
+    }
+
+
+def _rank_matches(target: str, candidates: list[str], *, limit: int = 5) -> list[dict[str, Any]]:
+    needle = target.strip().lower()
+    if not needle:
+        return []
+    normalized = sorted({candidate.strip() for candidate in candidates if candidate.strip()})
+    if not normalized:
+        return []
+    direct_hits = [candidate for candidate in normalized if needle == candidate.lower()]
+    contains_hits = [candidate for candidate in normalized if needle in candidate.lower() and candidate not in direct_hits]
+    fuzzy_hits = difflib.get_close_matches(needle, [item.lower() for item in normalized], n=limit * 2, cutoff=0.35)
+    lookup = {item.lower(): item for item in normalized}
+    ordered: list[str] = []
+    for entry in [*direct_hits, *contains_hits, *[lookup[item] for item in fuzzy_hits if item in lookup]]:
+        if entry in ordered:
+            continue
+        ordered.append(entry)
+        if len(ordered) >= limit:
+            break
+    ranked: list[dict[str, Any]] = []
+    for entry in ordered:
+        score = difflib.SequenceMatcher(a=needle, b=entry.lower()).ratio()
+        ranked.append({"candidate": entry, "score": round(float(score), 4)})
+    return ranked
+
+
+def _suggest_model_resolutions(
+    *,
+    issues: dict[str, Any],
+    inventory: dict[str, Any],
+    limit_per_issue: int = 5,
+) -> list[dict[str, Any]]:
+    suggestions: list[dict[str, Any]] = []
+    filename_map = inventory.get("filename_to_paths", {})
+    subckt_index = inventory.get("subckt_index", {})
+    model_index = inventory.get("model_index", {})
+
+    for missing_include in issues.get("missing_include_files", []):
+        filename = Path(str(missing_include)).name.lower()
+        direct_paths = [str(path) for path in filename_map.get(filename, [])]
+        ranked_names = _rank_matches(
+            filename,
+            list(filename_map.keys()),
+            limit=limit_per_issue,
+        )
+        ranked_paths: list[dict[str, Any]] = []
+        for ranked in ranked_names:
+            candidate_name = str(ranked["candidate"]).lower()
+            for candidate_path in filename_map.get(candidate_name, [])[:limit_per_issue]:
+                ranked_paths.append(
+                    {
+                        "path": str(candidate_path),
+                        "score": ranked["score"],
+                    }
+                )
+                if len(ranked_paths) >= limit_per_issue:
+                    break
+            if len(ranked_paths) >= limit_per_issue:
+                break
+        suggestions.append(
+            {
+                "issue_type": "missing_include_file",
+                "missing": missing_include,
+                "direct_matches": direct_paths[:limit_per_issue],
+                "best_matches": ranked_paths,
+            }
+        )
+
+    for missing_subckt in issues.get("missing_subcircuits", []):
+        direct = [str(path) for path in subckt_index.get(str(missing_subckt).lower(), [])]
+        ranked = _rank_matches(
+            str(missing_subckt),
+            list(subckt_index.keys()),
+            limit=limit_per_issue,
+        )
+        ranked_paths: list[dict[str, Any]] = []
+        for item in ranked:
+            candidate = str(item["candidate"]).lower()
+            for source in subckt_index.get(candidate, [])[:limit_per_issue]:
+                ranked_paths.append(
+                    {
+                        "name": item["candidate"],
+                        "path": str(source),
+                        "score": item["score"],
+                    }
+                )
+                if len(ranked_paths) >= limit_per_issue:
+                    break
+            if len(ranked_paths) >= limit_per_issue:
+                break
+        suggestions.append(
+            {
+                "issue_type": "missing_subcircuit",
+                "missing": missing_subckt,
+                "direct_matches": direct[:limit_per_issue],
+                "best_matches": ranked_paths,
+            }
+        )
+
+    for missing_model in issues.get("missing_models", []):
+        direct = [str(path) for path in model_index.get(str(missing_model).lower(), [])]
+        ranked = _rank_matches(
+            str(missing_model),
+            list(model_index.keys()),
+            limit=limit_per_issue,
+        )
+        ranked_paths: list[dict[str, Any]] = []
+        for item in ranked:
+            candidate = str(item["candidate"]).lower()
+            for source in model_index.get(candidate, [])[:limit_per_issue]:
+                ranked_paths.append(
+                    {
+                        "name": item["candidate"],
+                        "path": str(source),
+                        "score": item["score"],
+                    }
+                )
+                if len(ranked_paths) >= limit_per_issue:
+                    break
+            if len(ranked_paths) >= limit_per_issue:
+                break
+        suggestions.append(
+            {
+                "issue_type": "missing_model",
+                "missing": missing_model,
+                "direct_matches": direct[:limit_per_issue],
+                "best_matches": ranked_paths,
+            }
+        )
+    return suggestions
 
 
 def _extract_floating_nodes(messages: list[str]) -> list[str]:
@@ -1277,6 +1675,78 @@ def _discover_subckt_names(model_text: str) -> list[str]:
     return names
 
 
+def _has_convergence_issue(messages: list[str]) -> bool:
+    return any(_CONVERGENCE_RE.search(message or "") for message in messages)
+
+
+def _apply_convergence_options(netlist_path: Path) -> list[str]:
+    convergence_lines = [
+        ".options reltol=0.01 abstol=1e-9 vntol=1e-6 gmin=1e-12",
+        ".options method=gear",
+    ]
+    return _append_lines_if_missing(netlist_path, convergence_lines)
+
+
+def _confidence_label(score: float) -> str:
+    if score >= 0.75:
+        return "high"
+    if score >= 0.5:
+        return "medium"
+    return "low"
+
+
+def _compute_auto_debug_confidence(
+    *,
+    succeeded: bool,
+    final_result: dict[str, Any] | None,
+    actions_applied: list[dict[str, Any]],
+    iterations_run: int,
+) -> dict[str, Any]:
+    score = 0.2
+    factors: list[dict[str, Any]] = []
+
+    if succeeded:
+        score += 0.4
+        factors.append({"factor": "run_succeeded", "delta": 0.4})
+    else:
+        factors.append({"factor": "run_failed", "delta": 0.0})
+
+    if final_result is not None and not final_result.get("issues"):
+        score += 0.2
+        factors.append({"factor": "no_remaining_issues", "delta": 0.2})
+    else:
+        remaining = len(final_result.get("issues", [])) if isinstance(final_result, dict) else 1
+        penalty = min(0.2, 0.05 * max(1, remaining))
+        score -= penalty
+        factors.append({"factor": "remaining_issues", "delta": -round(penalty, 4)})
+
+    if actions_applied:
+        delta = min(0.15, 0.03 * len(actions_applied))
+        score += delta
+        factors.append({"factor": "fixes_applied", "delta": round(delta, 4)})
+
+    if iterations_run > 1:
+        delta = min(0.1, 0.02 * (iterations_run - 1))
+        score += delta
+        factors.append({"factor": "iterative_progress", "delta": round(delta, 4)})
+
+    diagnostics = final_result.get("diagnostics", []) if isinstance(final_result, dict) else []
+    error_diags = [
+        item for item in diagnostics if isinstance(item, dict) and str(item.get("severity", "")).lower() == "error"
+    ]
+    if error_diags:
+        penalty = min(0.2, 0.03 * len(error_diags))
+        score -= penalty
+        factors.append({"factor": "error_diagnostics", "delta": -round(penalty, 4)})
+
+    clamped = max(0.0, min(1.0, score))
+    return {
+        "score": round(clamped, 4),
+        "label": _confidence_label(clamped),
+        "factors": factors,
+    }
+
+
 _PLOT_PRESETS: dict[str, dict[str, Any]] = {
     "bode": {
         "mode": "db",
@@ -1408,15 +1878,179 @@ def _validate_schematic_file(path: Path) -> dict[str, Any]:
     }
 
 
+def _lint_schematic_file(
+    path: Path,
+    *,
+    library: SymbolLibrary | None,
+    strict: bool = False,
+) -> dict[str, Any]:
+    validation = _validate_schematic_file(path)
+    text = path.read_text(encoding="utf-8", errors="ignore")
+
+    components: list[dict[str, Any]] = []
+    current_component: dict[str, Any] | None = None
+    wires: list[tuple[int, int, int, int]] = []
+    flags: dict[tuple[int, int], list[str]] = {}
+    errors: list[str] = list(validation.get("issues", []))
+    warnings: list[str] = list(validation.get("warnings", []))
+
+    for line_no, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split()
+        keyword = parts[0]
+        if keyword == "SYMBOL" and len(parts) >= 5:
+            try:
+                component = {
+                    "symbol": parts[1],
+                    "x": int(parts[2]),
+                    "y": int(parts[3]),
+                    "orientation": parts[4],
+                    "reference": None,
+                    "line": line_no,
+                }
+            except Exception:
+                warnings.append(f"Could not parse SYMBOL line {line_no}: {line}")
+                current_component = None
+                continue
+            components.append(component)
+            current_component = component
+            continue
+        if keyword == "SYMATTR" and len(parts) >= 3 and parts[1].lower() == "instname":
+            if current_component is not None:
+                current_component["reference"] = " ".join(parts[2:])
+            continue
+        if keyword == "WIRE" and len(parts) >= 5:
+            try:
+                wires.append((int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4])))
+            except Exception:
+                warnings.append(f"Could not parse WIRE line {line_no}: {line}")
+            continue
+        if keyword == "FLAG" and len(parts) >= 4:
+            try:
+                point = (int(parts[1]), int(parts[2]))
+            except Exception:
+                warnings.append(f"Could not parse FLAG line {line_no}: {line}")
+                continue
+            flags.setdefault(point, []).append(parts[3])
+
+    refs_seen: dict[str, int] = {}
+    for component in components:
+        reference = str(component.get("reference") or "").strip()
+        if not reference:
+            errors.append(f"Component '{component['symbol']}' at line {component['line']} is missing InstName.")
+            continue
+        lowered = reference.lower()
+        if lowered in refs_seen:
+            errors.append(
+                f"Duplicate InstName '{reference}' at line {component['line']} (already seen at line {refs_seen[lowered]})."
+            )
+        else:
+            refs_seen[lowered] = int(component["line"])
+
+    wire_endpoint_degree: dict[tuple[int, int], int] = {}
+    for x1, y1, x2, y2 in wires:
+        wire_endpoint_degree[(x1, y1)] = wire_endpoint_degree.get((x1, y1), 0) + 1
+        wire_endpoint_degree[(x2, y2)] = wire_endpoint_degree.get((x2, y2), 0) + 1
+    wire_endpoints = set(wire_endpoint_degree.keys())
+
+    connected_pin_points: set[tuple[int, int]] = set()
+    pin_lint: list[dict[str, Any]] = []
+    unresolved_symbol_count = 0
+    if library is not None:
+        for component in components:
+            symbol = str(component["symbol"])
+            reference = str(component.get("reference") or f"{symbol}@line{component['line']}")
+            try:
+                pin_count = len(library.get(symbol).pins)
+            except Exception:
+                unresolved_symbol_count += 1
+                warnings.append(
+                    f"Could not resolve symbol '{symbol}' for component '{reference}'; pin-level lint skipped."
+                )
+                continue
+            connected = 0
+            unconnected_pins: list[int] = []
+            for pin_order in range(1, pin_count + 1):
+                try:
+                    dx, dy = library.pin_offset(symbol, str(component["orientation"]), pin_order)
+                except Exception:
+                    continue
+                point = (int(component["x"]) + dx, int(component["y"]) + dy)
+                if point in wire_endpoints or point in flags:
+                    connected += 1
+                    connected_pin_points.add(point)
+                else:
+                    unconnected_pins.append(pin_order)
+            if connected == 0:
+                errors.append(f"Component '{reference}' has no connected pins.")
+            elif unconnected_pins:
+                message = f"Component '{reference}' has unconnected pins: {unconnected_pins}."
+                if strict:
+                    errors.append(message)
+                else:
+                    warnings.append(message)
+            pin_lint.append(
+                {
+                    "reference": reference,
+                    "symbol": symbol,
+                    "pin_count": pin_count,
+                    "connected_pin_count": connected,
+                    "unconnected_pins": unconnected_pins,
+                }
+            )
+
+    dangling_wire_endpoints: list[tuple[int, int]] = []
+    for point, degree in wire_endpoint_degree.items():
+        if point in connected_pin_points or point in flags:
+            continue
+        if degree <= 1:
+            dangling_wire_endpoints.append(point)
+    if dangling_wire_endpoints:
+        message = (
+            f"Dangling wire endpoints detected: {dangling_wire_endpoints[:20]}"
+            + (" ..." if len(dangling_wire_endpoints) > 20 else "")
+        )
+        if strict:
+            errors.append(message)
+        else:
+            warnings.append(message)
+
+    for point, names in flags.items():
+        unique_names = sorted({name.strip() for name in names if name.strip()})
+        if len(unique_names) > 1:
+            warnings.append(
+                f"Multiple net labels at point {point}: {unique_names}. Verify this is intentional."
+            )
+
+    return {
+        "asc_path": str(path),
+        "valid": len(errors) == 0,
+        "strict": bool(strict),
+        "errors": errors,
+        "warnings": warnings,
+        "component_count": len(components),
+        "wire_count": len(wires),
+        "flag_count": sum(len(values) for values in flags.values()),
+        "unresolved_symbol_count": unresolved_symbol_count,
+        "dangling_wire_endpoint_count": len(dangling_wire_endpoints),
+        "pin_lint": pin_lint,
+        "validation": validation,
+    }
+
+
 _load_run_state()
 
 
 @mcp.tool()
+@_telemetry_tool
 def getLtspiceStatus() -> dict[str, Any]:
     """Get LTspice executable status and server configuration."""
     executable = _runner.executable or find_ltspice_executable()
     version = get_ltspice_version(executable) if executable else None
     return {
+        "mcp_server_version": LTSPICE_MCP_VERSION,
         "ltspice_executable": str(executable) if executable else None,
         "ltspice_version": version,
         "workdir": str(_runner.workdir),
@@ -1550,6 +2184,7 @@ def getLtspiceSymbolInfo(
 
 
 @mcp.tool()
+@_telemetry_tool
 def renderLtspiceSymbolImage(
     symbol: str,
     output_path: str | None = None,
@@ -1640,6 +2275,7 @@ def renderLtspiceSymbolImage(
 
 
 @mcp.tool()
+@_telemetry_tool
 def renderLtspiceSchematicImage(
     asc_path: str,
     output_path: str | None = None,
@@ -1725,6 +2361,7 @@ def renderLtspiceSchematicImage(
 
 
 @mcp.tool()
+@_telemetry_tool
 def renderLtspicePlotImage(
     vectors: list[str],
     plot: str | None = None,
@@ -2013,6 +2650,7 @@ def renderLtspicePlotPresetImage(
     settle_seconds: float = 1.0,
     downscale_factor: float = 1.0,
     validate_capture: bool = True,
+    render_session_id: str | None = None,
 ) -> types.CallToolResult:
     """Render a plot image using a built-in deterministic preset."""
     normalized_preset = _normalize_plot_preset(preset)
@@ -2034,6 +2672,7 @@ def renderLtspicePlotPresetImage(
         dual_axis=bool(settings["dual_axis"]),
         pane_layout=str(settings["pane_layout"]),
         validate_capture=validate_capture,
+        render_session_id=render_session_id,
     )
     payload = result.structuredContent
     if not isinstance(payload, dict):
@@ -2129,6 +2768,7 @@ def openLtspiceUi(
 
 
 @mcp.tool()
+@_telemetry_tool
 def createSchematic(
     components: list[dict[str, Any]],
     wires: list[dict[str, Any]] | None = None,
@@ -2173,6 +2813,7 @@ def createSchematic(
 
 
 @mcp.tool()
+@_telemetry_tool
 def createSchematicFromNetlist(
     netlist_content: str,
     circuit_name: str = "schematic_from_netlist",
@@ -2183,9 +2824,10 @@ def createSchematicFromNetlist(
     open_ui: bool | None = None,
 ) -> dict[str, Any]:
     """
-    Create an LTspice .asc schematic from a SPICE netlist using simple auto-placement/routing.
+    Create an LTspice .asc schematic from a SPICE netlist using auto-placement/routing.
 
-    Currently supports common two-pin primitives (R, C, L, D, V, I).
+    Supports common two-pin primitives (R, C, L, D, V, I) plus multi-pin active elements
+    such as X-subcircuits, BJTs (Q), and MOSFETs (M) when symbols can be resolved.
     """
     result = build_schematic_from_netlist(
         workdir=_runner.workdir,
@@ -2215,6 +2857,7 @@ def listSchematicTemplates(template_path: str | None = None) -> dict[str, Any]:
 
 
 @mcp.tool()
+@_telemetry_tool
 def createSchematicFromTemplate(
     template_name: str,
     parameters: dict[str, Any] | None = None,
@@ -2255,6 +2898,7 @@ def createSchematicFromTemplate(
 
 
 @mcp.tool()
+@_telemetry_tool
 def listIntentCircuitTemplates() -> dict[str, Any]:
     """List high-level circuit intent templates and default parameters."""
     intents: list[dict[str, Any]] = []
@@ -2270,6 +2914,7 @@ def listIntentCircuitTemplates() -> dict[str, Any]:
 
 
 @mcp.tool()
+@_telemetry_tool
 def createIntentCircuit(
     intent: str,
     parameters: dict[str, Any] | None = None,
@@ -2321,6 +2966,7 @@ def createIntentCircuit(
 
 
 @mcp.tool()
+@_telemetry_tool
 def syncSchematicFromNetlistFile(
     netlist_path: str,
     circuit_name: str | None = None,
@@ -2361,6 +3007,7 @@ def syncSchematicFromNetlistFile(
 
 
 @mcp.tool()
+@_telemetry_tool
 def watchSchematicFromNetlistFile(
     netlist_path: str,
     circuit_name: str | None = None,
@@ -2448,6 +3095,7 @@ def loadNetlistFromFile(filepath: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+@_telemetry_tool
 def runSimulation(
     command: str = "",
     ascii_raw: bool = False,
@@ -2485,6 +3133,7 @@ def runSimulation(
 
 
 @mcp.tool()
+@_telemetry_tool
 def simulateNetlist(
     netlist_content: str,
     circuit_name: str = "circuit",
@@ -2512,6 +3161,7 @@ def simulateNetlist(
 
 
 @mcp.tool()
+@_telemetry_tool
 def simulateNetlistFile(
     netlist_path: str,
     ascii_raw: bool = False,
@@ -2546,13 +3196,44 @@ def validateSchematic(asc_path: str) -> dict[str, Any]:
 
     Checks for components, ground flag, and simulation directives in TEXT commands.
     """
-    path = Path(asc_path).expanduser().resolve()
-    if not path.exists():
-        raise FileNotFoundError(f"Schematic file not found: {path}")
-    return _validate_schematic_file(path)
+    with _tool_telemetry_scope("validateSchematic"):
+        path = Path(asc_path).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Schematic file not found: {path}")
+        return _validate_schematic_file(path)
 
 
 @mcp.tool()
+def lintSchematic(
+    asc_path: str,
+    strict: bool = False,
+    lib_zip_path: str | None = None,
+) -> dict[str, Any]:
+    """Run structural lint checks on a schematic, including pin connectivity and dangling wires."""
+    with _tool_telemetry_scope("lintSchematic"):
+        path = Path(asc_path).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Schematic file not found: {path}")
+        symbol_lib: SymbolLibrary | None
+        symbol_lib_error: str | None = None
+        try:
+            symbol_lib = _resolve_symbol_library(lib_zip_path)
+        except Exception as exc:
+            symbol_lib = None
+            symbol_lib_error = str(exc)
+        payload = _lint_schematic_file(path, library=symbol_lib, strict=strict)
+        if symbol_lib_error:
+            payload.setdefault("warnings", []).append(
+                f"Symbol library unavailable for pin-level lint: {symbol_lib_error}"
+            )
+            payload["symbol_library_available"] = False
+        else:
+            payload["symbol_library_available"] = True
+        return payload
+
+
+@mcp.tool()
+@_telemetry_tool
 def simulateSchematicFile(
     asc_path: str,
     ascii_raw: bool = False,
@@ -2617,40 +3298,77 @@ def simulateSchematicFile(
 def scanModelIssues(
     run_id: str | None = None,
     log_path: str | None = None,
+    search_paths: list[str] | None = None,
+    suggest_matches: bool = True,
+    max_scan_files: int = 300,
+    max_suggestions_per_issue: int = 5,
 ) -> dict[str, Any]:
     """Scan LTspice log text for missing model/include/subcircuit issues."""
-    resolved_log: Path | None = None
-    source_run_id: str | None = None
-    if log_path:
-        resolved_log = Path(log_path).expanduser().resolve()
-    else:
-        run = _resolve_run(run_id)
-        source_run_id = run.run_id
-        resolved_log = run.log_path
-    if resolved_log is None or not resolved_log.exists():
-        return {
-            "run_id": source_run_id or run_id,
-            "log_path": str(resolved_log) if resolved_log else None,
-            "has_model_issues": False,
-            "missing_include_files": [],
-            "missing_subcircuits": [],
-            "missing_models": [],
-            "matched_lines": [],
+    with _tool_telemetry_scope("scanModelIssues"):
+        resolved_log: Path | None = None
+        source_run_id: str | None = None
+        source_path: Path | None = None
+        if log_path:
+            resolved_log = Path(log_path).expanduser().resolve()
+        else:
+            run = _resolve_run(run_id)
+            source_run_id = run.run_id
+            source_path = run.netlist_path
+            resolved_log = run.log_path
+        if resolved_log is None or not resolved_log.exists():
+            return {
+                "run_id": source_run_id or run_id,
+                "log_path": str(resolved_log) if resolved_log else None,
+                "has_model_issues": False,
+                "missing_include_files": [],
+                "missing_subcircuits": [],
+                "missing_models": [],
+                "matched_lines": [],
+                "resolution_suggestions": [],
+            }
+        text = read_text_auto(resolved_log)
+        payload = _extract_model_issues_from_text(text)
+        payload["run_id"] = source_run_id or run_id
+        payload["log_path"] = str(resolved_log)
+        payload["suggestions"] = []
+        if payload["missing_include_files"]:
+            payload["suggestions"].append(
+                "Import missing files with importModelFile and add .include lines via patchNetlistModelBindings."
+            )
+        if payload["missing_subcircuits"] or payload["missing_models"]:
+            payload["suggestions"].append(
+                "Use patchNetlistModelBindings with subckt_aliases/model_aliases to remap references."
+            )
+
+        payload["resolution_suggestions"] = []
+        payload["model_search"] = {
+            "search_paths": [],
+            "scanned_file_count": 0,
+            "scan_truncated": False,
+            "enabled": bool(suggest_matches),
         }
-    text = read_text_auto(resolved_log)
-    payload = _extract_model_issues_from_text(text)
-    payload["run_id"] = source_run_id or run_id
-    payload["log_path"] = str(resolved_log)
-    payload["suggestions"] = []
-    if payload["missing_include_files"]:
-        payload["suggestions"].append(
-            "Import missing files with importModelFile and add .include lines via patchNetlistModelBindings."
-        )
-    if payload["missing_subcircuits"] or payload["missing_models"]:
-        payload["suggestions"].append(
-            "Use patchNetlistModelBindings with subckt_aliases/model_aliases to remap references."
-        )
-    return payload
+        if payload["has_model_issues"] and suggest_matches:
+            resolved_search_paths = _resolve_model_search_paths(
+                run_workdir=_runner.workdir,
+                extra_paths=search_paths,
+                source_path=source_path,
+            )
+            inventory = _scan_model_inventory(
+                search_paths=resolved_search_paths,
+                max_scan_files=max_scan_files,
+            )
+            payload["resolution_suggestions"] = _suggest_model_resolutions(
+                issues=payload,
+                inventory=inventory,
+                limit_per_issue=max_suggestions_per_issue,
+            )
+            payload["model_search"] = {
+                "search_paths": inventory["search_paths"],
+                "scanned_file_count": inventory["scanned_file_count"],
+                "scan_truncated": inventory["scan_truncated"],
+                "enabled": True,
+            }
+        return payload
 
 
 @mcp.tool()
@@ -2660,33 +3378,35 @@ def importModelFile(
     models_dir: str | None = None,
 ) -> dict[str, Any]:
     """Import a model file into the MCP workdir for reproducible .include usage."""
-    source = Path(source_path).expanduser().resolve()
-    if not source.exists():
-        raise FileNotFoundError(f"Model file not found: {source}")
-    if not source.is_file():
-        raise ValueError(f"Model source_path must be a file: {source}")
-    target_dir = (
-        Path(models_dir).expanduser().resolve()
-        if models_dir
-        else (_runner.workdir / "models").resolve()
-    )
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target_name = destination_name or source.name
-    target = (target_dir / target_name).resolve()
-    if target.exists() and target.read_bytes() == source.read_bytes():
-        imported = False
-    else:
-        shutil.copy2(source, target)
-        imported = True
+    with _tool_telemetry_scope("importModelFile"):
+        source = Path(source_path).expanduser().resolve()
+        if not source.exists():
+            raise FileNotFoundError(f"Model file not found: {source}")
+        if not source.is_file():
+            raise ValueError(f"Model source_path must be a file: {source}")
+        target_dir = (
+            Path(models_dir).expanduser().resolve()
+            if models_dir
+            else (_runner.workdir / "models").resolve()
+        )
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_name = destination_name or source.name
+        target = (target_dir / target_name).resolve()
+        if target.exists() and target.read_bytes() == source.read_bytes():
+            imported = False
+        else:
+            shutil.copy2(source, target)
+            imported = True
 
-    model_text = read_text_auto(target)
-    return {
-        "source_path": str(source),
-        "model_path": str(target),
-        "imported": imported,
-        "include_directive": f'.include "{target}"',
-        "subckt_names": _discover_subckt_names(model_text),
-    }
+        model_text = read_text_auto(target)
+        return {
+            "source_path": str(source),
+            "model_path": str(target),
+            "imported": imported,
+            "include_directive": f'.include "{target}"',
+            "subckt_names": _discover_subckt_names(model_text),
+            "model_names": _discover_model_names(model_text),
+        }
 
 
 @mcp.tool()
@@ -2698,77 +3418,78 @@ def patchNetlistModelBindings(
     backup: bool = True,
 ) -> dict[str, Any]:
     """Patch netlist model bindings by adding includes and remapping model/subckt names."""
-    path = Path(netlist_path).expanduser().resolve()
-    if not path.exists():
-        raise FileNotFoundError(f"Netlist file not found: {path}")
-    if not path.is_file():
-        raise ValueError(f"netlist_path must be a file: {path}")
+    with _tool_telemetry_scope("patchNetlistModelBindings"):
+        path = Path(netlist_path).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Netlist file not found: {path}")
+        if not path.is_file():
+            raise ValueError(f"netlist_path must be a file: {path}")
 
-    backup_path: Path | None = None
-    original_text = path.read_text(encoding="utf-8", errors="ignore")
-    if backup:
-        backup_path = path.with_suffix(path.suffix + ".bak")
-        backup_path.write_text(original_text, encoding="utf-8")
+        backup_path: Path | None = None
+        original_text = path.read_text(encoding="utf-8", errors="ignore")
+        if backup:
+            backup_path = path.with_suffix(path.suffix + ".bak")
+            backup_path.write_text(original_text, encoding="utf-8")
 
-    include_lines: list[str] = []
-    for raw_include in include_files or []:
-        include_target = Path(raw_include).expanduser().resolve()
-        include_lines.append(f'.include "{include_target}"')
-    added_include_lines = _append_lines_if_missing(path, include_lines) if include_lines else []
+        include_lines: list[str] = []
+        for raw_include in include_files or []:
+            include_target = Path(raw_include).expanduser().resolve()
+            include_lines.append(f'.include "{include_target}"')
+        added_include_lines = _append_lines_if_missing(path, include_lines) if include_lines else []
 
-    subckt_lookup = {
-        str(key).strip().lower(): str(value).strip()
-        for key, value in (subckt_aliases or {}).items()
-        if str(key).strip() and str(value).strip()
-    }
-    model_lookup = {
-        str(key).strip().lower(): str(value).strip()
-        for key, value in (model_aliases or {}).items()
-        if str(key).strip() and str(value).strip()
-    }
-    model_pattern = None
-    if model_lookup:
-        model_pattern = re.compile(
-            r"\b(" + "|".join(re.escape(key) for key in sorted(model_lookup.keys(), key=len, reverse=True)) + r")\b",
-            re.IGNORECASE,
-        )
+        subckt_lookup = {
+            str(key).strip().lower(): str(value).strip()
+            for key, value in (subckt_aliases or {}).items()
+            if str(key).strip() and str(value).strip()
+        }
+        model_lookup = {
+            str(key).strip().lower(): str(value).strip()
+            for key, value in (model_aliases or {}).items()
+            if str(key).strip() and str(value).strip()
+        }
+        model_pattern = None
+        if model_lookup:
+            model_pattern = re.compile(
+                r"\b(" + "|".join(re.escape(key) for key in sorted(model_lookup.keys(), key=len, reverse=True)) + r")\b",
+                re.IGNORECASE,
+            )
 
-    updated_lines: list[str] = []
-    replacement_count = 0
-    for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-        line = raw_line
-        stripped = raw_line.strip()
-        if stripped and not stripped.startswith("*"):
-            tokens = raw_line.split()
-            if tokens and tokens[0][:1].upper() == "X" and subckt_lookup:
-                model_idx = len(tokens) - 1
-                while model_idx > 0 and "=" in tokens[model_idx]:
-                    model_idx -= 1
-                old_symbol = tokens[model_idx]
-                new_symbol = subckt_lookup.get(old_symbol.lower())
-                if new_symbol and new_symbol != old_symbol:
-                    tokens[model_idx] = new_symbol
-                    line = " ".join(tokens)
-                    replacement_count += 1
-            if model_pattern is not None:
-                replaced_line = model_pattern.sub(
-                    lambda match: model_lookup.get(match.group(1).lower(), match.group(1)),
-                    line,
-                )
-                if replaced_line != line:
-                    replacement_count += 1
-                line = replaced_line
-        updated_lines.append(line)
+        updated_lines: list[str] = []
+        replacement_count = 0
+        for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw_line
+            stripped = raw_line.strip()
+            if stripped and not stripped.startswith("*"):
+                tokens = raw_line.split()
+                if tokens and tokens[0][:1].upper() == "X" and subckt_lookup:
+                    model_idx = len(tokens) - 1
+                    while model_idx > 0 and "=" in tokens[model_idx]:
+                        model_idx -= 1
+                    old_symbol = tokens[model_idx]
+                    new_symbol = subckt_lookup.get(old_symbol.lower())
+                    if new_symbol and new_symbol != old_symbol:
+                        tokens[model_idx] = new_symbol
+                        line = " ".join(tokens)
+                        replacement_count += 1
+                if model_pattern is not None:
+                    replaced_line = model_pattern.sub(
+                        lambda match: model_lookup.get(match.group(1).lower(), match.group(1)),
+                        line,
+                    )
+                    if replaced_line != line:
+                        replacement_count += 1
+                    line = replaced_line
+            updated_lines.append(line)
 
-    path.write_text("\n".join(updated_lines).rstrip() + "\n", encoding="utf-8")
-    return {
-        "netlist_path": str(path),
-        "backup_path": str(backup_path) if backup_path else None,
-        "include_lines_added": added_include_lines,
-        "replacements": replacement_count,
-        "subckt_aliases": subckt_lookup,
-        "model_aliases": model_lookup,
-    }
+        path.write_text("\n".join(updated_lines).rstrip() + "\n", encoding="utf-8")
+        return {
+            "netlist_path": str(path),
+            "backup_path": str(backup_path) if backup_path else None,
+            "include_lines_added": added_include_lines,
+            "replacements": replacement_count,
+            "subckt_aliases": subckt_lookup,
+            "model_aliases": model_lookup,
+        }
 
 
 @mcp.tool()
@@ -2782,129 +3503,211 @@ def autoDebugSchematic(
     auto_fix_preflight: bool = True,
     auto_fix_runtime: bool = True,
     auto_import_models: bool = False,
+    auto_fix_convergence: bool = True,
+    model_search_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Iteratively validate, simulate, and apply targeted fixes to a schematic until it runs or stalls.
     """
-    if max_iterations <= 0:
-        raise ValueError("max_iterations must be > 0")
-    path = Path(asc_path).expanduser().resolve()
-    if not path.exists():
-        raise FileNotFoundError(f"Schematic file not found: {path}")
+    with _tool_telemetry_scope("autoDebugSchematic"):
+        if max_iterations <= 0:
+            raise ValueError("max_iterations must be > 0")
+        path = Path(asc_path).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Schematic file not found: {path}")
 
-    history: list[dict[str, Any]] = []
-    final_result: dict[str, Any] | None = None
-    all_actions: list[dict[str, Any]] = []
+        history: list[dict[str, Any]] = []
+        final_result: dict[str, Any] | None = None
+        all_actions: list[dict[str, Any]] = []
 
-    for iteration in range(1, max_iterations + 1):
-        validation = _validate_schematic_file(path)
-        preflight_actions: list[dict[str, Any]] = []
-        if auto_fix_preflight and not validation.get("valid", False):
-            preflight_actions = _apply_schematic_preflight_fixes(path, validation)
-            for action in preflight_actions:
-                action["iteration"] = iteration
-            if preflight_actions:
-                validation = _validate_schematic_file(path)
-                all_actions.extend(preflight_actions)
+        for iteration in range(1, max_iterations + 1):
+            validation = _validate_schematic_file(path)
+            preflight_actions: list[dict[str, Any]] = []
+            if auto_fix_preflight and not validation.get("valid", False):
+                preflight_actions = _apply_schematic_preflight_fixes(path, validation)
+                for action in preflight_actions:
+                    action["iteration"] = iteration
+                if preflight_actions:
+                    validation = _validate_schematic_file(path)
+                    all_actions.extend(preflight_actions)
 
-        run_result = simulateSchematicFile(
-            asc_path=str(path),
-            ascii_raw=ascii_raw,
-            timeout_seconds=timeout_seconds,
-            show_ui=show_ui,
-            open_raw_after_run=open_raw_after_run,
-            validate_first=True,
-            abort_on_validation_error=False,
-        )
-        final_result = run_result
-        diagnostics_messages = [
-            str(item.get("message", ""))
-            for item in run_result.get("diagnostics", [])
-            if isinstance(item, dict)
-        ]
-        issue_messages = [str(item) for item in run_result.get("issues", [])]
-        floating_nodes = _extract_floating_nodes(diagnostics_messages + issue_messages)
-        model_issues = _extract_model_issues_from_text(str(run_result.get("log_tail", "")))
+            run_result = simulateSchematicFile(
+                asc_path=str(path),
+                ascii_raw=ascii_raw,
+                timeout_seconds=timeout_seconds,
+                show_ui=show_ui,
+                open_raw_after_run=open_raw_after_run,
+                validate_first=True,
+                abort_on_validation_error=False,
+            )
+            final_result = run_result
+            diagnostics_messages = [
+                str(item.get("message", ""))
+                for item in run_result.get("diagnostics", [])
+                if isinstance(item, dict)
+            ]
+            issue_messages = [str(item) for item in run_result.get("issues", [])]
+            log_tail = str(run_result.get("log_tail", ""))
+            all_messages = [*diagnostics_messages, *issue_messages, log_tail]
+            floating_nodes = _extract_floating_nodes(all_messages)
+            convergence_detected = _has_convergence_issue(all_messages)
 
-        runtime_actions: list[dict[str, Any]] = []
-        if auto_fix_runtime:
-            try:
-                netlist_path = _ensure_debug_fix_netlist(path)
-            except Exception:
-                netlist_path = None
+            log_path_value = run_result.get("log_path")
+            if isinstance(log_path_value, str) and log_path_value.strip():
+                model_scan = scanModelIssues(
+                    run_id=None,
+                    log_path=log_path_value,
+                    search_paths=model_search_paths,
+                    suggest_matches=True,
+                    max_scan_files=300,
+                    max_suggestions_per_issue=5,
+                )
+            else:
+                model_scan = _extract_model_issues_from_text(log_tail)
+                model_scan["resolution_suggestions"] = []
 
-            if netlist_path is not None and floating_nodes:
-                additions = _apply_floating_node_bleeders(netlist_path, floating_nodes)
-                if additions:
-                    runtime_actions.append(
-                        {
-                            "action": "add_bleeder_resistors",
-                            "path": str(netlist_path),
-                            "lines": additions,
-                        }
-                    )
+            runtime_actions: list[dict[str, Any]] = []
+            if auto_fix_runtime:
+                try:
+                    netlist_path = _ensure_debug_fix_netlist(path)
+                except Exception:
+                    netlist_path = None
 
-            if (
-                auto_import_models
-                and netlist_path is not None
-                and model_issues.get("missing_include_files")
-            ):
-                models_dir = (_runner.workdir / "models").resolve()
-                include_candidates: list[str] = []
-                for missing in model_issues["missing_include_files"]:
-                    missing_name = Path(str(missing)).name.lower()
-                    matches = [
-                        candidate
-                        for candidate in models_dir.glob("*")
-                        if candidate.is_file() and candidate.name.lower() == missing_name
-                    ]
-                    if matches:
-                        include_candidates.append(str(matches[0].resolve()))
-                if include_candidates:
-                    include_lines = [
-                        f'.include "{Path(item).expanduser().resolve()}"'
-                        for item in include_candidates
-                    ]
-                    added_lines = _append_lines_if_missing(netlist_path, include_lines)
-                    if added_lines:
+                if netlist_path is not None and floating_nodes:
+                    additions = _apply_floating_node_bleeders(netlist_path, floating_nodes)
+                    if additions:
                         runtime_actions.append(
                             {
-                                "action": "add_model_includes",
+                                "action": "add_bleeder_resistors",
                                 "path": str(netlist_path),
-                                "lines": added_lines,
+                                "lines": additions,
                             }
                         )
 
-        for action in runtime_actions:
-            action["iteration"] = iteration
-        all_actions.extend(runtime_actions)
+                if auto_fix_convergence and netlist_path is not None and convergence_detected:
+                    convergence_lines = _apply_convergence_options(netlist_path)
+                    if convergence_lines:
+                        runtime_actions.append(
+                            {
+                                "action": "add_convergence_options",
+                                "path": str(netlist_path),
+                                "lines": convergence_lines,
+                            }
+                        )
 
-        history.append(
-            {
-                "iteration": iteration,
-                "validation": validation,
-                "run_result": run_result,
-                "floating_nodes": floating_nodes,
-                "model_issues": model_issues,
-                "preflight_actions": preflight_actions,
-                "runtime_actions": runtime_actions,
-            }
+                if (
+                    auto_import_models
+                    and netlist_path is not None
+                    and model_scan.get("has_model_issues")
+                ):
+                    include_candidates: list[str] = []
+                    for item in model_scan.get("resolution_suggestions", []):
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get("issue_type") != "missing_include_file":
+                            continue
+                        direct_matches = item.get("direct_matches") or []
+                        best_matches = item.get("best_matches") or []
+                        if direct_matches:
+                            include_candidates.append(str(direct_matches[0]))
+                            continue
+                        if best_matches and isinstance(best_matches[0], dict):
+                            candidate_path = best_matches[0].get("path")
+                            if candidate_path:
+                                include_candidates.append(str(candidate_path))
+                    if include_candidates:
+                        include_lines = [
+                            f'.include "{Path(item).expanduser().resolve()}"'
+                            for item in include_candidates
+                        ]
+                        added_lines = _append_lines_if_missing(netlist_path, include_lines)
+                        if added_lines:
+                            runtime_actions.append(
+                                {
+                                    "action": "add_model_includes",
+                                    "path": str(netlist_path),
+                                    "lines": added_lines,
+                                }
+                            )
+
+            for action in runtime_actions:
+                action["iteration"] = iteration
+            all_actions.extend(runtime_actions)
+
+            history.append(
+                {
+                    "iteration": iteration,
+                    "validation": validation,
+                    "run_result": run_result,
+                    "floating_nodes": floating_nodes,
+                    "convergence_detected": convergence_detected,
+                    "model_issues": model_scan,
+                    "preflight_actions": preflight_actions,
+                    "runtime_actions": runtime_actions,
+                }
+            )
+
+            if run_result.get("succeeded", False) and not run_result.get("issues"):
+                break
+            if not preflight_actions and not runtime_actions:
+                break
+
+        succeeded = bool(final_result and final_result.get("succeeded", False))
+        confidence = _compute_auto_debug_confidence(
+            succeeded=succeeded,
+            final_result=final_result,
+            actions_applied=all_actions,
+            iterations_run=len(history),
         )
+        return {
+            "asc_path": str(path),
+            "iterations_run": len(history),
+            "max_iterations": max_iterations,
+            "succeeded": succeeded,
+            "actions_applied": all_actions,
+            "history": history,
+            "final_result": final_result,
+            "confidence": confidence,
+        }
 
-        if run_result.get("succeeded", False) and not run_result.get("issues"):
-            break
-        if not preflight_actions and not runtime_actions:
-            break
 
-    return {
-        "asc_path": str(path),
-        "iterations_run": len(history),
-        "max_iterations": max_iterations,
-        "succeeded": bool(final_result and final_result.get("succeeded", False)),
-        "actions_applied": all_actions,
-        "history": history,
-        "final_result": final_result,
-    }
+@mcp.tool()
+def getToolTelemetry(tool_name: str | None = None) -> dict[str, Any]:
+    """Return rolling performance telemetry for MCP tools."""
+    with _tool_telemetry_scope("getToolTelemetry"):
+        payload = _telemetry_payload()
+        if tool_name is None:
+            return payload
+        target = tool_name.strip()
+        if not target:
+            return payload
+        filtered = [entry for entry in payload["tools"] if str(entry.get("tool", "")).lower() == target.lower()]
+        return {
+            "window_size": payload["window_size"],
+            "tool_count": len(filtered),
+            "tools": filtered,
+        }
+
+
+@mcp.tool()
+def resetToolTelemetry(tool_name: str | None = None) -> dict[str, Any]:
+    """Reset rolling performance telemetry for one tool or all tools."""
+    with _tool_telemetry_scope("resetToolTelemetry"):
+        if tool_name is None:
+            cleared = len(_tool_telemetry)
+            _tool_telemetry.clear()
+            return {"cleared": cleared, "tool_name": None}
+        target = tool_name.strip().lower()
+        if not target:
+            cleared = len(_tool_telemetry)
+            _tool_telemetry.clear()
+            return {"cleared": cleared, "tool_name": None}
+        removed = 0
+        for key in list(_tool_telemetry.keys()):
+            if key.lower() == target:
+                _tool_telemetry.pop(key, None)
+                removed += 1
+        return {"cleared": removed, "tool_name": tool_name}
 
 
 @mcp.tool()
