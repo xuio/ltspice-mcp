@@ -25,6 +25,7 @@ from typing import Any, Literal
 
 import mcp.types as types
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase as _FastMCPArgModelBase
 
 from . import __version__ as LTSPICE_MCP_VERSION
 from .analysis import (
@@ -65,6 +66,13 @@ from .textio import read_text_auto
 mcp = FastMCP("ltspice-mcp-macos")
 CallToolResult = types.CallToolResult
 _LOGGER = logging.getLogger(__name__)
+
+# Reject unknown tool arguments instead of silently dropping them.
+# This keeps retired parameters (for example `backend`) from being accidentally ignored.
+_FastMCPArgModelBase.model_config = {  # type: ignore[assignment]
+    **dict(_FastMCPArgModelBase.model_config),
+    "extra": "forbid",
+}
 
 
 def _read_env_bool(name: str, default: bool = False) -> bool:
@@ -548,6 +556,7 @@ def _resolve_png_output_path(
 
 
 _PLOT_MODES = {"auto", "db", "phase", "real", "imag"}
+_PLOT_Y_MODES = {"magnitude", "phase", "real", "imag", "db"}
 _PANE_LAYOUTS = {"single", "split", "per_trace"}
 
 
@@ -574,6 +583,13 @@ def _normalize_plot_mode(value: str) -> str:
     normalized = value.strip().lower()
     if normalized not in _PLOT_MODES:
         raise ValueError("mode must be one of: auto, db, phase, real, imag")
+    return normalized
+
+
+def _normalize_plot_y_mode(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized not in _PLOT_Y_MODES:
+        raise ValueError("y_mode must be one of: magnitude, phase, real, imag, db")
     return normalized
 
 
@@ -1732,6 +1748,93 @@ def _resolve_sidecar_netlist_path(asc_path: Path) -> Path | None:
     return None
 
 
+def _resolve_schematic_simulation_target(
+    path: Path,
+    *,
+    require_sidecar_on_macos: bool = True,
+) -> dict[str, Any]:
+    resolved = path.expanduser().resolve()
+    suffix = resolved.suffix.lower()
+    is_macos = platform.system() == "Darwin"
+    candidate_paths = [
+        str(resolved.with_suffix(ext))
+        for ext in (".cir", ".net", ".sp", ".spi")
+    ]
+
+    if suffix != ".asc":
+        return {
+            "input_path": str(resolved),
+            "platform": platform.system(),
+            "input_suffix": suffix,
+            "require_sidecar_on_macos": bool(require_sidecar_on_macos),
+            "sidecar_found": False,
+            "sidecar_path": None,
+            "candidate_sidecar_paths": [],
+            "run_target_path": str(resolved),
+            "can_batch_simulate": True,
+            "reason": "input_is_netlist",
+            "suggestions": [],
+            "error": None,
+        }
+
+    sidecar = _resolve_sidecar_netlist_path(resolved)
+    if sidecar is not None:
+        return {
+            "input_path": str(resolved),
+            "platform": platform.system(),
+            "input_suffix": suffix,
+            "require_sidecar_on_macos": bool(require_sidecar_on_macos),
+            "sidecar_found": True,
+            "sidecar_path": str(sidecar),
+            "candidate_sidecar_paths": candidate_paths,
+            "run_target_path": str(sidecar),
+            "can_batch_simulate": True,
+            "reason": "sidecar_available",
+            "suggestions": [],
+            "error": None,
+        }
+
+    if is_macos and require_sidecar_on_macos:
+        error = (
+            "simulateSchematicFile on macOS does not support LTspice batch simulation "
+            "directly from .asc files. Create a sidecar netlist next to the schematic "
+            "(.cir/.net/.sp/.spi) and retry, or use simulateNetlist/simulateNetlistFile."
+        )
+        return {
+            "input_path": str(resolved),
+            "platform": platform.system(),
+            "input_suffix": suffix,
+            "require_sidecar_on_macos": bool(require_sidecar_on_macos),
+            "sidecar_found": False,
+            "sidecar_path": None,
+            "candidate_sidecar_paths": candidate_paths,
+            "run_target_path": str(resolved),
+            "can_batch_simulate": False,
+            "reason": "missing_sidecar_required_on_macos",
+            "suggestions": [
+                "Create a sidecar netlist with the same basename and a .cir/.net/.sp/.spi extension.",
+                "If schematic was generated from netlist/template tools, use the emitted sidecar path.",
+                "Use simulateNetlist/simulateNetlistFile when you already have netlist text.",
+            ],
+            "error": error,
+        }
+
+    return {
+        "input_path": str(resolved),
+        "platform": platform.system(),
+        "input_suffix": suffix,
+        "require_sidecar_on_macos": bool(require_sidecar_on_macos),
+        "sidecar_found": False,
+        "sidecar_path": None,
+        "candidate_sidecar_paths": candidate_paths,
+        "run_target_path": str(resolved),
+        "can_batch_simulate": True,
+        "reason": "direct_asc_batch_allowed",
+        "suggestions": [],
+        "error": None,
+    }
+
+
 def _ensure_debug_fix_netlist(path: Path) -> Path:
     netlist_path = _resolve_sidecar_netlist_path(path)
     if netlist_path is None:
@@ -2474,8 +2577,8 @@ def renderLtspicePlotImage(
     downscale_factor: float = 1.0,
     settle_seconds: float = 1.0,
     max_points: int = 2000,
-    y_mode: str = "magnitude",
-    mode: str = "auto",
+    y_mode: Literal["magnitude", "phase", "real", "imag", "db"] = "magnitude",
+    mode: Literal["auto", "db", "phase", "real", "imag"] = "auto",
     x_log: bool | None = None,
     x_min: float | None = None,
     x_max: float | None = None,
@@ -2498,19 +2601,19 @@ def renderLtspicePlotImage(
     dataset = _resolve_dataset(plot=plot, run_id=run_id, raw_path=raw_path)
     selected_step = _resolve_step_index(dataset, step_index)
     normalized_mode = _normalize_plot_mode(mode)
+    normalized_y_mode = _normalize_plot_y_mode(y_mode)
     normalized_pane_layout = _normalize_pane_layout(pane_layout)
     warnings: list[str] = []
 
     effective_mode = normalized_mode
     if normalized_mode == "auto":
-        y_mode_normalized = y_mode.strip().lower()
-        if y_mode_normalized == "phase":
+        if normalized_y_mode == "phase":
             effective_mode = "phase"
-        elif y_mode_normalized == "real":
+        elif normalized_y_mode == "real":
             effective_mode = "real"
-        elif y_mode_normalized == "imag":
+        elif normalized_y_mode == "imag":
             effective_mode = "imag"
-        elif y_mode_normalized == "magnitude":
+        elif normalized_y_mode in {"magnitude", "db"}:
             effective_mode = "db" if _infer_plot_type(dataset) == "ac" else "real"
 
     render_dataset, step_rendering = _materialize_plot_step_dataset(
@@ -2587,6 +2690,7 @@ def renderLtspicePlotImage(
         "vectors": vectors,
         "plot_settings": plt_payload,
         "mode_requested": normalized_mode,
+        "y_mode_requested": normalized_y_mode,
         "mode_used": plt_payload["mode_used"],
         "pane_layout": normalized_pane_layout,
         "dual_axis_requested": dual_axis,
@@ -2610,7 +2714,7 @@ def generatePlotSettings(
     run_id: str | None = None,
     raw_path: str | None = None,
     step_index: int | None = None,
-    mode: str = "auto",
+    mode: Literal["auto", "db", "phase", "real", "imag"] = "auto",
     x_log: bool | None = None,
     x_min: float | None = None,
     x_max: float | None = None,
@@ -3320,21 +3424,15 @@ def simulateSchematicFile(
                 f"Issues: {validation.get('issues', [])}"
             )
 
-    run_target = path
-    sidecar_netlist: Path | None = None
-    if path.suffix.lower() == ".asc":
-        for suffix in (".cir", ".net", ".sp", ".spi"):
-            candidate = path.with_suffix(suffix)
-            if candidate.exists():
-                run_target = candidate
-                sidecar_netlist = candidate
-                break
-        if sidecar_netlist is None and platform.system() == "Darwin":
-            raise ValueError(
-                "simulateSchematicFile on macOS does not support LTspice batch simulation "
-                "directly from .asc files. Create a sidecar netlist next to the schematic "
-                "(.cir/.net/.sp/.spi) and retry, or use simulateNetlist/simulateNetlistFile."
-            )
+    target_info = _resolve_schematic_simulation_target(path, require_sidecar_on_macos=True)
+    if not bool(target_info.get("can_batch_simulate")):
+        raise ValueError(str(target_info.get("error")))
+    run_target = Path(str(target_info["run_target_path"])).expanduser().resolve()
+    sidecar_netlist: Path | None = (
+        Path(str(target_info["sidecar_path"])).expanduser().resolve()
+        if target_info.get("sidecar_path")
+        else None
+    )
 
     _loaded_netlist = run_target
     run, ui_events, effective_ui = _run_simulation_with_ui(
@@ -3356,6 +3454,23 @@ def simulateSchematicFile(
     if ui_events:
         response["ui_events"] = ui_events
     return response
+
+
+@mcp.tool()
+def resolveSchematicSimulationTarget(
+    asc_path: str,
+    require_sidecar_on_macos: bool = True,
+) -> dict[str, Any]:
+    """
+    Resolve which file simulateSchematicFile will execute and explain sidecar requirements.
+    """
+    path = Path(asc_path).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Schematic file not found: {path}")
+    return _resolve_schematic_simulation_target(
+        path,
+        require_sidecar_on_macos=require_sidecar_on_macos,
+    )
 
 
 @mcp.tool()

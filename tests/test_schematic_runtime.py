@@ -128,6 +128,28 @@ class TestSchematicRuntimeTools(unittest.TestCase):
                 )
             run_mock.assert_not_called()
 
+    def test_resolve_schematic_simulation_target_reports_missing_sidecar(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_resolve_target_test_"))
+        asc_path = temp_dir / "no_sidecar.asc"
+        asc_path.write_text(
+            "Version 4\n"
+            "SHEET 1 880 680\n"
+            "SYMBOL voltage 120 120 R0\n"
+            "SYMATTR InstName V1\n"
+            "SYMATTR Value DC 1\n"
+            "FLAG 120 216 0\n"
+            "TEXT 48 560 Left 2 !.op\n",
+            encoding="utf-8",
+        )
+
+        with patch("ltspice_mcp.server.platform.system", return_value="Darwin"):
+            payload = server.resolveSchematicSimulationTarget(str(asc_path))
+
+        self.assertFalse(payload["can_batch_simulate"])
+        self.assertEqual(payload["reason"], "missing_sidecar_required_on_macos")
+        self.assertIsNone(payload["sidecar_path"])
+        self.assertGreaterEqual(len(payload["candidate_sidecar_paths"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

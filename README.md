@@ -184,6 +184,7 @@ Simulation and setup:
 - `runSimulation`
 - `simulateNetlist`
 - `simulateNetlistFile`
+- `resolveSchematicSimulationTarget`
 - `simulateSchematicFile`
 - `autoDebugSchematic`
 - `getToolTelemetry`
@@ -335,7 +336,8 @@ All create/sync/watch schematic tools return an `asc_path` and support `open_ui`
 Schematic debug workflow:
 - `validateSchematic`: preflight checks for `.asc` files (components, ground flag, simulation directives)
 - `lintSchematic`: deeper structural linting (pin connectivity, dangling wire endpoints, duplicate InstName detection)
-- `simulateSchematicFile`: runs `.asc` directly in batch mode and optionally includes preflight validation in the response
+- `simulateSchematicFile`: simulates schematics using a sidecar netlist when present and optionally includes preflight validation in the response
+- `resolveSchematicSimulationTarget`: explains which file `simulateSchematicFile` will execute, whether a sidecar is required, and what is missing
 - use `abort_on_validation_error=true` when you want to block execution until preflight issues are fixed
 - schematics generated from netlists/templates include a sidecar `.cir`; `simulateSchematicFile` uses this sidecar
 - macOS note: LTspice batch simulation does not run `.asc` directly; `simulateSchematicFile` requires a sidecar netlist (`.cir`/`.net`/`.sp`/`.spi`) next to the schematic
@@ -387,6 +389,7 @@ Plot rendering specifics:
   - `renderLtspicePlotPresetImage`: render image using preset settings
 - Plot controls supported by `renderLtspicePlotImage` and `generatePlotSettings`:
   - `mode`: `auto`, `db`, `phase`, `real`, `imag`
+  - `y_mode` (`renderLtspicePlotImage`): `magnitude`, `phase`, `real`, `imag`, `db` (used as auto-mode hint)
   - `pane_layout`: `single`, `split`, `per_trace`
   - `dual_axis`: AC Bode dual-axis toggle (magnitude + phase)
   - `x_log`, `x_min`, `x_max`, `y_min`, `y_max`: explicit axis controls
@@ -423,13 +426,22 @@ LTSPICE_MCP_RUN_REAL_SCK=1 PYTHONPATH=src .venv/bin/python -m unittest tests.tes
 
 ## Run MCP smoke test
 
-This performs an end-to-end MCP stdio session, runs LTspice on a sample circuit, and validates the core tools.
+This performs an end-to-end MCP session, runs LTspice on a sample circuit, and validates the core tools.
 
 ```bash
 source .venv/bin/activate
 python3 smoke_test_mcp.py \
+  --transport stdio \
   --server-command .venv/bin/ltspice-mcp \
   --ltspice-binary /Applications/LTspice.app/Contents/MacOS/LTspice
+```
+
+To run against a long-lived daemon instead of launching a subprocess:
+
+```bash
+python3 smoke_test_mcp.py \
+  --transport streamable-http \
+  --server-url http://127.0.0.1:8765/mcp
 ```
 
 Run responses now include `diagnostics` with categories like `convergence`, `floating_node`, and `model_missing`, each with suggested fixes.

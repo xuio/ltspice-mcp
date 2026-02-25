@@ -72,7 +72,6 @@ async def _trigger(args: argparse.Namespace) -> int:
                     "renderLtspiceSymbolImage",
                     {
                         "symbol": args.symbol,
-                        "backend": "ltspice",
                         "settle_seconds": args.settle_seconds,
                     },
                 )
