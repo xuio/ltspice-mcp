@@ -7,7 +7,9 @@ import math
 import mimetypes
 import os
 import shutil
+import struct
 import uuid
+import zlib
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -47,6 +49,7 @@ from .schematic import (
     sync_schematic_from_netlist_file,
     watch_schematic_from_netlist_file,
 )
+from .textio import read_text_auto
 from .visualization import render_plot_svg, render_schematic_svg, render_symbol_svg
 
 
@@ -232,6 +235,10 @@ def _resolve_png_output_path(
     ).resolve()
 
 
+_PLOT_MODES = {"auto", "db", "phase", "real", "imag"}
+_PANE_LAYOUTS = {"single", "split", "per_trace"}
+
+
 def _format_plt_number(value: float) -> str:
     if not math.isfinite(value):
         return "0"
@@ -251,79 +258,555 @@ def _safe_axis_range(values: list[float], *, fallback_span: float) -> tuple[floa
     return lo, hi
 
 
-def _write_ltspice_plot_settings_file(
+def _normalize_plot_mode(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized not in _PLOT_MODES:
+        raise ValueError("mode must be one of: auto, db, phase, real, imag")
+    return normalized
+
+
+def _normalize_pane_layout(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized not in _PANE_LAYOUTS:
+        raise ValueError("pane_layout must be one of: single, split, per_trace")
+    return normalized
+
+
+def _infer_plot_type(dataset: RawDataset) -> str:
+    plot_name = dataset.plot_name.lower()
+    scale_name = dataset.scale_name.lower()
+    if "ac analysis" in plot_name or scale_name == "frequency":
+        return "ac"
+    if "transient analysis" in plot_name or scale_name == "time":
+        return "tran"
+    if "dc transfer characteristic" in plot_name or "dc" in plot_name:
+        return "dc"
+    return "generic"
+
+
+def _series_for_expression(dataset: RawDataset, expression: str, step_index: int | None) -> list[complex] | None:
+    try:
+        return dataset.get_vector(expression, step_index=step_index)
+    except KeyError:
+        return None
+
+
+def _transform_series(series: list[complex], mode: str) -> list[float]:
+    if mode == "db":
+        return [20.0 * math.log10(max(abs(value), 1e-30)) for value in series]
+    if mode == "phase":
+        return [math.degrees(math.atan2(value.imag, value.real)) for value in series]
+    if mode == "imag":
+        return [value.imag for value in series]
+    return [value.real for value in series]
+
+
+def _resolve_axis_range(
+    *,
+    values: list[float],
+    fallback_span: float,
+    lower_override: float | None,
+    upper_override: float | None,
+) -> tuple[float, float, float]:
+    lo, hi = _safe_axis_range(values, fallback_span=fallback_span)
+    if lower_override is not None:
+        lo = float(lower_override)
+    if upper_override is not None:
+        hi = float(upper_override)
+    if hi <= lo:
+        raise ValueError("axis max must be greater than axis min")
+    step = max((hi - lo) / 10.0, 1e-12)
+    return lo, step, hi
+
+
+def _axis_prefix_for_range(lo: float, hi: float) -> str:
+    scale = max(abs(lo), abs(hi))
+    if scale >= 1e9:
+        return "G"
+    if scale >= 1e6:
+        return "M"
+    if scale >= 1e3:
+        return "K"
+    if scale >= 1:
+        return " "
+    if scale >= 1e-3:
+        return "m"
+    if scale >= 1e-6:
+        return "u"
+    if scale >= 1e-9:
+        return "n"
+    return "p"
+
+
+def _trace_expression_for_mode(expression: str, *, mode: str, plot_type: str, dual_axis: bool) -> str:
+    if mode == "db" and dual_axis and plot_type == "ac":
+        return expression
+    if mode == "db":
+        return f"dB({expression})"
+    if mode == "phase":
+        return f"ph({expression})"
+    if mode == "imag":
+        return f"im({expression})"
+    if mode == "real" and plot_type == "ac":
+        return f"re({expression})"
+    return expression
+
+
+def _pane_groups(vectors: list[str], pane_layout: str) -> list[list[str]]:
+    if pane_layout == "single" or len(vectors) <= 1:
+        return [vectors]
+    if pane_layout == "per_trace":
+        return [[vector] for vector in vectors]
+    split_index = max(1, math.ceil(len(vectors) / 2))
+    left = vectors[:split_index]
+    right = vectors[split_index:]
+    if right:
+        return [left, right]
+    return [left]
+
+
+def _ascii_raw_scalar(value: complex, *, complex_mode: bool) -> str:
+    if complex_mode:
+        return f"({value.real:.16g},{value.imag:.16g})"
+    return f"{value.real:.16g}"
+
+
+def _write_raw_dataset_ascii(dataset: RawDataset, output_path: Path) -> None:
+    complex_mode = "complex" in dataset.flags or any(
+        abs(value.imag) > 1e-24
+        for series in dataset.values
+        for value in series
+    )
+    flags = sorted(
+        flag for flag in dataset.flags if flag not in {"stepped", "fastaccess", "compressed"}
+    )
+    flags = [flag for flag in flags if flag not in {"real", "complex"}]
+    flags.insert(0, "complex" if complex_mode else "real")
+
+    header_lines = [
+        f"Title: {dataset.metadata.get('Title', 'Generated by ltspice-mcp')}",
+        f"Date: {dataset.metadata.get('Date', datetime.now().ctime())}",
+        f"Plotname: {dataset.plot_name}",
+        f"Flags: {' '.join(flags)}",
+        f"No. Variables: {len(dataset.variables)}",
+        f"No. Points: {dataset.points}",
+        "Offset: 0",
+        "Command: generated by ltspice-mcp",
+        "Variables:",
+    ]
+    for variable in dataset.variables:
+        header_lines.append(f"\t{variable.index}\t{variable.name}\t{variable.kind}")
+    header_lines.append("Values:")
+
+    value_lines: list[str] = []
+    for point_index in range(dataset.points):
+        value_lines.append(
+            f"\t{point_index}\t{_ascii_raw_scalar(dataset.values[0][point_index], complex_mode=complex_mode)}"
+        )
+        for variable_index in range(1, len(dataset.variables)):
+            value_lines.append(
+                f"\t\t{_ascii_raw_scalar(dataset.values[variable_index][point_index], complex_mode=complex_mode)}"
+            )
+    output_path.write_text("\n".join([*header_lines, *value_lines]) + "\n", encoding="utf-8")
+
+
+def _materialize_plot_step_dataset(
+    *,
+    dataset: RawDataset,
+    selected_step: int | None,
+) -> tuple[RawDataset, dict[str, Any]]:
+    if not dataset.is_stepped or selected_step is None:
+        return dataset, {
+            "source_raw_path": str(dataset.path),
+            "render_raw_path": str(dataset.path),
+            "step_materialized": False,
+            "step_index": selected_step,
+        }
+
+    step = dataset.steps[selected_step]
+    step_values = [series[step.start : step.end] for series in dataset.values]
+    step_flags = {flag for flag in dataset.flags if flag not in {"stepped", "fastaccess"}}
+    step_raw_path = dataset.path.with_name(f"{dataset.path.stem}__step{selected_step}.raw")
+    step_dataset = RawDataset(
+        path=step_raw_path,
+        plot_name=dataset.plot_name,
+        flags=step_flags,
+        metadata=dict(dataset.metadata),
+        variables=list(dataset.variables),
+        values=step_values,
+        steps=[],
+    )
+    _write_raw_dataset_ascii(step_dataset, step_raw_path)
+    return step_dataset, {
+        "source_raw_path": str(dataset.path),
+        "render_raw_path": str(step_raw_path),
+        "step_materialized": True,
+        "step_index": selected_step,
+        "materialized_points": step_dataset.points,
+    }
+
+
+def _build_ltspice_plot_settings_text(
     *,
     dataset: RawDataset,
     vectors: list[str],
-    step_index: int | None,
+    mode: str,
+    pane_layout: str,
+    dual_axis: bool | None,
+    x_log: bool | None,
+    x_min: float | None,
+    x_max: float | None,
+    y_min: float | None,
+    y_max: float | None,
 ) -> dict[str, Any]:
     if not vectors:
         raise ValueError("vectors must contain at least one vector name")
 
-    trace_entries: list[str] = []
-    is_ac_plot = dataset.scale_name.lower() == "frequency" or "ac analysis" in dataset.plot_name.lower()
-    base_trace_id = 524290 if is_ac_plot else 268959746
-    for index, expression in enumerate(vectors):
-        escaped = expression.replace('"', '\\"')
-        trace_entries.append(f'{{{base_trace_id + index},0,"{escaped}"}}')
+    plot_type = _infer_plot_type(dataset)
+    mode_used = mode
+    if mode_used == "auto":
+        mode_used = "db" if plot_type == "ac" else "real"
 
-    scale_values = dataset.scale_values(step_index=step_index)
-    first_series = dataset.get_vector(vectors[0], step_index=step_index)
-    plt_path = dataset.path.with_suffix(".plt")
+    dual_axis_enabled = (
+        bool(dual_axis)
+        if dual_axis is not None
+        else (plot_type == "ac" and mode_used == "db")
+    )
+    if plot_type != "ac" or mode_used != "db":
+        dual_axis_enabled = False
+
+    x_log_enabled = bool(x_log) if x_log is not None else (plot_type == "ac")
+    pane_groups = _pane_groups(vectors, pane_layout=pane_layout)
+    x_values = dataset.scale_values(step_index=None)
+    x_lo, x_step, x_hi = _resolve_axis_range(
+        values=x_values,
+        fallback_span=1.0,
+        lower_override=x_min,
+        upper_override=x_max,
+    )
+    x_prefix = _axis_prefix_for_range(x_lo, x_hi)
 
     lines: list[str] = [
         f"[{dataset.plot_name}]",
         "{",
-        "   Npanes: 1",
-        "   {",
-        f"      traces: {len(trace_entries)} {' '.join(trace_entries)}",
+        f"   Npanes: {len(pane_groups)}",
     ]
+    pane_payload: list[dict[str, Any]] = []
 
-    if is_ac_plot:
-        positive_scale = [value for value in scale_values if value > 0]
-        x_min = min(positive_scale) if positive_scale else 1.0
-        x_max = max(positive_scale) if positive_scale else (x_min * 10.0)
-        if x_max <= x_min:
-            x_max = x_min * 10.0
+    next_trace_id = 524290 if plot_type == "ac" else 268959746
+    for pane_index, pane_vectors in enumerate(pane_groups):
+        trace_expressions: list[str] = []
+        raw_to_rendered: dict[str, str] = {}
+        for raw_expression in pane_vectors:
+            rendered = _trace_expression_for_mode(
+                raw_expression,
+                mode=mode_used,
+                plot_type=plot_type,
+                dual_axis=dual_axis_enabled,
+            )
+            trace_expressions.append(rendered)
+            raw_to_rendered[raw_expression] = rendered
+
+        first_series = _series_for_expression(dataset, pane_vectors[0], step_index=None)
+        y_lines: list[str] = []
+        warnings: list[str] = []
+        if dual_axis_enabled:
+            # LTspice's Bode rendering expects these canonical axis settings with PltMag/PltPhi.
+            # Using direct dB/phase ranges here can hide traces in some LTspice builds.
+            mag_lo, mag_step, mag_hi = 0.001, 6.0, 1.0
+            phase_lo, phase_step, phase_hi = -90.0, 9.0, 0.0
+            if y_min is not None or y_max is not None:
+                warnings.append(
+                    "y_min/y_max are ignored when dual_axis Bode mode is enabled."
+                )
+            y_lines.extend(
+                [
+                    f"      Y[0]: (' ',0,{_format_plt_number(mag_lo)},{_format_plt_number(mag_step)},{_format_plt_number(mag_hi)})",
+                    f"      Y[1]: (' ',0,{_format_plt_number(phase_lo)},{_format_plt_number(phase_step)},{_format_plt_number(phase_hi)})",
+                    f"      Log: {1 if x_log_enabled else 0} 2 0",
+                    "      PltMag: 1",
+                    "      PltPhi: 1 0",
+                ]
+            )
+        else:
+            sampled = _transform_series(first_series or [], mode_used)
+            fallback = 180.0 if mode_used == "phase" else (60.0 if mode_used == "db" else 1.0)
+            y_lo, y_step, y_hi = _resolve_axis_range(
+                values=sampled,
+                fallback_span=fallback,
+                lower_override=y_min,
+                upper_override=y_max,
+            )
+            y_lines.extend(
+                [
+                    f"      Y[0]: (' ',0,{_format_plt_number(y_lo)},{_format_plt_number(y_step)},{_format_plt_number(y_hi)})",
+                    "      Y[1]: ('_',0,1e+308,0,-1e+308)",
+                    f"      Log: {1 if x_log_enabled else 0} 0 0",
+                ]
+            )
+            if plot_type != "ac":
+                y_lines.insert(
+                    2,
+                    f"      Volts: (' ',0,0,0,{_format_plt_number(y_lo)},{_format_plt_number(y_step)},{_format_plt_number(y_hi)})",
+                )
+            if first_series is None:
+                warnings.append(
+                    f"Could not resolve raw vector '{pane_vectors[0]}' for axis auto-scaling; used fallback range."
+                )
+
+        pane_trace_tokens: list[str] = []
+        for rendered_expression in trace_expressions:
+            escaped = rendered_expression.replace('"', '\\"')
+            pane_trace_tokens.append(f'{{{next_trace_id},0,"{escaped}"}}')
+            next_trace_id += 1
 
         lines.extend(
             [
-                f"      X: ('K',0,{_format_plt_number(x_min)},0,{_format_plt_number(x_max)})",
-                "      Y[0]: (' ',0,0.001,6,1)",
-                "      Y[1]: (' ',0,-90,9,0)",
-                "      Log: 1 2 0",
-                "      PltMag: 1",
-                "      PltPhi: 1 0",
+                "   {",
+                f"      traces: {len(pane_trace_tokens)} {' '.join(pane_trace_tokens)}",
+                f"      X: ('{x_prefix}',0,{_format_plt_number(x_lo)},{_format_plt_number(x_step)},{_format_plt_number(x_hi)})",
+                *y_lines,
                 "      NeyeDiagPeriods: 0",
+                "   }",
             ]
         )
-    else:
-        x_min, x_max = _safe_axis_range(scale_values, fallback_span=1.0)
-        x_step = max((x_max - x_min) / 10.0, 1e-12)
-
-        y_values = [value.real for value in first_series]
-        y_min, y_max = _safe_axis_range(y_values, fallback_span=1.0)
-        y_step = max((y_max - y_min) / 10.0, 1e-12)
-
-        lines.extend(
-            [
-                f"      X: ('m',0,{_format_plt_number(x_min)},{_format_plt_number(x_step)},{_format_plt_number(x_max)})",
-                f"      Y[0]: (' ',0,{_format_plt_number(y_min)},{_format_plt_number(y_step)},{_format_plt_number(y_max)})",
-                "      Y[1]: ('_',0,1e+308,0,-1e+308)",
-                f"      Volts: (' ',0,0,0,{_format_plt_number(y_min)},{_format_plt_number(y_step)},{_format_plt_number(y_max)})",
-                "      Log: 0 0 0",
-                "      NeyeDiagPeriods: 0",
-            ]
+        pane_payload.append(
+            {
+                "pane_index": pane_index,
+                "trace_count": len(pane_vectors),
+                "input_traces": pane_vectors,
+                "rendered_traces": trace_expressions,
+                "trace_mapping": raw_to_rendered,
+                "warnings": warnings,
+            }
         )
+    lines.append("}")
 
-    lines.extend(["   }", "}"])
-    plt_path.write_text("\n".join(lines) + "\n", encoding="utf-16le")
+    return {
+        "text": "\n".join(lines) + "\n",
+        "plot_name": dataset.plot_name,
+        "plot_type": plot_type,
+        "mode_used": mode_used,
+        "pane_layout": pane_layout,
+        "dual_axis": dual_axis_enabled,
+        "x_log": x_log_enabled,
+        "x_range": [x_lo, x_hi],
+        "x_step": x_step,
+        "panes": pane_payload,
+    }
+
+
+def _parse_ltspice_plot_settings_text(text: str) -> dict[str, Any]:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    npanes = None
+    pane_trace_counts: list[int] = []
+    pane_traces: list[list[str]] = []
+    for line in lines:
+        if line.lower().startswith("npanes:"):
+            try:
+                npanes = int(line.split(":", 1)[1].strip())
+            except Exception as exc:
+                raise ValueError(f"Invalid Npanes line in .plt: {line}") from exc
+            continue
+        if line.lower().startswith("traces:"):
+            tail = line.split(":", 1)[1].strip()
+            count_token = tail.split(" ", 1)[0]
+            try:
+                count = int(count_token)
+            except Exception as exc:
+                raise ValueError(f"Invalid traces count in .plt: {line}") from exc
+            expressions: list[str] = []
+            quote_parts = line.split('"')
+            for idx in range(1, len(quote_parts), 2):
+                expressions.append(quote_parts[idx])
+            pane_trace_counts.append(count)
+            pane_traces.append(expressions)
+
+    if npanes is None:
+        raise ValueError("Could not parse Npanes from .plt content")
+    if len(pane_trace_counts) != npanes:
+        raise ValueError(
+            f".plt pane mismatch: Npanes={npanes}, found {len(pane_trace_counts)} pane trace blocks"
+        )
+    return {
+        "npanes": npanes,
+        "pane_trace_counts": pane_trace_counts,
+        "pane_traces": pane_traces,
+    }
+
+
+def _write_ltspice_plot_settings_file(
+    *,
+    dataset: RawDataset,
+    vectors: list[str],
+    mode: str,
+    pane_layout: str,
+    dual_axis: bool | None,
+    x_log: bool | None,
+    x_min: float | None,
+    x_max: float | None,
+    y_min: float | None,
+    y_max: float | None,
+    output_path: Path | None = None,
+) -> dict[str, Any]:
+    settings = _build_ltspice_plot_settings_text(
+        dataset=dataset,
+        vectors=vectors,
+        mode=mode,
+        pane_layout=pane_layout,
+        dual_axis=dual_axis,
+        x_log=x_log,
+        x_min=x_min,
+        x_max=x_max,
+        y_min=y_min,
+        y_max=y_max,
+    )
+    plt_path = output_path or dataset.path.with_suffix(".plt")
+    plt_path.write_text(str(settings["text"]), encoding="utf-16le")
+    parsed = _parse_ltspice_plot_settings_text(str(settings["text"]))
+    total_declared_traces = sum(int(item) for item in parsed["pane_trace_counts"])
+    if total_declared_traces < len(vectors):
+        raise ValueError(
+            "Generated .plt file declares fewer traces than requested vectors."
+        )
     return {
         "plt_path": str(plt_path),
-        "trace_count": len(trace_entries),
+        "trace_count": len(vectors),
         "trace_expressions": vectors,
-        "plot_name": dataset.plot_name,
-        "plot_type": "ac" if is_ac_plot else "generic",
+        "plot_name": settings["plot_name"],
+        "plot_type": settings["plot_type"],
+        "mode_used": settings["mode_used"],
+        "pane_layout": settings["pane_layout"],
+        "dual_axis": settings["dual_axis"],
+        "x_log": settings["x_log"],
+        "x_range": settings["x_range"],
+        "x_step": settings["x_step"],
+        "panes": settings["panes"],
+        "parsed": parsed,
+        "text": settings["text"],
+    }
+
+
+def _png_plot_trace_metrics(path: Path) -> dict[str, Any]:
+    blob = path.read_bytes()
+    if blob[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError(f"plot capture is not a PNG file: {path}")
+
+    cursor = 8
+    idat = bytearray()
+    width: int | None = None
+    height: int | None = None
+    color_type: int | None = None
+    bit_depth: int | None = None
+
+    while cursor + 8 <= len(blob):
+        chunk_len = struct.unpack(">I", blob[cursor : cursor + 4])[0]
+        cursor += 4
+        chunk_type = blob[cursor : cursor + 4]
+        cursor += 4
+        chunk = blob[cursor : cursor + chunk_len]
+        cursor += chunk_len + 4  # Skip payload + CRC
+        if chunk_type == b"IHDR":
+            width, height, bit_depth, color_type, _, _, _ = struct.unpack(">IIBBBBB", chunk)
+        elif chunk_type == b"IDAT":
+            idat.extend(chunk)
+        elif chunk_type == b"IEND":
+            break
+
+    if width is None or height is None or color_type is None or bit_depth is None:
+        raise ValueError(f"Missing PNG IHDR in capture: {path}")
+    if bit_depth != 8:
+        raise ValueError(f"Unsupported PNG bit depth {bit_depth}; expected 8-bit image")
+
+    if color_type == 6:
+        bytes_per_pixel = 4
+    elif color_type == 2:
+        bytes_per_pixel = 3
+    elif color_type == 0:
+        bytes_per_pixel = 1
+    else:
+        raise ValueError(f"Unsupported PNG color type {color_type}")
+
+    decoded = zlib.decompress(bytes(idat))
+    stride = width * bytes_per_pixel
+    expected_len = (stride + 1) * height
+    if len(decoded) < expected_len:
+        raise ValueError("PNG pixel payload shorter than expected")
+
+    position = 0
+    previous = bytearray(stride)
+    trace_pixels = 0
+    green_pixels = 0
+    non_black_pixels = 0
+
+    for _ in range(height):
+        filter_type = decoded[position]
+        position += 1
+        row = bytearray(decoded[position : position + stride])
+        position += stride
+        recon = bytearray(stride)
+
+        for index in range(stride):
+            left = recon[index - bytes_per_pixel] if index >= bytes_per_pixel else 0
+            up = previous[index]
+            up_left = previous[index - bytes_per_pixel] if index >= bytes_per_pixel else 0
+            if filter_type == 0:
+                value = row[index]
+            elif filter_type == 1:
+                value = (row[index] + left) & 0xFF
+            elif filter_type == 2:
+                value = (row[index] + up) & 0xFF
+            elif filter_type == 3:
+                value = (row[index] + ((left + up) // 2)) & 0xFF
+            elif filter_type == 4:
+                predictor = left + up - up_left
+                pa = abs(predictor - left)
+                pb = abs(predictor - up)
+                pc = abs(predictor - up_left)
+                nearest = left if pa <= pb and pa <= pc else (up if pb <= pc else up_left)
+                value = (row[index] + nearest) & 0xFF
+            else:
+                raise ValueError(f"Unsupported PNG filter type {filter_type}")
+            recon[index] = value
+        previous = recon
+
+        for idx in range(0, stride, bytes_per_pixel):
+            if color_type == 0:
+                red = green = blue = recon[idx]
+            else:
+                red = recon[idx]
+                green = recon[idx + 1]
+                blue = recon[idx + 2]
+            if red > 0 or green > 0 or blue > 0:
+                non_black_pixels += 1
+            if green > red + 20 and green > blue + 20 and green > 70:
+                trace_pixels += 1
+            if green > 100 and red < 120 and blue < 120:
+                green_pixels += 1
+
+    return {
+        "width": width,
+        "height": height,
+        "trace_pixels": trace_pixels,
+        "green_pixels": green_pixels,
+        "non_black_pixels": non_black_pixels,
+    }
+
+
+def _validate_plot_capture(path: Path) -> dict[str, Any]:
+    metrics = _png_plot_trace_metrics(path)
+    area = max(1, int(metrics["width"]) * int(metrics["height"]))
+    min_trace_pixels = max(130, int(area * 0.0018))
+    min_green_pixels = max(120, int(area * 0.0008))
+    valid = (
+        int(metrics["trace_pixels"]) >= min_trace_pixels
+        or int(metrics["green_pixels"]) >= min_green_pixels
+    )
+    return {
+        **metrics,
+        "min_trace_pixels": min_trace_pixels,
+        "min_green_pixels": min_green_pixels,
+        "valid": valid,
     }
 
 
@@ -952,8 +1435,16 @@ def renderLtspicePlotImage(
     settle_seconds: float = 1.0,
     max_points: int = 2000,
     y_mode: str = "magnitude",
+    mode: str = "auto",
     x_log: bool | None = None,
+    x_min: float | None = None,
+    x_max: float | None = None,
+    y_min: float | None = None,
+    y_max: float | None = None,
+    dual_axis: bool | None = None,
+    pane_layout: str = "single",
     title: str | None = None,
+    validate_capture: bool = True,
     render_session_id: str | None = None,
 ) -> types.CallToolResult:
     """
@@ -966,30 +1457,60 @@ def renderLtspicePlotImage(
     dataset = _resolve_dataset(plot=plot, run_id=run_id, raw_path=raw_path)
     selected_step = _resolve_step_index(dataset, step_index)
     normalized_backend = _normalize_image_backend(backend)
+    normalized_mode = _normalize_plot_mode(mode)
+    normalized_pane_layout = _normalize_pane_layout(pane_layout)
     warnings: list[str] = []
+
+    effective_mode = normalized_mode
+    if normalized_mode == "auto":
+        y_mode_normalized = y_mode.strip().lower()
+        if y_mode_normalized == "phase":
+            effective_mode = "phase"
+        elif y_mode_normalized == "real":
+            effective_mode = "real"
+        elif y_mode_normalized == "imag":
+            effective_mode = "imag"
+        elif y_mode_normalized == "magnitude":
+            effective_mode = "db" if _infer_plot_type(dataset) == "ac" else "real"
 
     use_ltspice_backend = normalized_backend in {"auto", "ltspice"}
     if use_ltspice_backend:
-        plt_payload = _write_ltspice_plot_settings_file(
+        render_dataset, step_rendering = _materialize_plot_step_dataset(
             dataset=dataset,
-            vectors=vectors,
-            step_index=selected_step,
+            selected_step=selected_step,
         )
-        open_path = dataset.path
-        title_hint = dataset.path.name
+        plt_payload = _write_ltspice_plot_settings_file(
+            dataset=render_dataset,
+            vectors=vectors,
+            mode=effective_mode,
+            pane_layout=normalized_pane_layout,
+            dual_axis=dual_axis,
+            x_log=x_log,
+            x_min=x_min,
+            x_max=x_max,
+            y_min=y_min,
+            y_max=y_max,
+        )
+        open_path = render_dataset.path
+        title_hint = render_dataset.path.name
         close_after_capture = True
         if render_session_id:
             session = _render_sessions.get(render_session_id)
             if not session:
                 raise ValueError(f"Unknown render_session_id '{render_session_id}'")
-            if session.get("path") and Path(session["path"]) != dataset.path:
-                raise ValueError("render_session_id is bound to a different path")
-            title_hint = str(session.get("title_hint") or dataset.path.name)
+            session_path = Path(str(session.get("path") or "")).expanduser().resolve()
+            if session.get("path") and session_path != render_dataset.path:
+                raise ValueError(
+                    "render_session_id is bound to a different path. "
+                    "Start a render session for the selected step/raw file first."
+                )
+            title_hint = str(session.get("title_hint") or render_dataset.path.name)
+            open_path = None
             close_after_capture = False
         screenshot_payload = capture_ltspice_window_screenshot(
             output_path=_resolve_png_output_path(
                 kind="plots",
-                name=f"{dataset.path.stem}_{vectors[0]}",
+                name=f"{render_dataset.path.stem}_{vectors[0]}",
                 output_path=output_path,
             ),
             open_path=open_path,
@@ -1000,33 +1521,44 @@ def renderLtspicePlotImage(
             prefer_screencapturekit=True,
             close_after_capture=close_after_capture,
         )
-        if selected_step is not None:
-            warnings.append(
-                "LTspice UI rendering currently cannot force step selection; "
-                "the displayed step follows LTspice's default waveform view."
-            )
         if any(
             [
-                y_mode != "magnitude",
-                x_log is not None,
                 title is not None,
                 max_points != 2000,
             ]
         ):
             warnings.append(
-                "LTspice plot rendering uses .plt settings and ignores y_mode/x_log/title/max_points."
+                "LTspice plot rendering uses .plt settings and ignores title/max_points."
             )
+        validation = None
+        if validate_capture:
+            validation = _validate_plot_capture(Path(str(screenshot_payload["image_path"])))
+            if not validation["valid"]:
+                raise RuntimeError(
+                    "LTspice plot capture appears empty or missing traces "
+                    f"(trace_pixels={validation['trace_pixels']}, "
+                    f"required_min={validation['min_trace_pixels']})."
+                )
         payload = {
             **screenshot_payload,
             "raw_path": str(dataset.path),
+            "render_raw_path": str(render_dataset.path),
             "plot_name": dataset.plot_name,
             "vectors": vectors,
             "plot_settings": plt_payload,
+            "mode_requested": normalized_mode,
+            "mode_used": plt_payload["mode_used"],
+            "pane_layout": normalized_pane_layout,
+            "dual_axis_requested": dual_axis,
+            "validate_capture": bool(validate_capture),
             "backend_requested": normalized_backend,
             "backend_used": "ltspice",
             "render_session_id": render_session_id,
+            "step_rendering": step_rendering,
             **_step_payload(dataset, selected_step),
         }
+        if validation is not None:
+            payload["capture_validation"] = validation
         if warnings:
             payload["warnings"] = warnings
         return _image_tool_result(payload)
@@ -1055,6 +1587,69 @@ def renderLtspicePlotImage(
         payload["warnings"] = warnings
     payload.update(_step_payload(dataset, selected_step))
     return _image_tool_result(payload)
+
+
+@mcp.tool()
+def generatePlotSettings(
+    vectors: list[str],
+    plot: str | None = None,
+    run_id: str | None = None,
+    raw_path: str | None = None,
+    step_index: int | None = None,
+    mode: str = "auto",
+    x_log: bool | None = None,
+    x_min: float | None = None,
+    x_max: float | None = None,
+    y_min: float | None = None,
+    y_max: float | None = None,
+    dual_axis: bool | None = None,
+    pane_layout: str = "single",
+    output_path: str | None = None,
+) -> dict[str, Any]:
+    """Generate a LTspice .plt file from vectors and return parsed settings for debugging."""
+    if not vectors:
+        raise ValueError("vectors must contain at least one vector name")
+    dataset = _resolve_dataset(plot=plot, run_id=run_id, raw_path=raw_path)
+    selected_step = _resolve_step_index(dataset, step_index)
+    normalized_mode = _normalize_plot_mode(mode)
+    normalized_layout = _normalize_pane_layout(pane_layout)
+    render_dataset, step_rendering = _materialize_plot_step_dataset(
+        dataset=dataset,
+        selected_step=selected_step,
+    )
+    plt_target = (
+        Path(output_path).expanduser().resolve()
+        if output_path
+        else render_dataset.path.with_suffix(".plt")
+    )
+    payload = _write_ltspice_plot_settings_file(
+        dataset=render_dataset,
+        vectors=vectors,
+        mode=normalized_mode,
+        pane_layout=normalized_layout,
+        dual_axis=dual_axis,
+        x_log=x_log,
+        x_min=x_min,
+        x_max=x_max,
+        y_min=y_min,
+        y_max=y_max,
+        output_path=plt_target,
+    )
+    text = read_text_auto(plt_target)
+    payload.update(
+        {
+            "raw_path": str(dataset.path),
+            "render_raw_path": str(render_dataset.path),
+            "mode_requested": normalized_mode,
+            "pane_layout_requested": normalized_layout,
+            "dual_axis_requested": dual_axis,
+            "step_rendering": step_rendering,
+            "preview": text[:4000],
+            "preview_truncated": len(text) > 4000,
+        }
+    )
+    payload.update(_step_payload(dataset, selected_step))
+    return payload
 
 
 @mcp.tool()

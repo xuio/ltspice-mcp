@@ -75,6 +75,7 @@ async def _run_smoke_test(args: argparse.Namespace) -> None:
                 "renderLtspiceSymbolImage",
                 "renderLtspiceSchematicImage",
                 "renderLtspicePlotImage",
+                "generatePlotSettings",
                 "setSchematicUiSingleWindow",
                 "closeLtspiceWindow",
                 "startLtspiceRenderSession",
@@ -367,6 +368,21 @@ C1 out 0 1u
             vout = vector_data.get("vectors", {}).get("V(out)", {})
             _require("magnitude" in vout, "V(out) magnitude data missing")
             print(f"Trace check passed ({len(vector_data['scale_points'])} sampled points)")
+
+            plt_settings = _extract_call_result(
+                await session.call_tool(
+                    "generatePlotSettings",
+                    {
+                        "run_id": run_id,
+                        "vectors": ["V(out)"],
+                        "mode": "db",
+                        "pane_layout": "single",
+                    },
+                )
+            )
+            _require(isinstance(plt_settings, dict), "generatePlotSettings did not return an object")
+            _require(Path(str(plt_settings.get("plt_path", ""))).exists(), "generatePlotSettings did not write .plt")
+            print("Plot settings generation check passed")
 
             plot_image = _extract_call_result(
                 await session.call_tool(

@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ltspice_mcp import server
+from ltspice_mcp.models import RawDataset, RawVariable
 
 
 class TestRenderSessions(unittest.TestCase):
@@ -57,6 +58,58 @@ class TestRenderSessions(unittest.TestCase):
             close_mock.return_value = {"closed": True}
             payload = server.closeLtspiceWindow("foo.asc")
         self.assertTrue(payload["closed"])
+
+    def test_plot_render_session_reuses_window(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_plot_render_session_test_"))
+        raw_path = temp_dir / "session.raw"
+        raw_path.write_text("raw placeholder\n", encoding="utf-8")
+        dataset = RawDataset(
+            path=raw_path.resolve(),
+            plot_name="AC Analysis",
+            flags={"complex"},
+            metadata={},
+            variables=[
+                RawVariable(index=0, name="frequency", kind="frequency"),
+                RawVariable(index=1, name="V(out)", kind="voltage"),
+            ],
+            values=[
+                [10.0 + 0j, 100.0 + 0j, 1000.0 + 0j],
+                [1.0 + 0j, 0.5 - 0.5j, 0.1 - 0.9j],
+            ],
+            steps=[],
+        )
+
+        def _capture_side_effect(**kwargs: object) -> dict[str, object]:
+            output_path = Path(str(kwargs["output_path"]))
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+            return {
+                "image_path": str(output_path),
+                "capture_backend": "screencapturekit",
+                "capture_window_info": {"capture_mode": "screencapturekit_window"},
+            }
+
+        with (
+            patch("ltspice_mcp.server.open_in_ltspice_ui") as open_mock,
+            patch("ltspice_mcp.server.capture_ltspice_window_screenshot", side_effect=_capture_side_effect) as capture_mock,
+            patch("ltspice_mcp.server._resolve_dataset", return_value=dataset),
+            patch(
+                "ltspice_mcp.server._validate_plot_capture",
+                return_value={"valid": True, "trace_pixels": 400, "min_trace_pixels": 120},
+            ),
+        ):
+            open_mock.return_value = {"opened": True}
+            session = server.startLtspiceRenderSession(path=str(raw_path))
+            session_id = session["render_session_id"]
+            result = server.renderLtspicePlotImage(
+                vectors=["V(out)"],
+                backend="ltspice",
+                render_session_id=session_id,
+            )
+            self.assertFalse(result.isError)
+            capture_kwargs = capture_mock.call_args.kwargs
+            self.assertIsNone(capture_kwargs["open_path"])
+            self.assertEqual(capture_kwargs["close_after_capture"], False)
 
 
 if __name__ == "__main__":

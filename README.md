@@ -87,6 +87,7 @@ Simulation and setup:
 - `renderLtspiceSymbolImage`
 - `renderLtspiceSchematicImage`
 - `renderLtspicePlotImage`
+- `generatePlotSettings`
 - `setLtspiceUiEnabled`
 - `setSchematicUiSingleWindow`
 - `closeLtspiceWindow`
@@ -220,6 +221,13 @@ Rendering backend options:
 Plot rendering specifics:
 - `renderLtspicePlotImage` writes a companion `.plt` file next to the RAW file so LTspice opens with the requested traces preselected.
 - This avoids UI button/menu interaction for trace selection and keeps rendering on LTspice's native plot engine.
+- Plot controls supported by `renderLtspicePlotImage` and `generatePlotSettings`:
+  - `mode`: `auto`, `db`, `phase`, `real`, `imag`
+  - `pane_layout`: `single`, `split`, `per_trace`
+  - `dual_axis`: AC Bode dual-axis toggle (magnitude + phase)
+  - `x_log`, `x_min`, `x_max`, `y_min`, `y_max`: explicit axis controls
+  - `step_index`: for stepped runs, selected step is materialized to a temporary step-specific RAW for LTspice rendering
+- Plot captures include `capture_validation` metadata, and `validate_capture=true` (default) fails fast when LTspice returns an empty/missing-trace plot image.
 
 Downscale:
 - `downscale_factor` (e.g. `0.5`) is supported for symbol, schematic, and plot image tools.
@@ -232,7 +240,7 @@ LTspice screenshot behavior:
 ## Run tests
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests -v
+PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
 ```
 
 Schematic tests include fixture snapshots under `tests/fixtures/schematic/*.asc` for deterministic rendering checks.
@@ -240,7 +248,8 @@ Schematic tests include fixture snapshots under `tests/fixtures/schematic/*.asc`
 Real ScreenCaptureKit integration tests are available and disabled by default:
 
 ```bash
-LTSPICE_MCP_RUN_REAL_SCK=1 PYTHONPATH=src python3 -m unittest tests.test_screencapturekit_integration -v
+LTSPICE_MCP_RUN_REAL_SCK=1 PYTHONPATH=src .venv/bin/python -m unittest tests.test_screencapturekit_integration -v
+LTSPICE_MCP_RUN_REAL_SCK=1 PYTHONPATH=src .venv/bin/python -m unittest tests.test_plot_render_mcp_real -v
 ```
 
 ## Run MCP smoke test
