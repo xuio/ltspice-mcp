@@ -188,6 +188,7 @@ class TestScreenCaptureKitPath(unittest.TestCase):
         close_mock.assert_called_once_with("source.asc")
         self.assertTrue(payload["close_event"]["closed"])
 
+
 class TestCloseLtspiceWindow(unittest.TestCase):
     def test_close_ltspice_window_requires_any_selector(self) -> None:
         with patch("ltspice_mcp.ltspice.platform.system", return_value="Darwin"):
