@@ -121,6 +121,8 @@ class TestScreenCaptureKitPath(unittest.TestCase):
             "source.asc",
             window_id=777,
             exact_title="source.asc",
+            attempts=5,
+            retry_delay=0.2,
         )
         self.assertEqual(sck_mock.call_count, 1)
         self.assertEqual(payload["capture_backend"], "screencapturekit")
@@ -154,7 +156,11 @@ class TestScreenCaptureKitPath(unittest.TestCase):
                     settle_seconds=0.0,
                     prefer_screencapturekit=True,
                 )
-            close_mock.assert_called_once_with("source.asc")
+            close_mock.assert_called_once_with(
+                "source.asc",
+                attempts=5,
+                retry_delay=0.2,
+            )
 
     def test_capture_ltspice_window_screenshot_falls_back_when_sck_disabled(self) -> None:
         temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_sck_disabled_test_"))
@@ -185,7 +191,11 @@ class TestScreenCaptureKitPath(unittest.TestCase):
         self.assertEqual(payload["capture_backend"], "screencapture")
         self.assertIsInstance(payload["capture_command"], list)
         self.assertEqual(payload["capture_command"][:2], ["screencapture", "-x"])
-        close_mock.assert_called_once_with("source.asc")
+        close_mock.assert_called_once_with(
+            "source.asc",
+            attempts=5,
+            retry_delay=0.2,
+        )
         self.assertTrue(payload["close_event"]["closed"])
 
 
@@ -227,6 +237,30 @@ class TestCloseLtspiceWindow(unittest.TestCase):
             payload = close_ltspice_window("foo.asc")
         self.assertTrue(payload["closed"])
         self.assertEqual(payload["close_strategy"], "menu")
+
+    def test_close_ltspice_window_retries_until_closed(self) -> None:
+        with (
+            patch("ltspice_mcp.ltspice.platform.system", return_value="Darwin"),
+            patch("ltspice_mcp.ltspice.subprocess.run") as run_mock,
+        ):
+            run_mock.side_effect = [
+                CompletedProcess(
+                    args=["osascript"],
+                    returncode=0,
+                    stdout="OK|0|0\n",
+                    stderr="",
+                ),
+                CompletedProcess(
+                    args=["osascript"],
+                    returncode=0,
+                    stdout="OK|1|1|menu\n",
+                    stderr="",
+                ),
+            ]
+            payload = close_ltspice_window("foo.asc", attempts=3, retry_delay=0.0)
+        self.assertTrue(payload["closed"])
+        self.assertEqual(payload["attempt_count"], 2)
+        self.assertEqual(run_mock.call_count, 2)
 
 
 if __name__ == "__main__":

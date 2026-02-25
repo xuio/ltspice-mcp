@@ -567,6 +567,8 @@ def close_ltspice_window(
     *,
     window_id: int | None = None,
     exact_title: str | None = None,
+    attempts: int = 1,
+    retry_delay: float = 0.15,
 ) -> dict[str, Any]:
     title_contains = title_hint.strip()
     title_exact = (exact_title or "").strip()
@@ -636,26 +638,43 @@ def close_ltspice_window(
         '    if closeCount < matchCount or matchCount is 0 then\n'
         '      set menuMatchCount to 0\n'
         '      try\n'
+        '        try\n'
+        '          set visible to true\n'
+        '        end try\n'
+        '        delay 0.08\n'
         '        set windowMenu to menu 1 of menu bar item "Window" of menu bar 1\n'
         '        set fileMenu to menu 1 of menu bar item "File" of menu bar 1\n'
-        '        repeat with mi in menu items of windowMenu\n'
-        '          set itemName to ""\n'
-        '          try\n'
-        '            set itemName to (name of mi) as text\n'
-        '          end try\n'
-        '          set menuItemMatch to false\n'
-        '          if targetExactName is not "" and itemName is targetExactName then set menuItemMatch to true\n'
-        '          if (not menuItemMatch) and targetContainsName is not "" and itemName contains targetContainsName then set menuItemMatch to true\n'
-        '          if menuItemMatch then\n'
-        '            set menuMatchCount to menuMatchCount + 1\n'
+        '        set safetyCount to 0\n'
+        '        repeat while safetyCount < 120\n'
+        '          set safetyCount to safetyCount + 1\n'
+        '          set matchedMenuItem to missing value\n'
+        '          repeat with mi in menu items of windowMenu\n'
+        '            set itemName to ""\n'
         '            try\n'
-        '              click mi\n'
-        '              delay 0.05\n'
-        '              click menu item "Close" of fileMenu\n'
-        '              set closeCount to closeCount + 1\n'
-        '              set closeStrategy to "menu"\n'
+        '              set itemName to (name of mi) as text\n'
         '            end try\n'
-        '          end if\n'
+        '            set menuItemMatch to false\n'
+        '            if targetExactName is not "" and itemName is targetExactName then set menuItemMatch to true\n'
+        '            if (not menuItemMatch) and targetContainsName is not "" and itemName contains targetContainsName then set menuItemMatch to true\n'
+        '            if menuItemMatch then\n'
+        '              set matchedMenuItem to mi\n'
+        '              exit repeat\n'
+        '            end if\n'
+        '          end repeat\n'
+        '          if matchedMenuItem is missing value then exit repeat\n'
+        '          set menuMatchCount to menuMatchCount + 1\n'
+        '          try\n'
+        '            click matchedMenuItem\n'
+        '            delay 0.06\n'
+        '            try\n'
+        '              click menu item "Close" of fileMenu\n'
+        '            on error\n'
+        '              keystroke "w" using command down\n'
+        '            end try\n'
+        '            set closeCount to closeCount + 1\n'
+        '            set closeStrategy to "menu"\n'
+        '            delay 0.05\n'
+        '          end try\n'
         '        end repeat\n'
         '      end try\n'
         '      if menuMatchCount > matchCount then set matchCount to menuMatchCount\n'
@@ -664,47 +683,69 @@ def close_ltspice_window(
         '  end tell\n'
         'end tell'
     )
-    proc = subprocess.run(
-        ["osascript", "-e", script],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    status = "UNKNOWN"
-    matched_windows = 0
-    closed_windows = 0
-    close_strategy = None
-    for raw_line in reversed(proc.stdout.splitlines()):
-        line = raw_line.strip()
-        if not line:
-            continue
-        parts = line.split("|")
-        if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
-            status = parts[0]
-            matched_windows = int(parts[1])
-            closed_windows = int(parts[2])
-            if len(parts) >= 4 and parts[3]:
-                close_strategy = parts[3]
-            break
-    if status == "UNKNOWN" and proc.returncode == 0:
-        status = "OK"
+    max_attempts = max(1, min(10, int(attempts)))
+    attempt_delay = max(0.0, float(retry_delay))
+    attempt_events: list[dict[str, Any]] = []
+    for attempt_index in range(max_attempts):
+        proc = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        status = "UNKNOWN"
+        matched_windows = 0
+        closed_windows = 0
+        close_strategy = None
+        for raw_line in reversed(proc.stdout.splitlines()):
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = line.split("|")
+            if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
+                status = parts[0]
+                matched_windows = int(parts[1])
+                closed_windows = int(parts[2])
+                if len(parts) >= 4 and parts[3]:
+                    close_strategy = parts[3]
+                break
+        if status == "UNKNOWN" and proc.returncode == 0:
+            status = "OK"
 
-    all_matches_closed = matched_windows > 0 and closed_windows == matched_windows
-    return {
-        "closed": proc.returncode == 0 and all_matches_closed,
-        "partially_closed": proc.returncode == 0 and 0 < closed_windows < matched_windows,
-        "matched_windows": matched_windows,
-        "closed_windows": closed_windows,
-        "close_strategy": close_strategy,
-        "status": status,
-        "return_code": proc.returncode,
-        "title_hint": title_hint,
-        "exact_title": title_exact or None,
-        "window_id": target_window_id,
-        "command": ["osascript", "-e", script],
-        "stdout": proc.stdout.strip(),
-        "stderr": proc.stderr.strip(),
-    }
+        all_matches_closed = matched_windows > 0 and closed_windows == matched_windows
+        event: dict[str, Any] = {
+            "closed": proc.returncode == 0 and all_matches_closed,
+            "partially_closed": proc.returncode == 0 and 0 < closed_windows < matched_windows,
+            "matched_windows": matched_windows,
+            "closed_windows": closed_windows,
+            "close_strategy": close_strategy,
+            "status": status,
+            "return_code": proc.returncode,
+            "title_hint": title_hint,
+            "exact_title": title_exact or None,
+            "window_id": target_window_id,
+            "command": ["osascript", "-e", script],
+            "stdout": proc.stdout.strip(),
+            "stderr": proc.stderr.strip(),
+            "attempt": attempt_index + 1,
+        }
+        attempt_events.append(event)
+
+        if event["closed"]:
+            break
+
+        stderr_lower = str(event.get("stderr", "")).lower()
+        if "assistive access" in stderr_lower or "(-25211)" in stderr_lower:
+            break
+
+        if attempt_index + 1 < max_attempts and attempt_delay > 0:
+            time.sleep(attempt_delay)
+
+    result = attempt_events[-1]
+    result["attempt_count"] = len(attempt_events)
+    if len(attempt_events) > 1:
+        result["attempts"] = attempt_events
+    return result
 
 
 def _capture_ltspice_window_with_screencapturekit(
@@ -939,7 +980,12 @@ def capture_ltspice_window_screenshot(
             if isinstance(capture_window_title, str) and capture_window_title.strip():
                 close_kwargs["exact_title"] = capture_window_title.strip()
             try:
-                close_event = close_ltspice_window(close_title, **close_kwargs)
+                close_event = close_ltspice_window(
+                    close_title,
+                    attempts=5,
+                    retry_delay=0.2,
+                    **close_kwargs,
+                )
             except Exception as exc:
                 close_event = {
                     "closed": False,
