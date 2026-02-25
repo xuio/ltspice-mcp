@@ -9,6 +9,7 @@ from unittest.mock import patch
 from ltspice_mcp.ltspice import (
     _capture_ltspice_window_with_screencapturekit,
     capture_ltspice_window_screenshot,
+    close_ltspice_window,
     open_in_ltspice_ui,
 )
 
@@ -116,7 +117,11 @@ class TestScreenCaptureKitPath(unittest.TestCase):
             )
 
         open_mock.assert_called_once_with(open_path, background=True)
-        close_mock.assert_called_once_with("source.asc")
+        close_mock.assert_called_once_with(
+            "source.asc",
+            window_id=777,
+            exact_title="source.asc",
+        )
         self.assertEqual(sck_mock.call_count, 1)
         self.assertEqual(payload["capture_backend"], "screencapturekit")
         self.assertEqual(payload["window_id"], 777)
@@ -182,6 +187,30 @@ class TestScreenCaptureKitPath(unittest.TestCase):
         self.assertEqual(payload["capture_command"][:2], ["screencapture", "-x"])
         close_mock.assert_called_once_with("source.asc")
         self.assertTrue(payload["close_event"]["closed"])
+
+class TestCloseLtspiceWindow(unittest.TestCase):
+    def test_close_ltspice_window_requires_any_selector(self) -> None:
+        with patch("ltspice_mcp.ltspice.platform.system", return_value="Darwin"):
+            payload = close_ltspice_window("  ")
+        self.assertFalse(payload["closed"])
+        self.assertIn("selector", payload["error"])
+
+    def test_close_ltspice_window_reports_no_match_as_not_closed(self) -> None:
+        with (
+            patch("ltspice_mcp.ltspice.platform.system", return_value="Darwin"),
+            patch("ltspice_mcp.ltspice.subprocess.run") as run_mock,
+        ):
+            run_mock.return_value = CompletedProcess(
+                args=["osascript"],
+                returncode=0,
+                stdout="OK|0|0\n",
+                stderr="",
+            )
+            payload = close_ltspice_window("foo.asc")
+        self.assertFalse(payload["closed"])
+        self.assertEqual(payload["matched_windows"], 0)
+        self.assertEqual(payload["closed_windows"], 0)
+        self.assertEqual(payload["status"], "OK")
 
 
 if __name__ == "__main__":

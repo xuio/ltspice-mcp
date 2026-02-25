@@ -562,32 +562,77 @@ def open_in_ltspice_ui(
     }
 
 
-def close_ltspice_window(title_hint: str) -> dict[str, Any]:
-    if not title_hint.strip():
+def close_ltspice_window(
+    title_hint: str,
+    *,
+    window_id: int | None = None,
+    exact_title: str | None = None,
+) -> dict[str, Any]:
+    title_contains = title_hint.strip()
+    title_exact = (exact_title or "").strip()
+    target_window_id = window_id if isinstance(window_id, int) and window_id > 0 else None
+    if not title_contains and not title_exact and target_window_id is None:
         return {
             "closed": False,
             "return_code": 1,
             "title_hint": title_hint,
-            "error": "title_hint must be non-empty to close LTspice window",
+            "exact_title": exact_title,
+            "window_id": window_id,
+            "error": "Provide at least one selector (title_hint, exact_title, or positive window_id)",
         }
     if platform.system() != "Darwin":
         raise RuntimeError("LTspice UI integration is currently implemented for macOS only.")
 
-    escaped = title_hint.replace('"', '\\"')
+    def _escape_applescript_string(value: str) -> str:
+        return value.replace("\\", "\\\\").replace('"', '\\"')
+
+    escaped_contains = _escape_applescript_string(title_contains)
+    escaped_exact = _escape_applescript_string(title_exact)
+    escaped_window_id = str(target_window_id) if target_window_id is not None else ""
     script = (
         'tell application "System Events"\n'
-        '  if not (exists process "LTspice") then return\n'
+        '  if not (exists process "LTspice") then return "PROCESS_MISSING|0|0"\n'
+        f'  set targetContainsName to "{escaped_contains}"\n'
+        f'  set targetExactName to "{escaped_exact}"\n'
+        f'  set targetWindowId to "{escaped_window_id}"\n'
         '  tell process "LTspice"\n'
-        f'    set matches to (windows whose name contains "{escaped}")\n'
+        '    set matches to {}\n'
+        '    repeat with w in windows\n'
+        '      set windowName to ""\n'
+        '      try\n'
+        '        set windowName to (name of w) as text\n'
+        '      end try\n'
+        '      set windowNumber to ""\n'
+        '      try\n'
+        '        set windowNumber to (value of attribute "AXWindowNumber" of w) as text\n'
+        '      end try\n'
+        '      set isMatch to false\n'
+        '      if targetWindowId is not "" and windowNumber is targetWindowId then set isMatch to true\n'
+        '      if (not isMatch) and targetExactName is not "" and windowName is targetExactName then set isMatch to true\n'
+        '      if (not isMatch) and targetContainsName is not "" and windowName contains targetContainsName then set isMatch to true\n'
+        '      if isMatch then set end of matches to w\n'
+        '    end repeat\n'
+        '    set matchCount to (count of matches)\n'
+        '    set closeCount to 0\n'
         '    repeat with w in matches\n'
+        '      set didClose to false\n'
         '      try\n'
         '        click (first button of w whose subrole is "AXCloseButton")\n'
+        '        set didClose to true\n'
         '      on error\n'
         '        try\n'
-        '          perform action "AXCloseButton" of w\n'
+        '          perform action "AXPress" of (first button of w whose subrole is "AXCloseButton")\n'
+        '          set didClose to true\n'
+        '        on error\n'
+        '          try\n'
+        '            perform action "AXClose" of w\n'
+        '            set didClose to true\n'
+        '          end try\n'
         '        end try\n'
         '      end try\n'
+        '      if didClose then set closeCount to closeCount + 1\n'
         '    end repeat\n'
+        '    return "OK|" & (matchCount as text) & "|" & (closeCount as text)\n'
         '  end tell\n'
         'end tell'
     )
@@ -597,10 +642,33 @@ def close_ltspice_window(title_hint: str) -> dict[str, Any]:
         text=True,
         check=False,
     )
+    status = "UNKNOWN"
+    matched_windows = 0
+    closed_windows = 0
+    for raw_line in reversed(proc.stdout.splitlines()):
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split("|")
+        if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+            status = parts[0]
+            matched_windows = int(parts[1])
+            closed_windows = int(parts[2])
+            break
+    if status == "UNKNOWN" and proc.returncode == 0:
+        status = "OK"
+
+    all_matches_closed = matched_windows > 0 and closed_windows == matched_windows
     return {
-        "closed": proc.returncode == 0,
+        "closed": proc.returncode == 0 and all_matches_closed,
+        "partially_closed": proc.returncode == 0 and 0 < closed_windows < matched_windows,
+        "matched_windows": matched_windows,
+        "closed_windows": closed_windows,
+        "status": status,
         "return_code": proc.returncode,
         "title_hint": title_hint,
+        "exact_title": title_exact or None,
+        "window_id": target_window_id,
         "command": ["osascript", "-e", script],
         "stdout": proc.stdout.strip(),
         "stderr": proc.stderr.strip(),
@@ -832,13 +900,21 @@ def capture_ltspice_window_screenshot(
     finally:
         if opened_window and close_after_capture:
             close_title = title_hint or (Path(open_path).name if open_path is not None else "")
+            close_kwargs: dict[str, Any] = {}
+            if window_id is not None:
+                close_kwargs["window_id"] = window_id
+            capture_window_title = window_info.get("window_title")
+            if isinstance(capture_window_title, str) and capture_window_title.strip():
+                close_kwargs["exact_title"] = capture_window_title.strip()
             try:
-                close_event = close_ltspice_window(close_title)
+                close_event = close_ltspice_window(close_title, **close_kwargs)
             except Exception as exc:
                 close_event = {
                     "closed": False,
                     "return_code": 1,
                     "title_hint": close_title,
+                    "exact_title": close_kwargs.get("exact_title"),
+                    "window_id": close_kwargs.get("window_id"),
                     "error": str(exc),
                 }
 
