@@ -358,36 +358,29 @@ def _ensure_screencapturekit_helper() -> tuple[Path, dict[str, Any]]:
 
         if not (_is_executable(helper_path) and existing_hash == source_hash):
             helper_source_path.write_text(_SCK_HELPER_SOURCE, encoding="utf-8")
-            temp_output_path = helper_dir / (
-                f".{_SCK_HELPER_FILENAME}.tmp-{os.getpid()}-{int(time.time() * 1000)}"
-            )
             compile_command = [
                 swiftc,
                 "-O",
                 "-o",
-                str(temp_output_path),
+                str(helper_path),
                 str(helper_source_path),
             ]
-            try:
-                compile_proc = subprocess.run(
-                    compile_command,
-                    capture_output=True,
-                    text=True,
-                    check=False,
+            compile_proc = subprocess.run(
+                compile_command,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            compile_stdout = compile_proc.stdout.strip()
+            compile_stderr = compile_proc.stderr.strip()
+            if compile_proc.returncode != 0:
+                raise RuntimeError(
+                    "swiftc failed to build ScreenCaptureKit helper "
+                    f"(rc={compile_proc.returncode}): {compile_stderr or compile_stdout}"
                 )
-                compile_stdout = compile_proc.stdout.strip()
-                compile_stderr = compile_proc.stderr.strip()
-                if compile_proc.returncode != 0:
-                    raise RuntimeError(
-                        "swiftc failed to build ScreenCaptureKit helper "
-                        f"(rc={compile_proc.returncode}): {compile_stderr or compile_stdout}"
-                    )
-                temp_output_path.chmod(0o755)
-                temp_output_path.replace(helper_path)
-                helper_hash_path.write_text(f"{source_hash}\n", encoding="utf-8")
-                compiled = True
-            finally:
-                temp_output_path.unlink(missing_ok=True)
+            helper_path.chmod(0o755)
+            helper_hash_path.write_text(f"{source_hash}\n", encoding="utf-8")
+            compiled = True
 
     return helper_path, {
         "helper_path": str(helper_path),

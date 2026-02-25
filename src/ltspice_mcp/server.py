@@ -4105,11 +4105,70 @@ def main() -> None:
     )
     parser.add_argument(
         "--transport",
-        default="stdio",
-        choices=["stdio", "sse"],
+        default=os.getenv("LTSPICE_MCP_TRANSPORT", "stdio"),
+        choices=["stdio", "sse", "streamable-http"],
         help="MCP transport",
     )
+    parser.add_argument(
+        "--daemon-http",
+        action="store_true",
+        help=(
+            "Run as a long-lived HTTP MCP daemon "
+            "(equivalent to --transport streamable-http)."
+        ),
+    )
+    parser.add_argument(
+        "--host",
+        default=os.getenv("LTSPICE_MCP_HOST", "127.0.0.1"),
+        help="Bind host for HTTP transports (sse/streamable-http).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.getenv("LTSPICE_MCP_PORT", "8000")),
+        help="Bind port for HTTP transports (sse/streamable-http).",
+    )
+    parser.add_argument(
+        "--mount-path",
+        default=os.getenv("LTSPICE_MCP_MOUNT_PATH", "/"),
+        help="Mount path for HTTP transports (sse/streamable-http).",
+    )
+    parser.add_argument(
+        "--sse-path",
+        default=os.getenv("LTSPICE_MCP_SSE_PATH", "/sse"),
+        help="SSE endpoint path when --transport sse is used.",
+    )
+    parser.add_argument(
+        "--message-path",
+        default=os.getenv("LTSPICE_MCP_MESSAGE_PATH", "/messages/"),
+        help="SSE message endpoint path when --transport sse is used.",
+    )
+    parser.add_argument(
+        "--http-path",
+        dest="streamable_http_path",
+        default=os.getenv("LTSPICE_MCP_STREAMABLE_HTTP_PATH", "/mcp"),
+        help="Streamable HTTP endpoint path when --transport streamable-http is used.",
+    )
     args = parser.parse_args()
+
+    transport = args.transport
+    if args.daemon_http:
+        if args.transport not in {"stdio", "streamable-http"}:
+            parser.error("--daemon-http can only be combined with stdio or streamable-http transport.")
+        transport = "streamable-http"
+
+    def _normalize_http_path(raw: str, *, trailing_slash: bool = False) -> str:
+        value = raw.strip() or "/"
+        if not value.startswith("/"):
+            value = f"/{value}"
+        if trailing_slash and not value.endswith("/"):
+            value = f"{value}/"
+        return value
+
+    mount_path = _normalize_http_path(args.mount_path)
+    sse_path = _normalize_http_path(args.sse_path)
+    message_path = _normalize_http_path(args.message_path, trailing_slash=True)
+    streamable_http_path = _normalize_http_path(args.streamable_http_path)
 
     _configure_runner(
         workdir=Path(args.workdir).expanduser().resolve(),
@@ -4119,7 +4178,17 @@ def main() -> None:
         schematic_single_window=args.schematic_single_window,
         schematic_live_path=args.schematic_live_path,
     )
-    mcp.run(transport=args.transport)
+    mcp.settings.host = args.host
+    mcp.settings.port = args.port
+    mcp.settings.mount_path = mount_path
+    mcp.settings.sse_path = sse_path
+    mcp.settings.message_path = message_path
+    mcp.settings.streamable_http_path = streamable_http_path
+
+    if transport == "sse":
+        mcp.run(transport=transport, mount_path=mount_path)
+        return
+    mcp.run(transport=transport)
 
 
 if __name__ == "__main__":

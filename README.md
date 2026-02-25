@@ -62,6 +62,11 @@ pip install -e .
 ltspice-mcp --transport stdio
 ```
 
+Transport modes:
+- `stdio` (default): subprocess mode for MCP clients that spawn the server
+- `sse`: HTTP + SSE endpoint mode
+- `streamable-http`: HTTP MCP endpoint mode (best for standalone daemon setups)
+
 Optional flags:
 
 ```bash
@@ -72,11 +77,30 @@ ltspice-mcp \
   --transport stdio
 ```
 
+HTTP daemon example:
+
+```bash
+ltspice-mcp \
+  --daemon-http \
+  --host 127.0.0.1 \
+  --port 8765 \
+  --http-path /mcp \
+  --workdir /absolute/path/to/workdir \
+  --ltspice-binary /Applications/LTspice.app/Contents/MacOS/LTspice
+```
+
 Environment variables:
 
 - `LTSPICE_BINARY`
 - `LTSPICE_MCP_WORKDIR`
 - `LTSPICE_MCP_TIMEOUT`
+- `LTSPICE_MCP_TRANSPORT` (`stdio`/`sse`/`streamable-http`)
+- `LTSPICE_MCP_HOST` (HTTP transports)
+- `LTSPICE_MCP_PORT` (HTTP transports)
+- `LTSPICE_MCP_MOUNT_PATH` (HTTP transports)
+- `LTSPICE_MCP_SSE_PATH` (SSE transport endpoint path)
+- `LTSPICE_MCP_MESSAGE_PATH` (SSE message endpoint path)
+- `LTSPICE_MCP_STREAMABLE_HTTP_PATH` (streamable-http endpoint path, default `/mcp`)
 - `LTSPICE_MCP_UI_ENABLED` (`true`/`false`)
 - `LTSPICE_MCP_SCHEMATIC_SINGLE_WINDOW` (`true`/`false`, default `true`)
 - `LTSPICE_MCP_SCHEMATIC_LIVE_PATH` (optional live schematic path override)
@@ -157,6 +181,7 @@ Responses include:
 
 ## Example client config
 
+Subprocess (`stdio`) mode:
 ```json
 {
   "mcpServers": {
@@ -168,6 +193,37 @@ Responses include:
   }
 }
 ```
+
+Daemon (`streamable-http`) mode:
+```toml
+[mcp_servers.ltspice]
+url = "http://127.0.0.1:8765/mcp"
+enabled = true
+```
+
+Claude Desktop daemon config example:
+```json
+{
+  "mcpServers": {
+    "ltspice-mcp": {
+      "url": "http://127.0.0.1:8765/mcp"
+    }
+  }
+}
+```
+
+## Standalone daemon mode (optional)
+
+Use this mode when you want one long-lived MCP server process shared by multiple clients (Codex, Claude, etc.) over HTTP.
+
+1. Start daemon in a dedicated terminal:
+```bash
+ltspice-mcp --daemon-http --host 127.0.0.1 --port 8765 --http-path /mcp
+```
+
+2. Point clients to `http://127.0.0.1:8765/mcp` via URL config instead of `command` + `args`.
+
+3. Keep daemon running (or run it via `launchd`) so clients connect to it rather than spawning separate subprocesses.
 
 ## UI integration (optional)
 
