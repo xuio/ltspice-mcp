@@ -206,11 +206,14 @@ Claude Desktop daemon config example:
 {
   "mcpServers": {
     "ltspice-mcp": {
-      "url": "http://127.0.0.1:8765/mcp"
+      "command": "/opt/homebrew/bin/npx",
+      "args": ["-y", "mcp-remote", "http://127.0.0.1:8765/mcp"]
     }
   }
 }
 ```
+
+Note: on some Claude Desktop builds, a direct `"url"` entry can cause startup failures. The `mcp-remote` bridge above is the stable option.
 
 ## Standalone daemon mode (optional)
 
@@ -221,7 +224,9 @@ Use this mode when you want one long-lived MCP server process shared by multiple
 ltspice-mcp --daemon-http --host 127.0.0.1 --port 8765 --http-path /mcp
 ```
 
-2. Point clients to `http://127.0.0.1:8765/mcp` via URL config instead of `command` + `args`.
+2. Point clients to `http://127.0.0.1:8765/mcp`:
+   - Codex/URL-capable clients: direct URL config
+   - Claude Desktop: use `mcp-remote` bridge (`command` + `args`) as shown above
 
 3. Keep daemon running (or run it via `launchd`) so clients connect to it rather than spawning separate subprocesses.
 
