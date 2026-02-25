@@ -136,6 +136,15 @@ Environment variables:
 - `LTSPICE_MCP_SCHEMATIC_LIVE_PATH` (optional live schematic path override)
 - `LTSPICE_MCP_SCK_HELPER_DIR` (optional ScreenCaptureKit helper cache dir; default `~/Library/Application Support/ltspice-mcp/bin`)
 - `LTSPICE_MCP_SCK_HELPER_PATH` (optional absolute path to a prebuilt ScreenCaptureKit helper executable)
+- `LTSPICE_MCP_LOG_LEVEL` (`DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`, default `INFO`)
+- `LTSPICE_MCP_TOOL_LOGGING` (`true`/`false`, default `true`)
+- `LTSPICE_MCP_TOOL_LOG_MAX_ITEMS` (max collection items summarized per tool log event, default `16`)
+- `LTSPICE_MCP_TOOL_LOG_MAX_CHARS` (max string size summarized per tool log event, default `300`)
+
+Tool-call logs are emitted as structured JSON with the `mcp_tool` prefix, including:
+- `tool_call_start` (tool name + summarized args/kwargs)
+- `tool_call_success` (elapsed time + summarized result)
+- `tool_call_error` (elapsed time + exception type/message)
 
 ## MCP tools
 

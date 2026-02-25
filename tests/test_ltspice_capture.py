@@ -194,6 +194,12 @@ class TestScreenCaptureKitPath(unittest.TestCase):
         self.assertEqual(payload["capture_command"], None)
         self.assertEqual(payload["width"], 300)
         self.assertEqual(payload["height"], 200)
+        self.assertIsInstance(payload["capture_id"], str)
+        self.assertEqual(payload["capture_diagnostics"]["capture_id"], payload["capture_id"])
+        self.assertEqual(
+            sck_mock.call_args.kwargs.get("capture_id"),
+            payload["capture_id"],
+        )
         self.assertTrue(payload["close_event"]["closed"])
         self.assertIn("capture_diagnostics", payload)
 

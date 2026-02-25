@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -300,6 +301,57 @@ class TestDevelopmentTools(unittest.TestCase):
         payload = server.getToolTelemetry(tool_name="listIntentCircuitTemplates")
         self.assertEqual(payload["tool_count"], 1)
         self.assertGreaterEqual(payload["tools"][0]["calls_total"], 2)
+
+    def test_tool_logging_emits_start_and_success_events(self) -> None:
+        previous = server._TOOL_LOGGING_ENABLED
+        server._TOOL_LOGGING_ENABLED = True
+        try:
+            with self.assertLogs(server.__name__, level="INFO") as log_capture:
+                server.listIntentCircuitTemplates()
+        finally:
+            server._TOOL_LOGGING_ENABLED = previous
+
+        events = []
+        for line in log_capture.output:
+            if "mcp_tool " not in line:
+                continue
+            payload = json.loads(line.split("mcp_tool ", 1)[1])
+            events.append(payload)
+
+        self.assertTrue(events, "Expected structured mcp_tool log entries.")
+        starts = [event for event in events if event.get("event") == "tool_call_start"]
+        successes = [event for event in events if event.get("event") == "tool_call_success"]
+        self.assertTrue(starts, "Expected tool_call_start log entry.")
+        self.assertTrue(successes, "Expected tool_call_success log entry.")
+        self.assertEqual(starts[0]["tool"], "listIntentCircuitTemplates")
+        self.assertEqual(successes[0]["tool"], "listIntentCircuitTemplates")
+        self.assertEqual(starts[0]["call_id"], successes[0]["call_id"])
+
+    def test_tool_logging_emits_error_event(self) -> None:
+        previous = server._TOOL_LOGGING_ENABLED
+        server._TOOL_LOGGING_ENABLED = True
+        try:
+            with self.assertLogs(server.__name__, level="INFO") as log_capture:
+                with self.assertRaises(ValueError):
+                    server.getLtspiceSymbolInfo(symbol="")
+        finally:
+            server._TOOL_LOGGING_ENABLED = previous
+
+        events = []
+        for line in log_capture.output:
+            if "mcp_tool " not in line:
+                continue
+            payload = json.loads(line.split("mcp_tool ", 1)[1])
+            events.append(payload)
+
+        starts = [event for event in events if event.get("event") == "tool_call_start"]
+        errors = [event for event in events if event.get("event") == "tool_call_error"]
+        self.assertTrue(starts, "Expected tool_call_start log entry.")
+        self.assertTrue(errors, "Expected tool_call_error log entry.")
+        self.assertEqual(starts[0]["tool"], "getLtspiceSymbolInfo")
+        self.assertEqual(errors[0]["tool"], "getLtspiceSymbolInfo")
+        self.assertEqual(errors[0]["error_type"], "ValueError")
+        self.assertEqual(starts[0]["call_id"], errors[0]["call_id"])
 
 
 if __name__ == "__main__":

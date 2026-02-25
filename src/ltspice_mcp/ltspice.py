@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import platform
 import re
@@ -11,12 +12,14 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from .models import SimulationDiagnostic, SimulationRun
 from .textio import read_text_auto
 
 
 _END_DIRECTIVE_RE = re.compile(r"(?im)^\s*\.end\b")
+_LOGGER = logging.getLogger(__name__)
 
 _CATEGORY_RULES: list[tuple[str, str, re.Pattern[str], str]] = [
     (
@@ -60,6 +63,15 @@ _CATEGORY_RULES: list[tuple[str, str, re.Pattern[str], str]] = [
         "Review warning context to ensure simulation accuracy is acceptable.",
     ),
 ]
+
+
+def _log_capture_event(level: int, event: str, **fields: Any) -> None:
+    payload = {"event": event, **fields}
+    try:
+        encoded = json.dumps(payload, sort_keys=True, default=str)
+    except Exception:  # noqa: BLE001
+        encoded = str(payload)
+    _LOGGER.log(level, "ltspice_capture %s", encoded)
 
 _SCK_HELPER_SOURCE = r"""
 import Foundation
@@ -1315,6 +1327,7 @@ def _capture_ltspice_window_with_screencapturekit(
     timeout_seconds: float = 20.0,
     attempts: int = 3,
     retry_delay: float = 0.4,
+    capture_id: str | None = None,
 ) -> dict[str, Any]:
     if platform.system() != "Darwin":
         raise RuntimeError("ScreenCaptureKit capture is currently implemented for macOS only.")
@@ -1358,6 +1371,18 @@ def _capture_ltspice_window_with_screencapturekit(
             (title_hint or ""),
             f"{helper_timeout:.3f}",
         ]
+        _log_capture_event(
+            logging.INFO,
+            "sck_attempt_start",
+            capture_id=capture_id,
+            attempt=attempt_index + 1,
+            max_attempts=max_attempts,
+            helper_path=str(helper_path),
+            title_hint=title_hint,
+            output_path=str(output_path),
+            per_attempt_timeout=per_attempt_timeout,
+            helper_timeout=helper_timeout,
+        )
         try:
             proc = subprocess.run(
                 command,
@@ -1371,6 +1396,15 @@ def _capture_ltspice_window_with_screencapturekit(
             last_error_message = (
                 f"helper process timed out after {per_attempt_timeout:.3f}s "
                 f"(attempt {attempt_index + 1}/{max_attempts})"
+            )
+            _log_capture_event(
+                logging.WARNING,
+                "sck_attempt_timeout",
+                capture_id=capture_id,
+                attempt=attempt_index + 1,
+                max_attempts=max_attempts,
+                duration_seconds=duration_seconds,
+                error=last_error_message,
             )
             attempt_events.append(
                 {
@@ -1419,8 +1453,26 @@ def _capture_ltspice_window_with_screencapturekit(
                     "attempts": attempt_events,
                 }
                 if payload:
+                    _log_capture_event(
+                        logging.INFO,
+                        "sck_capture_success",
+                        capture_id=capture_id,
+                        attempt=attempt_index + 1,
+                        duration_seconds=duration_seconds,
+                        output_path=str(output_path),
+                        window_id=payload.get("window_id"),
+                        window_title=payload.get("window_title"),
+                    )
                     payload["capture_diagnostics"] = diagnostics
                     return payload
+                _log_capture_event(
+                    logging.INFO,
+                    "sck_capture_success",
+                    capture_id=capture_id,
+                    attempt=attempt_index + 1,
+                    duration_seconds=duration_seconds,
+                    output_path=str(output_path),
+                )
                 return {
                     "capture_mode": "screencapturekit_window",
                     "capture_diagnostics": diagnostics,
@@ -1431,21 +1483,49 @@ def _capture_ltspice_window_with_screencapturekit(
                 f"{output_path}"
             )
             attempt_events[-1]["error"] = last_error_message
+            _log_capture_event(
+                logging.WARNING,
+                "sck_attempt_missing_file",
+                capture_id=capture_id,
+                attempt=attempt_index + 1,
+                duration_seconds=duration_seconds,
+                error=last_error_message,
+            )
             if attempt_index + 1 < max_attempts and delay_seconds > 0:
                 time.sleep(delay_seconds)
             continue
 
         retryable = _is_retryable_sck_error(message)
+        _log_capture_event(
+            logging.WARNING,
+            "sck_attempt_failed",
+            capture_id=capture_id,
+            attempt=attempt_index + 1,
+            max_attempts=max_attempts,
+            duration_seconds=duration_seconds,
+            return_code=proc.returncode,
+            retryable=retryable,
+            error=message,
+        )
         if attempt_index + 1 < max_attempts and retryable:
             if delay_seconds > 0:
                 time.sleep(delay_seconds)
             continue
         break
 
+    _log_capture_event(
+        logging.ERROR,
+        "sck_capture_failed",
+        capture_id=capture_id,
+        attempts=len(attempt_events),
+        max_attempts=max_attempts,
+        error=last_error_message,
+        helper_details=helper_details,
+    )
     raise RuntimeError(
         "ScreenCaptureKit capture failed after "
         f"{len(attempt_events)} attempt(s): {last_error_message}; "
-        f"diagnostics={json.dumps({'attempts': attempt_events, 'helper_details': helper_details})}"
+        f"diagnostics={json.dumps({'capture_id': capture_id, 'attempts': attempt_events, 'helper_details': helper_details})}"
     )
 
 
@@ -1526,6 +1606,7 @@ def capture_ltspice_window_screenshot(
     target = Path(output_path).expanduser().resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
     started_monotonic = time.monotonic()
+    capture_id = uuid4().hex[:12]
     preflight = {
         "platform": platform.system(),
         "prefer_screencapturekit": bool(prefer_screencapturekit),
@@ -1537,6 +1618,17 @@ def capture_ltspice_window_screenshot(
         "sck_helper_dir_env": os.getenv("LTSPICE_MCP_SCK_HELPER_DIR"),
         "ltspice_ui_running_before_open": is_ltspice_ui_running(),
     }
+    _log_capture_event(
+        logging.INFO,
+        "capture_start",
+        capture_id=capture_id,
+        output_path=str(target),
+        open_path=preflight["open_path"],
+        title_hint=title_hint,
+        prefer_screencapturekit=bool(prefer_screencapturekit),
+        avoid_space_switch=bool(avoid_space_switch),
+        settle_seconds=float(settle_seconds),
+    )
 
     open_event: dict[str, Any] | None = None
     close_event: dict[str, Any] | None = None
@@ -1547,7 +1639,15 @@ def capture_ltspice_window_screenshot(
             background=avoid_space_switch,
         )
         if not open_event.get("opened", False):
-            raise RuntimeError(f"Failed to open LTspice UI target: {open_event}")
+            _log_capture_event(
+                logging.ERROR,
+                "capture_open_failed",
+                capture_id=capture_id,
+                open_event=open_event,
+            )
+            raise RuntimeError(
+                f"Failed to open LTspice UI target (capture_id={capture_id}): {open_event}"
+            )
         opened_window = True
 
     if settle_seconds > 0:
@@ -1569,6 +1669,7 @@ def capture_ltspice_window_screenshot(
                     output_path=target,
                     title_hint=title_hint,
                     timeout_seconds=max(10.0, settle_seconds + 20.0),
+                    capture_id=capture_id,
                 )
                 capture_backend = "screencapturekit"
                 raw_window_id = window_info.get("window_id")
@@ -1576,9 +1677,17 @@ def capture_ltspice_window_screenshot(
                     window_id = raw_window_id
             except Exception as exc:
                 elapsed = round(time.monotonic() - started_monotonic, 6)
+                _log_capture_event(
+                    logging.ERROR,
+                    "capture_screencapturekit_failed",
+                    capture_id=capture_id,
+                    error=str(exc),
+                    elapsed_seconds=elapsed,
+                    preflight=preflight,
+                )
                 raise RuntimeError(
                     "ScreenCaptureKit capture failed: "
-                    f"{exc}; diagnostics={json.dumps({'elapsed_seconds': elapsed, 'preflight': preflight})}"
+                    f"{exc}; diagnostics={json.dumps({'capture_id': capture_id, 'elapsed_seconds': elapsed, 'preflight': preflight})}"
                 ) from exc
 
         if capture_backend != "screencapturekit":
@@ -1591,8 +1700,15 @@ def capture_ltspice_window_screenshot(
                 check=False,
             )
             if capture.returncode != 0:
+                _log_capture_event(
+                    logging.ERROR,
+                    "capture_screencapture_failed",
+                    capture_id=capture_id,
+                    return_code=capture.returncode,
+                    stderr=capture.stderr.strip(),
+                )
                 raise RuntimeError(
-                    f"screencapture failed (rc={capture.returncode}): {capture.stderr.strip()}"
+                    f"screencapture failed (capture_id={capture_id}, rc={capture.returncode}): {capture.stderr.strip()}"
                 )
             capture_stderr = capture.stderr.strip()
         else:
@@ -1622,14 +1738,45 @@ def capture_ltspice_window_screenshot(
                     "window_id": close_kwargs.get("window_id"),
                     "error": str(exc),
                 }
+            if close_event and not close_event.get("closed", False):
+                _log_capture_event(
+                    logging.WARNING,
+                    "capture_close_incomplete",
+                    capture_id=capture_id,
+                    close_event=close_event,
+                )
 
     if not target.exists():
-        raise FileNotFoundError(f"Screenshot capture did not produce file: {target}")
+        _log_capture_event(
+            logging.ERROR,
+            "capture_file_missing",
+            capture_id=capture_id,
+            output_path=str(target),
+            backend=capture_backend,
+            window_info=window_info,
+            open_event=open_event,
+            close_event=close_event,
+        )
+        raise FileNotFoundError(
+            f"Screenshot capture did not produce file (capture_id={capture_id}): {target}"
+        )
 
     downscale_info = _downscale_image_file(target, downscale_factor=downscale_factor)
     width, height = _probe_image_dimensions(target)
     elapsed = round(time.monotonic() - started_monotonic, 6)
+    _log_capture_event(
+        logging.INFO,
+        "capture_success",
+        capture_id=capture_id,
+        backend=capture_backend,
+        output_path=str(target),
+        elapsed_seconds=elapsed,
+        width=width,
+        height=height,
+        window_id=window_id,
+    )
     return {
+        "capture_id": capture_id,
         "image_path": str(target),
         "format": target.suffix.lstrip(".").lower() or "png",
         "window_id": window_id,
@@ -1645,6 +1792,7 @@ def capture_ltspice_window_screenshot(
         "height": height,
         "capture_stderr": capture_stderr,
         "capture_diagnostics": {
+            "capture_id": capture_id,
             "elapsed_seconds": elapsed,
             "settle_seconds": float(settle_seconds),
             "title_hint_used": title_hint,
