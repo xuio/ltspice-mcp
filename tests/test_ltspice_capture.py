@@ -36,8 +36,29 @@ class TestOpenInLtspiceUi(unittest.TestCase):
         self.assertTrue(payload["background"])
         self.assertEqual(payload["background_requested"], True)
         self.assertEqual(payload["command"][:2], ["open", "-g"])
-        self.assertIn("-j", payload["command"])
+        self.assertNotIn("-j", payload["command"])
         self.assertIn(str(target.resolve()), payload["command"])
+
+    def test_open_in_ltspice_ui_can_launch_hidden_when_enabled(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_open_ui_hidden_test_"))
+        target = temp_dir / "test.asc"
+        target.write_text("Version 4\nSHEET 1 100 100\n", encoding="utf-8")
+
+        with (
+            patch("ltspice_mcp.ltspice.platform.system", return_value="Darwin"),
+            patch("ltspice_mcp.ltspice.os.getenv", return_value="1"),
+            patch("ltspice_mcp.ltspice.subprocess.run") as run_mock,
+        ):
+            run_mock.return_value = CompletedProcess(
+                args=["open"],
+                returncode=0,
+                stdout="",
+                stderr="",
+            )
+            payload = open_in_ltspice_ui(target, background=True)
+
+        self.assertTrue(payload["opened"])
+        self.assertIn("-j", payload["command"])
 
 
 class TestScreenCaptureKitPath(unittest.TestCase):

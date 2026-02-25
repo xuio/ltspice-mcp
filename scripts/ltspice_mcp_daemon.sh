@@ -190,7 +190,12 @@ start_daemon() {
 
   (
     cd "${PROJECT_ROOT}"
-    nohup "${UV_BIN}" run --project "${PROJECT_ROOT}" ltspice-mcp \
+    local launch_prefix=()
+    # Fully detach from the caller session so agent-triggered restarts do not drop the daemon.
+    if command -v setsid >/dev/null 2>&1; then
+      launch_prefix=(setsid)
+    fi
+    nohup "${launch_prefix[@]}" "${UV_BIN}" run --project "${PROJECT_ROOT}" ltspice-mcp \
       --daemon-http \
       --host "${HOST}" \
       --port "${PORT}" \
@@ -198,7 +203,7 @@ start_daemon() {
       --workdir "${WORKDIR}" \
       --timeout "${TIMEOUT}" \
       --ltspice-binary "${LTSPICE_BINARY}" \
-      > "${log_file}" 2>&1 &
+      < /dev/null > "${log_file}" 2>&1 &
     echo $! > "${PID_FILE}"
   )
 

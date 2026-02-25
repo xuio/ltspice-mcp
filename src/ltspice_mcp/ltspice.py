@@ -284,6 +284,7 @@ _AX_CLOSE_HELPER_SOURCE = r"""
 import Foundation
 import AppKit
 import ApplicationServices
+import CoreGraphics
 
 let args = CommandLine.arguments
 if args.count < 6 {
@@ -309,7 +310,7 @@ func cfString(_ value: String) -> CFString {
     return value as CFString
 }
 
-func runningLTspicePids() -> [pid_t] {
+func runningLTspicePids() -> Set<pid_t> {
     var pids: [pid_t] = []
     for app in NSWorkspace.shared.runningApplications {
         if app.isTerminated {
@@ -321,7 +322,7 @@ func runningLTspicePids() -> [pid_t] {
             pids.append(app.processIdentifier)
         }
     }
-    return pids
+    return Set(pids)
 }
 
 func asAXElement(_ value: Any?) -> AXUIElement? {
@@ -335,9 +336,24 @@ func asAXElement(_ value: Any?) -> AXUIElement? {
     return nil
 }
 
-func elementKey(_ element: AXUIElement) -> String {
-    let opaque = Unmanaged.passUnretained(element).toOpaque()
-    return "\(opaque)"
+func asInt64(_ value: Any?) -> Int64? {
+    if let number = value as? NSNumber {
+        return number.int64Value
+    }
+    if let intValue = value as? Int {
+        return Int64(intValue)
+    }
+    if let text = value as? String {
+        return Int64(text)
+    }
+    return nil
+}
+
+func asPid(_ value: Any?) -> pid_t? {
+    guard let intValue = asInt64(value) else {
+        return nil
+    }
+    return pid_t(intValue)
 }
 
 func windowTitle(_ window: AXUIElement) -> String {
@@ -374,11 +390,62 @@ func closeWindow(_ window: AXUIElement) -> Bool {
     return false
 }
 
-func appendWindow(_ elementRef: CFTypeRef?, into windows: inout [AXUIElement], seen: inout Set<String>) {
+func windowPoint(_ window: AXUIElement, key: String) -> CGPoint? {
+    var value: CFTypeRef?
+    if AXUIElementCopyAttributeValue(window, key as CFString, &value) != .success {
+        return nil
+    }
+    guard let axValue = value else {
+        return nil
+    }
+    if CFGetTypeID(axValue) != AXValueGetTypeID() {
+        return nil
+    }
+    let typed = unsafeBitCast(axValue, to: AXValue.self)
+    var point = CGPoint.zero
+    if AXValueGetType(typed) != .cgPoint {
+        return nil
+    }
+    if AXValueGetValue(typed, .cgPoint, &point) {
+        return point
+    }
+    return nil
+}
+
+func windowSize(_ window: AXUIElement) -> CGSize? {
+    var value: CFTypeRef?
+    if AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &value) != .success {
+        return nil
+    }
+    guard let axValue = value else {
+        return nil
+    }
+    if CFGetTypeID(axValue) != AXValueGetTypeID() {
+        return nil
+    }
+    let typed = unsafeBitCast(axValue, to: AXValue.self)
+    var size = CGSize.zero
+    if AXValueGetType(typed) != .cgSize {
+        return nil
+    }
+    if AXValueGetValue(typed, .cgSize, &size) {
+        return size
+    }
+    return nil
+}
+
+func windowKey(_ window: AXUIElement, pid: pid_t) -> String {
+    let title = windowTitle(window)
+    let position = windowPoint(window, key: kAXPositionAttribute as String) ?? .zero
+    let size = windowSize(window) ?? .zero
+    return "\(pid)|\(title)|\(Int(position.x))|\(Int(position.y))|\(Int(size.width))|\(Int(size.height))"
+}
+
+func appendWindow(_ elementRef: CFTypeRef?, pid: pid_t, into windows: inout [AXUIElement], seen: inout Set<String>) {
     guard let window = asAXElement(elementRef) else {
         return
     }
-    let key = elementKey(window)
+    let key = windowKey(window, pid: pid)
     if seen.contains(key) {
         return
     }
@@ -386,7 +453,7 @@ func appendWindow(_ elementRef: CFTypeRef?, into windows: inout [AXUIElement], s
     windows.append(window)
 }
 
-func candidateWindows(_ appElement: AXUIElement) -> [AXUIElement] {
+func candidateWindows(_ appElement: AXUIElement, pid: pid_t) -> [AXUIElement] {
     var windows: [AXUIElement] = []
     var seen: Set<String> = []
 
@@ -395,23 +462,23 @@ func candidateWindows(_ appElement: AXUIElement) -> [AXUIElement] {
        let rawWindows {
         if let array = rawWindows as? [Any] {
             for item in array {
-                appendWindow(item as CFTypeRef, into: &windows, seen: &seen)
+                appendWindow(item as CFTypeRef, pid: pid, into: &windows, seen: &seen)
             }
         } else if let array = rawWindows as? NSArray {
             for item in array {
-                appendWindow(item as CFTypeRef, into: &windows, seen: &seen)
+                appendWindow(item as CFTypeRef, pid: pid, into: &windows, seen: &seen)
             }
         }
     }
 
     var focusedWindow: CFTypeRef?
     if AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &focusedWindow) == .success {
-        appendWindow(focusedWindow, into: &windows, seen: &seen)
+        appendWindow(focusedWindow, pid: pid, into: &windows, seen: &seen)
     }
 
     var mainWindow: CFTypeRef?
     if AXUIElementCopyAttributeValue(appElement, kAXMainWindowAttribute as CFString, &mainWindow) == .success {
-        appendWindow(mainWindow, into: &windows, seen: &seen)
+        appendWindow(mainWindow, pid: pid, into: &windows, seen: &seen)
     }
 
     return windows
@@ -433,21 +500,53 @@ func matchesSelector(_ window: AXUIElement) -> Bool {
     return isMatch
 }
 
-func matchingWindows() -> [AXUIElement] {
+func cgMatchingWindows() -> [[String: Any]] {
+    guard let info = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else {
+        return []
+    }
+    var matches: [[String: Any]] = []
+    for entry in info {
+        let owner = entry[kCGWindowOwnerName as String] as? String ?? ""
+        if owner != "LTspice" {
+            continue
+        }
+        let title = entry[kCGWindowName as String] as? String ?? ""
+        let windowNumber = asInt64(entry[kCGWindowNumber as String])
+        var isMatch = false
+        if let targetWindowId, let windowNumber, windowNumber == targetWindowId {
+            isMatch = true
+        }
+        if !isMatch && !titleExact.isEmpty && title == titleExact {
+            isMatch = true
+        }
+        if !isMatch && !titleContains.isEmpty && title.localizedCaseInsensitiveContains(titleContains) {
+            isMatch = true
+        }
+        if isMatch {
+            matches.append(entry)
+        }
+    }
+    return matches
+}
+
+func cgMatchingPidSet() -> Set<pid_t> {
+    var pids: Set<pid_t> = []
+    for entry in cgMatchingWindows() {
+        if let pid = asPid(entry[kCGWindowOwnerPID as String]) {
+            pids.insert(pid)
+        }
+    }
+    return pids
+}
+
+func matchingWindows(targetPids: Set<pid_t>) -> [AXUIElement] {
     var matches: [AXUIElement] = []
-    var seen: Set<String> = []
-    for pid in runningLTspicePids() {
+    for pid in targetPids {
         let appElement = AXUIElementCreateApplication(pid)
-        for window in candidateWindows(appElement) {
-            if !matchesSelector(window) {
-                continue
+        for window in candidateWindows(appElement, pid: pid) {
+            if matchesSelector(window) {
+                matches.append(window)
             }
-            let key = elementKey(window)
-            if seen.contains(key) {
-                continue
-            }
-            seen.insert(key)
-            matches.append(window)
         }
     }
     return matches
@@ -485,15 +584,30 @@ if pids.isEmpty {
     exit(0)
 }
 
-let initialMatches = matchingWindows()
-let initialMatchedCount = initialMatches.count
+let initialCgMatches = cgMatchingWindows()
+let initialMatchedCount = initialCgMatches.count
+let matchingPidSet = cgMatchingPidSet()
+let targetPids = matchingPidSet.isEmpty ? pids : matchingPidSet
 var passEvents: [[String: Any]] = []
 var totalCloseActions = 0
 
 for passIndex in 1...maxPasses {
-    let matches = matchingWindows()
+    let matches = matchingWindows(targetPids: targetPids)
     if matches.isEmpty {
-        break
+        let remaining = cgMatchingWindows().count
+        passEvents.append([
+            "pass": passIndex,
+            "ax_matched": 0,
+            "close_actions": 0,
+            "remaining": remaining
+        ])
+        if remaining == 0 {
+            break
+        }
+        if settleMs > 0 {
+            usleep(useconds_t(settleMs * 1000))
+        }
+        continue
     }
     var closeActions = 0
     for window in matches {
@@ -505,10 +619,10 @@ for passIndex in 1...maxPasses {
     if settleMs > 0 {
         usleep(useconds_t(settleMs * 1000))
     }
-    let remaining = matchingWindows().count
+    let remaining = cgMatchingWindows().count
     passEvents.append([
         "pass": passIndex,
-        "matched": matches.count,
+        "ax_matched": matches.count,
         "close_actions": closeActions,
         "remaining": remaining
     ])
@@ -517,20 +631,21 @@ for passIndex in 1...maxPasses {
     }
 }
 
-let remainingCount = matchingWindows().count
-let closedCount = totalCloseActions
-let closed = remainingCount == 0 && totalCloseActions > 0
+let remainingCount = cgMatchingWindows().count
+let closedCount = max(0, initialMatchedCount - remainingCount)
+let closed = initialMatchedCount > 0 && remainingCount == 0
 let partiallyClosed = !closed && closedCount > 0
 
 emitJSON([
     "status": "OK",
     "closed": closed,
     "partially_closed": partiallyClosed,
-    "matched_windows": max(initialMatchedCount, closedCount + remainingCount),
+    "matched_windows": initialMatchedCount,
     "closed_windows": closedCount,
     "remaining_windows": remainingCount,
     "close_strategy": "ax_helper",
     "pid_count": pids.count,
+    "target_pid_count": targetPids.count,
     "attempt_count": passEvents.count,
     "attempts": passEvents
 ])
@@ -914,9 +1029,17 @@ def open_in_ltspice_ui(
     command = ["open"]
     effective_background = bool(background)
     if effective_background:
-        # `-g` avoids foreground activation and `-j` asks LaunchServices to launch hidden.
-        # Together they reduce chances of macOS Space switches during automation.
-        command.extend(["-g", "-j"])
+        # `-g` avoids foreground activation. `-j` (launch hidden) caused window-management
+        # side effects on some setups, so keep it opt-in.
+        command.append("-g")
+        launch_hidden = os.getenv("LTSPICE_MCP_OPEN_LAUNCH_HIDDEN", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if launch_hidden:
+            command.append("-j")
     command.extend(["-a", "LTspice", str(target)])
     proc = subprocess.run(
         command,
@@ -1002,6 +1125,7 @@ def _close_ltspice_window_with_ax_helper(
     status = str(helper_payload.get("status") or ("OK" if proc.returncode == 0 else "AX_HELPER_FAILED"))
     matched_windows = int(helper_payload.get("matched_windows") or 0)
     closed_windows = int(helper_payload.get("closed_windows") or 0)
+    remaining_windows = int(helper_payload.get("remaining_windows") or 0)
     closed = bool(helper_payload.get("closed"))
     partially_closed = bool(helper_payload.get("partially_closed"))
     if not partially_closed:
@@ -1012,6 +1136,7 @@ def _close_ltspice_window_with_ax_helper(
         "partially_closed": partially_closed,
         "matched_windows": matched_windows,
         "closed_windows": closed_windows,
+        "remaining_windows": remaining_windows,
         "close_strategy": str(helper_payload.get("close_strategy") or "ax_helper"),
         "status": status,
         "return_code": proc.returncode,
