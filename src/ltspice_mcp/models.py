@@ -137,6 +137,7 @@ class SimulationRun:
     log_path: Path | None
     raw_files: list[Path]
     artifacts: list[Path]
+    log_utf8_path: Path | None = None
     issues: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     diagnostics: list[SimulationDiagnostic] = field(default_factory=list)
@@ -156,6 +157,7 @@ class SimulationRun:
             "command": self.command,
             "ltspice_executable": str(self.ltspice_executable),
             "log_path": str(self.log_path) if self.log_path else None,
+            "log_utf8_path": str(self.log_utf8_path) if self.log_utf8_path else None,
             "raw_files": [str(path) for path in self.raw_files],
             "artifacts": [str(path) for path in self.artifacts],
             "issues": self.issues,
@@ -186,6 +188,11 @@ class SimulationRun:
             log_path=(
                 Path(payload["log_path"]).expanduser().resolve()
                 if payload.get("log_path")
+                else None
+            ),
+            log_utf8_path=(
+                Path(payload["log_utf8_path"]).expanduser().resolve()
+                if payload.get("log_utf8_path")
                 else None
             ),
             raw_files=[

@@ -290,6 +290,10 @@ class TestCloseLtspiceWindow(unittest.TestCase):
                     "return_code": 0,
                 },
             ) as helper_mock,
+            patch(
+                "ltspice_mcp.ltspice._apply_post_close_verification",
+                side_effect=lambda event, **_: event,
+            ),
             patch("ltspice_mcp.ltspice.subprocess.run") as run_mock,
         ):
             payload = close_ltspice_window("foo.asc")
@@ -313,6 +317,10 @@ class TestCloseLtspiceWindow(unittest.TestCase):
                     "return_code": 0,
                 },
             ),
+            patch(
+                "ltspice_mcp.ltspice._apply_post_close_verification",
+                side_effect=lambda event, **_: event,
+            ),
             patch("ltspice_mcp.ltspice.subprocess.run") as run_mock,
         ):
             payload = close_ltspice_window("foo.asc")
@@ -324,6 +332,10 @@ class TestCloseLtspiceWindow(unittest.TestCase):
         with (
             patch("ltspice_mcp.ltspice.platform.system", return_value="Darwin"),
             patch("ltspice_mcp.ltspice._close_ltspice_window_with_ax_helper", return_value=None),
+            patch(
+                "ltspice_mcp.ltspice._apply_post_close_verification",
+                side_effect=lambda event, **_: event,
+            ),
             patch("ltspice_mcp.ltspice.subprocess.run") as run_mock,
         ):
             run_mock.return_value = CompletedProcess(
@@ -342,6 +354,10 @@ class TestCloseLtspiceWindow(unittest.TestCase):
         with (
             patch("ltspice_mcp.ltspice.platform.system", return_value="Darwin"),
             patch("ltspice_mcp.ltspice._close_ltspice_window_with_ax_helper", return_value=None),
+            patch(
+                "ltspice_mcp.ltspice._apply_post_close_verification",
+                side_effect=lambda event, **_: event,
+            ),
             patch("ltspice_mcp.ltspice.subprocess.run") as run_mock,
         ):
             run_mock.return_value = CompletedProcess(
@@ -358,6 +374,10 @@ class TestCloseLtspiceWindow(unittest.TestCase):
         with (
             patch("ltspice_mcp.ltspice.platform.system", return_value="Darwin"),
             patch("ltspice_mcp.ltspice._close_ltspice_window_with_ax_helper", return_value=None),
+            patch(
+                "ltspice_mcp.ltspice._apply_post_close_verification",
+                side_effect=lambda event, **_: event,
+            ),
             patch("ltspice_mcp.ltspice.subprocess.run") as run_mock,
         ):
             run_mock.side_effect = [
@@ -378,6 +398,67 @@ class TestCloseLtspiceWindow(unittest.TestCase):
         self.assertTrue(payload["closed"])
         self.assertEqual(payload["attempt_count"], 2)
         self.assertEqual(run_mock.call_count, 2)
+
+    def test_close_ltspice_window_post_verify_marks_remaining_window_not_closed(self) -> None:
+        with (
+            patch("ltspice_mcp.ltspice.platform.system", return_value="Darwin"),
+            patch(
+                "ltspice_mcp.ltspice._close_ltspice_window_with_ax_helper",
+                return_value={
+                    "closed": True,
+                    "partially_closed": False,
+                    "matched_windows": 1,
+                    "closed_windows": 1,
+                    "close_strategy": "ax_helper",
+                    "status": "OK",
+                    "return_code": 0,
+                },
+            ),
+            patch(
+                "ltspice_mcp.ltspice._probe_ltspice_window_matches",
+                return_value={
+                    "status": "OK",
+                    "verification_available": True,
+                    "verified_closed": False,
+                    "matched_windows": 1,
+                    "matching_window_ids": [42],
+                },
+            ),
+        ):
+            payload = close_ltspice_window("foo.asc")
+        self.assertFalse(payload["closed"])
+        self.assertTrue(payload["verification_mismatch"])
+        self.assertEqual(payload["post_verify"]["matched_windows"], 1)
+
+    def test_close_ltspice_window_post_verify_can_upgrade_to_closed(self) -> None:
+        with (
+            patch("ltspice_mcp.ltspice.platform.system", return_value="Darwin"),
+            patch(
+                "ltspice_mcp.ltspice._close_ltspice_window_with_ax_helper",
+                return_value={
+                    "closed": False,
+                    "partially_closed": False,
+                    "matched_windows": 0,
+                    "closed_windows": 0,
+                    "close_strategy": "ax_helper",
+                    "status": "OK",
+                    "return_code": 0,
+                },
+            ),
+            patch(
+                "ltspice_mcp.ltspice._probe_ltspice_window_matches",
+                return_value={
+                    "status": "OK",
+                    "verification_available": True,
+                    "verified_closed": True,
+                    "matched_windows": 0,
+                    "matching_window_ids": [],
+                },
+            ),
+        ):
+            payload = close_ltspice_window("foo.asc")
+        self.assertTrue(payload["closed"])
+        self.assertTrue(payload["verification_mismatch"])
 
 
 if __name__ == "__main__":

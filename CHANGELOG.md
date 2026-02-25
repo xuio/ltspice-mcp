@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.28.0 - 2026-02-25
+
+### Added
+- New MCP diagnostics tools for daemon operations:
+  - `tailDaemonLog`
+  - `getRecentErrors`
+  - `getCaptureHealth`
+- In-memory ScreenCapture/LTspice capture health tracking with structured event summaries.
+- UTF-8 normalized LTspice log sidecars (`*.log.utf8.txt`) recorded per simulation run.
+
+### Improved
+- Streamable HTTP daemon startup now uses explicit uvicorn wiring with graceful shutdown timeout and built-in noise filters.
+- Daemon logs now suppress known OAuth discovery probe 404s and transient `GET /mcp` 400 probe noise by default.
+- Suppressed known uvicorn shutdown false-positive (`ASGI callable returned without completing response`) in daemon logs.
+- `runSimulation`, `simulateNetlist`, `simulateNetlistFile`, and `simulateSchematicFile` now auto-retry once with convergence options when convergence failure is detected.
+- LTspice window close flow now performs post-close verification using exact selectors (window id/title), reducing false close positives.
+
+### Tests
+- Added regression coverage for close verification, convergence auto-retry behavior, uvicorn noise filtering, daemon log diagnostics tools, and UTF-8 log sidecar generation.
+
 ## v1.27.1 - 2026-02-25
 
 ### Added

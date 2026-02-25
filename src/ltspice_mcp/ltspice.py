@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import time
+from collections import Counter, deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,8 @@ from .textio import read_text_auto
 
 _END_DIRECTIVE_RE = re.compile(r"(?im)^\s*\.end\b")
 _LOGGER = logging.getLogger(__name__)
+_CAPTURE_HISTORY_LIMIT = max(50, int(os.getenv("LTSPICE_MCP_CAPTURE_HISTORY_LIMIT", "800")))
+_capture_event_history: deque[dict[str, Any]] = deque(maxlen=_CAPTURE_HISTORY_LIMIT)
 
 _CATEGORY_RULES: list[tuple[str, str, re.Pattern[str], str]] = [
     (
@@ -67,11 +70,78 @@ _CATEGORY_RULES: list[tuple[str, str, re.Pattern[str], str]] = [
 
 def _log_capture_event(level: int, event: str, **fields: Any) -> None:
     payload = {"event": event, **fields}
+    history_entry = {
+        "timestamp": datetime.now().isoformat(),
+        "level": logging.getLevelName(level),
+        **payload,
+    }
+    _capture_event_history.append(history_entry)
     try:
         encoded = json.dumps(payload, sort_keys=True, default=str)
     except Exception:  # noqa: BLE001
         encoded = str(payload)
     _LOGGER.log(level, "ltspice_capture %s", encoded)
+
+
+def get_capture_event_history(limit: int = 200) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    return list(_capture_event_history)[-limit:]
+
+
+def get_capture_health_snapshot(limit: int = 400) -> dict[str, Any]:
+    events = get_capture_event_history(limit=limit)
+    event_counts = Counter(str(item.get("event", "")) for item in events)
+    starts = int(event_counts.get("capture_start", 0))
+    successes = int(event_counts.get("capture_success", 0))
+    failure_events = [
+        "capture_open_failed",
+        "capture_screencapturekit_failed",
+        "capture_screencapture_failed",
+        "capture_file_missing",
+    ]
+    failures = sum(int(event_counts.get(name, 0)) for name in failure_events)
+    close_incomplete = int(event_counts.get("capture_close_incomplete", 0))
+    success_rate = round(successes / starts, 4) if starts > 0 else None
+    latest_failure = next(
+        (
+            item
+            for item in reversed(events)
+            if str(item.get("event", "")) in set(failure_events + ["capture_close_incomplete"])
+        ),
+        None,
+    )
+    return {
+        "total_events_considered": len(events),
+        "capture_starts": starts,
+        "capture_successes": successes,
+        "capture_failures": failures,
+        "capture_close_incomplete": close_incomplete,
+        "success_rate": success_rate,
+        "event_counts": dict(sorted(event_counts.items())),
+        "latest_event": events[-1] if events else None,
+        "latest_failure": latest_failure,
+    }
+
+
+def _write_utf8_log_sidecar(log_path: Path | None) -> Path | None:
+    if log_path is None or not log_path.exists():
+        return None
+    try:
+        text = read_text_auto(log_path)
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.warning("Failed to decode LTspice log '%s' for utf8 sidecar: %s", log_path, exc)
+        return None
+
+    sidecar = log_path.with_name(f"{log_path.name}.utf8.txt")
+    try:
+        if sidecar.exists() and sidecar.read_text(encoding="utf-8", errors="ignore") == text:
+            return sidecar
+        sidecar.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.warning("Failed to write LTspice utf8 log sidecar '%s': %s", sidecar, exc)
+        return None
+    return sidecar
 
 _SCK_HELPER_SOURCE = r"""
 import Foundation
@@ -1164,6 +1234,172 @@ def _close_ltspice_window_with_ax_helper(
     }
 
 
+def _probe_ltspice_window_matches(
+    *,
+    title_hint: str,
+    exact_title: str | None,
+    window_id: int | None,
+) -> dict[str, Any]:
+    def _escape_applescript_string(value: str) -> str:
+        return value.replace("\\", "\\\\").replace('"', '\\"')
+
+    escaped_contains = _escape_applescript_string(title_hint.strip())
+    escaped_exact = _escape_applescript_string((exact_title or "").strip())
+    escaped_window_id = str(window_id) if isinstance(window_id, int) and window_id > 0 else ""
+    script = (
+        'set AppleScript\'s text item delimiters to ""\n'
+        "on joinItems(theList, delim)\n"
+        '  set AppleScript\'s text item delimiters to delim\n'
+        '  set outText to theList as text\n'
+        '  set AppleScript\'s text item delimiters to ""\n'
+        "  return outText\n"
+        "end joinItems\n"
+        f'set targetContainsName to "{escaped_contains}"\n'
+        f'set targetExactName to "{escaped_exact}"\n'
+        f'set targetWindowId to "{escaped_window_id}"\n'
+        "try\n"
+        '  tell application "System Events"\n'
+        '    if not (exists process "LTspice") then return "PROCESS_MISSING|0|"\n'
+        '    tell process "LTspice"\n'
+        '      set matchIds to {}\n'
+        "      repeat with w in windows\n"
+        '        set windowName to ""\n'
+        "        try\n"
+        "          set windowName to (name of w) as text\n"
+        "        end try\n"
+        '        set windowNumber to ""\n'
+        "        try\n"
+        '          set windowNumber to (value of attribute "AXWindowNumber" of w) as text\n'
+        "        end try\n"
+        "        set isMatch to false\n"
+        '        if targetWindowId is not "" and windowNumber is targetWindowId then set isMatch to true\n'
+        '        if (not isMatch) and targetExactName is not "" and windowName is targetExactName then set isMatch to true\n'
+        '        if (not isMatch) and targetContainsName is not "" and windowName contains targetContainsName then set isMatch to true\n'
+        "        if isMatch then\n"
+        '          if windowNumber is "" then\n'
+        '            set end of matchIds to "unknown"\n'
+        "          else\n"
+        "            set end of matchIds to windowNumber\n"
+        "          end if\n"
+        "        end if\n"
+        "      end repeat\n"
+        '      return "OK|" & ((count of matchIds) as text) & "|" & my joinItems(matchIds, ",")\n'
+        "    end tell\n"
+        "  end tell\n"
+        "on error errMsg number errNum\n"
+        '  return "ERROR|" & (errNum as text) & "|" & errMsg\n'
+        "end try"
+    )
+
+    proc = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    status = "UNKNOWN"
+    matched_windows = 0
+    matching_ids: list[int | str] = []
+    message = ""
+    for raw_line in reversed(proc.stdout.splitlines()):
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split("|", 2)
+        if len(parts) >= 2 and parts[0] in {"OK", "PROCESS_MISSING", "ERROR"}:
+            status = parts[0]
+            try:
+                matched_windows = int(parts[1])
+            except Exception:  # noqa: BLE001
+                matched_windows = 0
+            if len(parts) >= 3 and parts[2]:
+                if status == "OK":
+                    for token in parts[2].split(","):
+                        item = token.strip()
+                        if not item:
+                            continue
+                        if item.isdigit():
+                            matching_ids.append(int(item))
+                        else:
+                            matching_ids.append(item)
+                else:
+                    message = parts[2]
+            break
+
+    if status == "UNKNOWN" and proc.returncode == 0:
+        status = "OK"
+    if not message and status == "ERROR":
+        message = proc.stderr.strip() or "Window verification failed."
+    stderr_lower = proc.stderr.lower()
+    access_denied = "assistive access" in stderr_lower or "(-25211)" in stderr_lower
+    verification_available = status in {"OK", "PROCESS_MISSING"} and proc.returncode == 0
+    verified_closed = status == "PROCESS_MISSING" or (verification_available and matched_windows == 0)
+    return {
+        "status": status,
+        "verified_closed": bool(verified_closed),
+        "verification_available": bool(verification_available),
+        "matched_windows": matched_windows,
+        "matching_window_ids": matching_ids,
+        "window_id": window_id,
+        "title_hint": title_hint,
+        "exact_title": exact_title,
+        "return_code": proc.returncode,
+        "command": ["osascript", "-e", script],
+        "stdout": proc.stdout.strip(),
+        "stderr": proc.stderr.strip(),
+        "access_denied": access_denied,
+        "message": message,
+    }
+
+
+def _apply_post_close_verification(
+    event: dict[str, Any],
+    *,
+    title_hint: str,
+    exact_title: str | None,
+    window_id: int | None,
+) -> dict[str, Any]:
+    verify_enabled = os.getenv("LTSPICE_MCP_VERIFY_WINDOW_CLOSE", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    if not verify_enabled:
+        event["post_verify"] = {"verification_available": False, "status": "DISABLED"}
+        return event
+    try:
+        post_verify = _probe_ltspice_window_matches(
+            title_hint=title_hint,
+            exact_title=exact_title,
+            window_id=window_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        event["post_verify"] = {
+            "verification_available": False,
+            "status": "ERROR",
+            "error": str(exc),
+        }
+        return event
+
+    event["post_verify"] = post_verify
+    if not bool(post_verify.get("verification_available")):
+        return event
+
+    closed_before_verify = bool(event.get("closed", False))
+    verified_closed = bool(post_verify.get("verified_closed"))
+    event["closed_before_verify"] = closed_before_verify
+    event["verified_closed"] = verified_closed
+    event["verification_mismatch"] = closed_before_verify != verified_closed
+    event["closed"] = verified_closed
+    if verified_closed:
+        event["partially_closed"] = False
+    elif int(event.get("closed_windows") or 0) > 0:
+        event["partially_closed"] = True
+    return event
+
+
 def close_ltspice_window(
     title_hint: str,
     *,
@@ -1201,7 +1437,12 @@ def close_ltspice_window(
         helper_status = str(helper_event.get("status") or "")
         # Keep AX helper as the default path to avoid Space-dependent System Events behavior.
         if helper_status != "AX_HELPER_UNAVAILABLE":
-            return helper_event
+            return _apply_post_close_verification(
+                helper_event,
+                title_hint=title_contains,
+                exact_title=title_exact or None,
+                window_id=target_window_id,
+            )
 
     escaped_contains = _escape_applescript_string(title_contains)
     escaped_exact = _escape_applescript_string(title_exact)
@@ -1317,7 +1558,12 @@ def close_ltspice_window(
         result["attempts"] = attempt_events
     if helper_event is not None:
         result["ax_helper_event"] = helper_event
-    return result
+    return _apply_post_close_verification(
+        result,
+        title_hint=title_contains,
+        exact_title=title_exact or None,
+        window_id=target_window_id,
+    )
 
 
 def _capture_ltspice_window_with_screencapturekit(
@@ -1894,6 +2140,9 @@ class LTspiceRunner:
         if not log_path.exists():
             candidates = sorted(netlist.parent.glob(f"{netlist.stem}*.log"))
             log_path = candidates[0] if candidates else None
+        log_utf8_path = _write_utf8_log_sidecar(log_path)
+        if log_utf8_path is not None:
+            artifacts = sorted({*artifacts, log_utf8_path})
 
         issues, warnings, diagnostics = analyze_log(log_path)
         if return_code != 0:
@@ -1929,6 +2178,7 @@ class LTspiceRunner:
             stdout=stdout,
             stderr=stderr,
             log_path=log_path,
+            log_utf8_path=log_utf8_path,
             raw_files=raw_files,
             artifacts=artifacts,
             issues=issues,

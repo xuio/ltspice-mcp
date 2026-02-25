@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from ltspice_mcp import server
-from ltspice_mcp.models import RawDataset, RawVariable
+from ltspice_mcp.models import RawDataset, RawVariable, SimulationDiagnostic, SimulationRun
 
 
 class _FakeCallResult:
@@ -352,6 +353,181 @@ class TestDevelopmentTools(unittest.TestCase):
         self.assertEqual(errors[0]["tool"], "getLtspiceSymbolInfo")
         self.assertEqual(errors[0]["error_type"], "ValueError")
         self.assertEqual(starts[0]["call_id"], errors[0]["call_id"])
+
+    def test_uvicorn_access_noise_filter_suppresses_known_probe_lines(self) -> None:
+        filt = server._UvicornAccessNoiseFilter("/mcp")
+
+        oauth_record = Mock()
+        oauth_record.getMessage.return_value = (
+            '127.0.0.1 - "GET /.well-known/oauth-authorization-server HTTP/1.1" 404 Not Found'
+        )
+        self.assertFalse(filt.filter(oauth_record))
+
+        transient_record = Mock()
+        transient_record.getMessage.return_value = (
+            '127.0.0.1 - "GET /mcp HTTP/1.1" 400 Bad Request'
+        )
+        self.assertFalse(filt.filter(transient_record))
+
+        normal_record = Mock()
+        normal_record.getMessage.return_value = '127.0.0.1 - "POST /mcp HTTP/1.1" 200 OK'
+        self.assertTrue(filt.filter(normal_record))
+
+    def test_uvicorn_error_noise_filter_suppresses_shutdown_false_positive(self) -> None:
+        filt = server._UvicornErrorNoiseFilter()
+        noisy = Mock()
+        noisy.getMessage.return_value = "ASGI callable returned without completing response."
+        self.assertFalse(filt.filter(noisy))
+        normal = Mock()
+        normal.getMessage.return_value = "Application startup complete."
+        self.assertTrue(filt.filter(normal))
+
+    def test_simulate_netlist_file_retries_on_convergence(self) -> None:
+        netlist = self.temp_dir / "conv_case.cir"
+        netlist.write_text("* conv case\nR1 in out 1k\n.tran 0 10m\n.end\n", encoding="utf-8")
+        retry_netlist = self.temp_dir / "conv_case_convergence_retry.cir"
+        retry_netlist.write_text(netlist.read_text(encoding="utf-8"), encoding="utf-8")
+
+        started_at = datetime.now().astimezone().isoformat()
+        executable = Path("/Applications/LTspice.app/Contents/MacOS/LTspice")
+        primary_run = SimulationRun(
+            run_id="run-primary",
+            netlist_path=netlist,
+            command=["LTspice", "-b", str(netlist)],
+            ltspice_executable=executable,
+            started_at=started_at,
+            duration_seconds=0.2,
+            return_code=255,
+            stdout="",
+            stderr="",
+            log_path=netlist.with_suffix(".log"),
+            raw_files=[],
+            artifacts=[netlist],
+            issues=["Time step too small"],
+            warnings=[],
+            diagnostics=[
+                SimulationDiagnostic(
+                    category="convergence",
+                    severity="error",
+                    message="Time step too small",
+                    suggestion=None,
+                )
+            ],
+        )
+        fallback_run = SimulationRun(
+            run_id="run-fallback",
+            netlist_path=retry_netlist,
+            command=["LTspice", "-b", str(retry_netlist)],
+            ltspice_executable=executable,
+            started_at=started_at,
+            duration_seconds=0.18,
+            return_code=0,
+            stdout="",
+            stderr="",
+            log_path=retry_netlist.with_suffix(".log"),
+            raw_files=[retry_netlist.with_suffix(".raw")],
+            artifacts=[retry_netlist],
+            issues=[],
+            warnings=[],
+            diagnostics=[],
+        )
+
+        with (
+            patch(
+                "ltspice_mcp.server._prepare_convergence_retry_netlist",
+                return_value=(retry_netlist, [".options method=gear"]),
+            ),
+            patch(
+                "ltspice_mcp.server._run_simulation_with_ui",
+                side_effect=[
+                    (primary_run, [{"stage": "before_run"}], False),
+                    (fallback_run, [], False),
+                ],
+            ),
+        ):
+            payload = server.simulateNetlistFile(str(netlist))
+
+        self.assertEqual(payload["run_id"], "run-fallback")
+        self.assertTrue(payload["succeeded"])
+        retry = payload["auto_convergence_retry"]
+        self.assertTrue(retry["triggered"])
+        self.assertEqual(retry["reason"], "convergence_detected")
+        self.assertEqual(retry["selected_attempt"], "fallback")
+        self.assertEqual(retry["fallback_run_id"], "run-fallback")
+        self.assertEqual(len(retry["attempts"]), 2)
+
+    def test_tail_daemon_log_and_recent_errors(self) -> None:
+        log_dir = self.temp_dir / "daemon" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "ltspice-mcp-daemon-20260225-120000.log"
+        log_file.write_text(
+            "\n".join(
+                [
+                    'INFO:     127.0.0.1 - "GET /.well-known/oauth-authorization-server HTTP/1.1" 404 Not Found',
+                    "2026-02-25 12:00:01 ERROR ltspice_mcp.server run failed",
+                    '2026-02-25 12:00:02 INFO ltspice_mcp.server mcp_tool {"event":"tool_call_error","tool":"renderLtspiceSchematicImage"}',
+                    '2026-02-25 12:00:03 WARNING ltspice_mcp.ltspice ltspice_capture {"event":"capture_close_incomplete"}',
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        tail = server.tailDaemonLog(lines=2, log_dir=str(log_dir))
+        self.assertEqual(tail["line_count"], 2)
+        self.assertIn("capture_close_incomplete", tail["text"])
+
+        errors = server.getRecentErrors(limit=10, log_count=1, include_warnings=True, log_dir=str(log_dir))
+        self.assertGreaterEqual(errors["entry_count"], 3)
+        messages = [entry["message"] for entry in errors["entries"]]
+        self.assertTrue(any("run failed" in message for message in messages))
+        self.assertTrue(any("tool_call_error" in message for message in messages))
+        self.assertTrue(any("capture_close_incomplete" in message for message in messages))
+
+    def test_get_capture_health_can_include_recent_events(self) -> None:
+        with (
+            patch(
+                "ltspice_mcp.server.get_capture_health_snapshot",
+                return_value={"capture_starts": 2, "capture_successes": 1},
+            ),
+            patch(
+                "ltspice_mcp.server.get_capture_event_history",
+                return_value=[{"event": "capture_start"}],
+            ),
+        ):
+            payload = server.getCaptureHealth(limit=50, include_recent_events=True)
+        self.assertEqual(payload["capture_starts"], 2)
+        self.assertEqual(payload["limit"], 50)
+        self.assertEqual(payload["recent_events"], [{"event": "capture_start"}])
+
+    def test_run_payload_includes_utf8_log_tail(self) -> None:
+        netlist = self.temp_dir / "payload_case.cir"
+        netlist.write_text("* payload\n.end\n", encoding="utf-8")
+        log_path = self.temp_dir / "payload_case.log"
+        log_path.write_text("A\nB\n", encoding="utf-8")
+        log_utf8 = self.temp_dir / "payload_case.log.utf8.txt"
+        log_utf8.write_text("A\nB\n", encoding="utf-8")
+        run = SimulationRun(
+            run_id="payload-run",
+            netlist_path=netlist,
+            command=["LTspice", "-b", str(netlist)],
+            ltspice_executable=Path("/Applications/LTspice.app/Contents/MacOS/LTspice"),
+            started_at=datetime.now().astimezone().isoformat(),
+            duration_seconds=0.1,
+            return_code=0,
+            stdout="",
+            stderr="",
+            log_path=log_path,
+            raw_files=[],
+            artifacts=[netlist, log_path, log_utf8],
+            log_utf8_path=log_utf8,
+            issues=[],
+            warnings=[],
+            diagnostics=[],
+        )
+        payload = server._run_payload(run, include_output=False, log_tail_lines=10)
+        self.assertIn("log_tail_utf8", payload)
+        self.assertEqual(payload["log_tail_utf8"], "A\nB")
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ For agent-focused operation details (daemon lifecycle, permissions, MCP tool wor
 - Optional LTspice UI integration (disabled by default)
 - Schematic UI single-window mode (enabled by default)
 - Batch simulation from netlist text or existing netlist file
+- Automatic one-shot convergence retry for simulation tools when LTspice reports convergence failure
 - Schematic generation (`.asc`) from structured data or pin-aware netlist auto-layout (`placement_mode=smart|legacy`)
 - Netlist auto-layout supports both two-pin primitives and multi-pin active elements (`X`, `Q`, `M`) when symbols resolve
 - Intent-driven circuit generation (filters, non-inverting amplifier, zener regulator)
@@ -27,9 +28,11 @@ For agent-focused operation details (daemon lifecycle, permissions, MCP tool wor
 - MCP-served image rendering for symbols, schematics, and plots
 - Deterministic plot presets (`bode`, `transient_startup`, `noise`, `step_compare`) backed by `.plt`
 - Tool-level performance telemetry with rolling timing stats and reset controls
+- Daemon log diagnostics tools (`tailDaemonLog`, `getRecentErrors`, `getCaptureHealth`)
 - JSON template-driven schematic generation
 - Netlist-file schematic sync/watch workflow with JSON state files
 - Run history with artifacts (`.log`, `.raw`, `.op.raw`)
+- UTF-8 normalized LTspice log sidecars (`*.log.utf8.txt`) for grep/debug readability
 - JSON-backed run metadata persistence across server restarts (`.ltspice_mcp_runs.json`)
 - RAW parser with support for:
   - real/complex datasets
@@ -140,6 +143,9 @@ Environment variables:
 - `LTSPICE_MCP_TOOL_LOGGING` (`true`/`false`, default `true`)
 - `LTSPICE_MCP_TOOL_LOG_MAX_ITEMS` (max collection items summarized per tool log event, default `16`)
 - `LTSPICE_MCP_TOOL_LOG_MAX_CHARS` (max string size summarized per tool log event, default `300`)
+- `LTSPICE_MCP_VERIFY_WINDOW_CLOSE` (`true`/`false`, default `true`; post-close LTspice window verification)
+- `LTSPICE_MCP_DISABLE_UVICORN_NOISE_FILTERS` (`true`/`false`, default `false`; keep noisy oauth probe access logs)
+- `LTSPICE_MCP_DAEMON_LOG_DIR` (optional daemon log directory override used by `tailDaemonLog`/`getRecentErrors`)
 
 Tool-call logs are emitted as structured JSON with the `mcp_tool` prefix, including:
 - `tool_call_start` (tool name + summarized args/kwargs)
@@ -189,6 +195,9 @@ Simulation and setup:
 - `autoDebugSchematic`
 - `getToolTelemetry`
 - `resetToolTelemetry`
+- `tailDaemonLog`
+- `getRecentErrors`
+- `getCaptureHealth`
 - `scanModelIssues`
 - `importModelFile`
 - `patchNetlistModelBindings`

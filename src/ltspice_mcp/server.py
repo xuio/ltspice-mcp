@@ -43,6 +43,8 @@ from .ltspice import (
     capture_ltspice_window_screenshot,
     close_ltspice_window,
     find_ltspice_executable,
+    get_capture_event_history,
+    get_capture_health_snapshot,
     get_ltspice_version,
     is_ltspice_ui_running,
     open_in_ltspice_ui,
@@ -125,6 +127,7 @@ _symbol_library_zip_path: Path | None = None
 _render_sessions: dict[str, dict[str, Any]] = {}
 _TOOL_TELEMETRY_WINDOW = max(10, int(os.getenv("LTSPICE_MCP_TELEMETRY_WINDOW", "200")))
 _tool_telemetry: dict[str, dict[str, Any]] = {}
+_uvicorn_noise_filters_installed = False
 
 
 def _configure_logging(log_level: str | None = None) -> str:
@@ -143,6 +146,63 @@ def _configure_logging(log_level: str | None = None) -> str:
 
     logging.getLogger("ltspice_mcp").setLevel(level)
     return level_name
+
+
+class _UvicornAccessNoiseFilter(logging.Filter):
+    def __init__(self, streamable_http_path: str) -> None:
+        super().__init__()
+        normalized = streamable_http_path.strip() or "/mcp"
+        if not normalized.startswith("/"):
+            normalized = f"/{normalized}"
+        self._streamable_http_path = normalized
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        match = re.search(r'"([A-Z]+)\s+([^ ]+)\s+HTTP/[0-9.]+"\s+(\d{3})', message)
+        if not match:
+            return True
+        method = match.group(1).upper()
+        path = match.group(2)
+        status_code = int(match.group(3))
+        if (
+            method == "GET"
+            and status_code == 404
+            and (
+                path.startswith("/.well-known/oauth-authorization-server")
+                or path.startswith("/.well-known/oauth-protected-resource")
+                or path.startswith(f"{self._streamable_http_path}/.well-known/oauth-authorization-server")
+                or path.startswith(f"{self._streamable_http_path}/.well-known/oauth-protected-resource")
+            )
+        ):
+            return False
+        if method == "GET" and status_code == 400 and path == self._streamable_http_path:
+            return False
+        return True
+
+
+class _UvicornErrorNoiseFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if "ASGI callable returned without completing response" in message:
+            return False
+        return True
+
+
+def _install_uvicorn_noise_filters(streamable_http_path: str) -> None:
+    global _uvicorn_noise_filters_installed
+    if _uvicorn_noise_filters_installed:
+        return
+    if os.getenv("LTSPICE_MCP_DISABLE_UVICORN_NOISE_FILTERS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        _uvicorn_noise_filters_installed = True
+        return
+    logging.getLogger("uvicorn.access").addFilter(_UvicornAccessNoiseFilter(streamable_http_path))
+    logging.getLogger("uvicorn.error").addFilter(_UvicornErrorNoiseFilter())
+    _uvicorn_noise_filters_installed = True
 
 
 def _record_tool_telemetry(
@@ -1285,7 +1345,124 @@ def _step_payload(dataset: RawDataset, step_index: int | None) -> dict[str, Any]
 def _run_payload(run: SimulationRun, *, include_output: bool, log_tail_lines: int) -> dict[str, Any]:
     payload = run.as_dict(include_output=include_output)
     payload["log_tail"] = tail_text_file(run.log_path, max_lines=log_tail_lines)
+    if run.log_utf8_path is not None:
+        payload["log_tail_utf8"] = tail_text_file(run.log_utf8_path, max_lines=log_tail_lines)
     return payload
+
+
+def _resolve_daemon_log_dir(log_dir: str | None = None) -> Path:
+    if log_dir:
+        return Path(log_dir).expanduser().resolve()
+    env_dir = os.getenv("LTSPICE_MCP_DAEMON_LOG_DIR")
+    if env_dir:
+        return Path(env_dir).expanduser().resolve()
+    return (_runner.workdir / "daemon" / "logs").expanduser().resolve()
+
+
+def _list_daemon_log_files(log_dir: Path, *, limit: int = 20) -> list[Path]:
+    if not log_dir.exists():
+        return []
+    files = sorted(
+        [path for path in log_dir.glob("ltspice-mcp-daemon-*.log") if path.is_file()],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    return files[: max(1, limit)]
+
+
+def _resolve_daemon_log_path(log_path: str | None = None, log_dir: str | None = None) -> Path:
+    if log_path:
+        target = Path(log_path).expanduser().resolve()
+        if not target.exists():
+            raise FileNotFoundError(f"Daemon log file not found: {target}")
+        return target
+    resolved_dir = _resolve_daemon_log_dir(log_dir)
+    files = _list_daemon_log_files(resolved_dir, limit=1)
+    if not files:
+        raise FileNotFoundError(f"No daemon log files found in {resolved_dir}")
+    return files[0]
+
+
+def _parse_structured_log_payload(line: str, marker: str) -> dict[str, Any] | None:
+    if marker not in line:
+        return None
+    _, suffix = line.split(marker, 1)
+    suffix = suffix.strip()
+    if not suffix:
+        return None
+    try:
+        payload = json.loads(suffix)
+    except Exception:  # noqa: BLE001
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _is_recent_error_line(line: str, *, include_warnings: bool) -> tuple[bool, str]:
+    lowered = line.lower()
+    if " trace" in lowered:
+        return False, "trace"
+    if " critical " in lowered or lowered.startswith("critical:"):
+        return True, "critical"
+    if " error " in lowered or lowered.startswith("error:"):
+        return True, "error"
+    if include_warnings and (" warning " in lowered or lowered.startswith("warning:")):
+        return True, "warning"
+    if "exception" in lowered or "traceback" in lowered:
+        return True, "exception"
+    return False, "info"
+
+
+def _collect_recent_log_entries(
+    *,
+    limit: int,
+    include_warnings: bool,
+    log_count: int,
+    log_dir: str | None = None,
+) -> list[dict[str, Any]]:
+    resolved_dir = _resolve_daemon_log_dir(log_dir)
+    log_files = _list_daemon_log_files(resolved_dir, limit=max(1, log_count))
+    if not log_files:
+        return []
+    entries: list[dict[str, Any]] = []
+    for log_file in log_files:
+        lines = read_text_auto(log_file).splitlines()
+        for line_no, line in enumerate(lines, start=1):
+            include_line, inferred_level = _is_recent_error_line(
+                line,
+                include_warnings=include_warnings,
+            )
+            tool_payload = _parse_structured_log_payload(line, "mcp_tool ")
+            if tool_payload and str(tool_payload.get("event")) == "tool_call_error":
+                include_line = True
+                inferred_level = "error"
+            capture_payload = _parse_structured_log_payload(line, "ltspice_capture ")
+            if capture_payload:
+                capture_event = str(capture_payload.get("event", ""))
+                if capture_event in {
+                    "capture_open_failed",
+                    "capture_screencapturekit_failed",
+                    "capture_screencapture_failed",
+                    "capture_file_missing",
+                }:
+                    include_line = True
+                    inferred_level = "error"
+                elif include_warnings and capture_event == "capture_close_incomplete":
+                    include_line = True
+                    inferred_level = "warning"
+
+            if not include_line:
+                continue
+            entries.append(
+                {
+                    "log_path": str(log_file),
+                    "line_number": line_no,
+                    "level": inferred_level,
+                    "message": line,
+                    "tool_event": tool_payload,
+                    "capture_event": capture_payload,
+                }
+            )
+    return entries[-max(1, limit) :]
 
 
 def _run_simulation_with_ui(
@@ -1336,6 +1513,99 @@ def _run_simulation_with_ui(
             )
 
     return run, ui_events, effective_ui
+
+
+def _run_has_convergence_issue(run: SimulationRun) -> bool:
+    if _has_convergence_issue(run.issues):
+        return True
+    diagnostic_messages = [
+        diagnostic.message
+        for diagnostic in run.diagnostics
+        if str(diagnostic.severity).lower() == "error"
+    ]
+    return _has_convergence_issue(diagnostic_messages)
+
+
+def _prepare_convergence_retry_netlist(netlist_path: Path) -> tuple[Path, list[str]]:
+    stem = netlist_path.stem
+    suffix = netlist_path.suffix or ".cir"
+    retry_path = netlist_path.with_name(f"{stem}_convergence_retry{suffix}")
+    if retry_path == netlist_path:
+        retry_path = netlist_path.with_name(f"{stem}_convergence_retry_1{suffix}")
+    text = read_text_auto(netlist_path)
+    retry_path.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+    applied_lines = _apply_convergence_options(retry_path)
+    return retry_path, applied_lines
+
+
+def _run_simulation_with_auto_convergence_retry(
+    *,
+    netlist_path: Path,
+    ascii_raw: bool,
+    timeout_seconds: int | None,
+    show_ui: bool | None,
+    open_raw_after_run: bool,
+) -> tuple[SimulationRun, list[dict[str, Any]], bool, dict[str, Any]]:
+    primary_run, ui_events, effective_ui = _run_simulation_with_ui(
+        netlist_path=netlist_path,
+        ascii_raw=ascii_raw,
+        timeout_seconds=timeout_seconds,
+        show_ui=show_ui,
+        open_raw_after_run=open_raw_after_run,
+    )
+    attempts: list[dict[str, Any]] = [
+        {
+            "attempt": 1,
+            "kind": "primary",
+            "run_id": primary_run.run_id,
+            "netlist_path": str(primary_run.netlist_path),
+            "succeeded": primary_run.succeeded,
+            "issues": list(primary_run.issues),
+        }
+    ]
+    retry_payload: dict[str, Any] = {
+        "triggered": False,
+        "reason": None,
+        "fallback_netlist_path": None,
+        "applied_lines": [],
+        "attempts": attempts,
+    }
+    if primary_run.succeeded or not _run_has_convergence_issue(primary_run):
+        retry_payload["reason"] = "not_required"
+        return primary_run, ui_events, effective_ui, retry_payload
+
+    retry_path, applied_lines = _prepare_convergence_retry_netlist(netlist_path)
+    fallback_run, _, _ = _run_simulation_with_ui(
+        netlist_path=retry_path,
+        ascii_raw=ascii_raw,
+        timeout_seconds=timeout_seconds,
+        show_ui=False,
+        open_raw_after_run=False,
+    )
+    attempts.append(
+        {
+            "attempt": 2,
+            "kind": "convergence_retry",
+            "run_id": fallback_run.run_id,
+            "netlist_path": str(fallback_run.netlist_path),
+            "succeeded": fallback_run.succeeded,
+            "issues": list(fallback_run.issues),
+        }
+    )
+    retry_payload.update(
+        {
+            "triggered": True,
+            "reason": "convergence_detected",
+            "fallback_netlist_path": str(retry_path),
+            "applied_lines": applied_lines,
+            "fallback_run_id": fallback_run.run_id,
+        }
+    )
+    if fallback_run.succeeded and not fallback_run.issues:
+        retry_payload["selected_attempt"] = "fallback"
+        return fallback_run, ui_events, effective_ui, retry_payload
+    retry_payload["selected_attempt"] = "primary"
+    return primary_run, ui_events, effective_ui, retry_payload
 
 
 def _sanitize_representation(value: str) -> str:
@@ -3278,7 +3548,7 @@ def runSimulation(
     if _loaded_netlist is None:
         raise ValueError("No netlist is loaded. Use loadCircuit or loadNetlistFromFile first.")
 
-    run, ui_events, effective_ui = _run_simulation_with_ui(
+    run, ui_events, effective_ui, retry_payload = _run_simulation_with_auto_convergence_retry(
         netlist_path=_loaded_netlist,
         ascii_raw=ascii_raw,
         timeout_seconds=timeout_seconds,
@@ -3294,6 +3564,7 @@ def runSimulation(
     if notes:
         response["notes"] = notes
     response["ui_enabled"] = effective_ui
+    response["auto_convergence_retry"] = retry_payload
     if ui_events:
         response["ui_events"] = ui_events
     return response
@@ -3312,7 +3583,7 @@ def simulateNetlist(
     global _loaded_netlist
     netlist_path = _runner.write_netlist(netlist_content, circuit_name=circuit_name)
     _loaded_netlist = netlist_path
-    run, ui_events, effective_ui = _run_simulation_with_ui(
+    run, ui_events, effective_ui, retry_payload = _run_simulation_with_auto_convergence_retry(
         netlist_path=netlist_path,
         ascii_raw=ascii_raw,
         timeout_seconds=timeout_seconds,
@@ -3321,6 +3592,7 @@ def simulateNetlist(
     )
     response = _run_payload(run, include_output=False, log_tail_lines=120)
     response["ui_enabled"] = effective_ui
+    response["auto_convergence_retry"] = retry_payload
     if ui_events:
         response["ui_events"] = ui_events
     return response
@@ -3340,7 +3612,7 @@ def simulateNetlistFile(
     if not path.exists():
         raise FileNotFoundError(f"Netlist file not found: {path}")
     _loaded_netlist = path
-    run, ui_events, effective_ui = _run_simulation_with_ui(
+    run, ui_events, effective_ui, retry_payload = _run_simulation_with_auto_convergence_retry(
         netlist_path=path,
         ascii_raw=ascii_raw,
         timeout_seconds=timeout_seconds,
@@ -3349,6 +3621,7 @@ def simulateNetlistFile(
     )
     response = _run_payload(run, include_output=False, log_tail_lines=120)
     response["ui_enabled"] = effective_ui
+    response["auto_convergence_retry"] = retry_payload
     if ui_events:
         response["ui_events"] = ui_events
     return response
@@ -3435,7 +3708,7 @@ def simulateSchematicFile(
     )
 
     _loaded_netlist = run_target
-    run, ui_events, effective_ui = _run_simulation_with_ui(
+    run, ui_events, effective_ui, retry_payload = _run_simulation_with_auto_convergence_retry(
         netlist_path=run_target,
         ascii_raw=ascii_raw,
         timeout_seconds=timeout_seconds,
@@ -3449,6 +3722,7 @@ def simulateSchematicFile(
     if sidecar_netlist is not None:
         response["sidecar_netlist_path"] = str(sidecar_netlist)
     response["ui_enabled"] = effective_ui
+    response["auto_convergence_retry"] = retry_payload
     if validation is not None:
         response["schematic_validation"] = validation
     if ui_events:
@@ -3884,6 +4158,71 @@ def resetToolTelemetry(tool_name: str | None = None) -> dict[str, Any]:
 
 
 @mcp.tool()
+def tailDaemonLog(
+    lines: int = 200,
+    log_path: str | None = None,
+    log_dir: str | None = None,
+) -> dict[str, Any]:
+    """Return tail text from the active daemon log file."""
+    max_lines = max(1, min(5000, int(lines)))
+    try:
+        resolved = _resolve_daemon_log_path(log_path=log_path, log_dir=log_dir)
+    except FileNotFoundError as exc:
+        return {
+            "log_path": None,
+            "line_count": 0,
+            "lines_requested": max_lines,
+            "text": "",
+            "warning": str(exc),
+        }
+    text = tail_text_file(resolved, max_lines=max_lines)
+    return {
+        "log_path": str(resolved),
+        "line_count": len(text.splitlines()) if text else 0,
+        "lines_requested": max_lines,
+        "text": text,
+    }
+
+
+@mcp.tool()
+def getRecentErrors(
+    limit: int = 80,
+    log_count: int = 5,
+    include_warnings: bool = False,
+    log_dir: str | None = None,
+) -> dict[str, Any]:
+    """Scan recent daemon logs and return structured error entries."""
+    max_items = max(1, min(1000, int(limit)))
+    entries = _collect_recent_log_entries(
+        limit=max_items,
+        include_warnings=bool(include_warnings),
+        log_count=max(1, min(30, int(log_count))),
+        log_dir=log_dir,
+    )
+    return {
+        "entry_count": len(entries),
+        "limit": max_items,
+        "log_count": max(1, min(30, int(log_count))),
+        "include_warnings": bool(include_warnings),
+        "entries": entries,
+    }
+
+
+@mcp.tool()
+def getCaptureHealth(
+    limit: int = 400,
+    include_recent_events: bool = False,
+) -> dict[str, Any]:
+    """Summarize ScreenCapture/LTspice capture health from in-process capture events."""
+    max_items = max(1, min(2000, int(limit)))
+    health = get_capture_health_snapshot(limit=max_items)
+    health["limit"] = max_items
+    if include_recent_events:
+        health["recent_events"] = get_capture_event_history(limit=min(120, max_items))
+    return health
+
+
+@mcp.tool()
 def listRuns(limit: int = 20) -> list[dict[str, Any]]:
     """List recent simulation runs (newest first)."""
     if limit <= 0:
@@ -4227,6 +4566,33 @@ def _configure_runner(
     _load_run_state()
 
 
+def _run_streamable_http_with_uvicorn(
+    *,
+    host: str,
+    port: int,
+    log_level: str,
+    streamable_http_path: str,
+) -> None:
+    import anyio
+    import uvicorn
+
+    _install_uvicorn_noise_filters(streamable_http_path)
+
+    async def _serve() -> None:
+        app = mcp.streamable_http_app()
+        config = uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            log_level=log_level.lower(),
+            timeout_graceful_shutdown=5,
+        )
+        server = uvicorn.Server(config)
+        await server.serve()
+
+    anyio.run(_serve)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="MCP server for LTspice on macOS")
     parser.add_argument(
@@ -4376,6 +4742,7 @@ def main() -> None:
     )
     mcp.settings.host = args.host
     mcp.settings.port = args.port
+    mcp.settings.log_level = configured_log_level
     mcp.settings.mount_path = mount_path
     mcp.settings.sse_path = sse_path
     mcp.settings.message_path = message_path
@@ -4383,6 +4750,14 @@ def main() -> None:
 
     if transport == "sse":
         mcp.run(transport=transport, mount_path=mount_path)
+        return
+    if transport == "streamable-http":
+        _run_streamable_http_with_uvicorn(
+            host=args.host,
+            port=args.port,
+            log_level=configured_log_level,
+            streamable_http_path=streamable_http_path,
+        )
         return
     mcp.run(transport=transport)
 
