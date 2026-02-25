@@ -239,12 +239,16 @@ Agent/LLM operations after code changes:
 ```bash
 ./scripts/ltspice_mcp_daemon.sh restart
 ./scripts/ltspice_mcp_daemon.sh status
+./scripts/ltspice_mcp_daemon.sh trigger-screen-recording-permission
 ./scripts/ltspice_mcp_daemon.sh follow
 ./scripts/ltspice_mcp_daemon.sh latest-log
 ./scripts/ltspice_mcp_daemon.sh list-logs 5
 ./scripts/ltspice_mcp_daemon.sh logs --lines 200
 ./scripts/ltspice_mcp_daemon.sh logs --follow
 ```
+
+Permission prompt helper:
+- `./scripts/ltspice_mcp_daemon.sh trigger-screen-recording-permission` forces an MCP-over-HTTP image render call (through `mcp-remote`) that exercises ScreenCaptureKit so macOS can show/refresh Screen Recording permission state.
 
 ## UI integration (optional)
 

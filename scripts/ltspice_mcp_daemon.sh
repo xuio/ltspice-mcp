@@ -33,6 +33,8 @@ Commands:
   stop                  Stop the daemon
   restart               Restart the daemon
   status                Print daemon status
+  trigger-screen-recording-permission
+                        Intentionally trigger ScreenCaptureKit permission flow
   follow [--lines N]    Follow daemon logs in real time
   logs [--lines N]      Print latest daemon log output (default: 120 lines)
   logs --follow         Follow the latest daemon log
@@ -48,6 +50,7 @@ Environment overrides:
   LTSPICE_MCP_DAEMON_LTSPICE_BINARY
   LTSPICE_MCP_DAEMON_DIR
   UV_BIN
+  NPX_BIN
 EOF
 }
 
@@ -339,6 +342,19 @@ list_logs() {
   ls -1t "${LOG_DIR}"/ltspice-mcp-daemon-*.log 2>/dev/null | head -n "${count}" || true
 }
 
+trigger_permission_prompt() {
+  local npx_bin="${NPX_BIN:-npx}"
+  start_daemon
+  (
+    cd "${PROJECT_ROOT}"
+    "${UV_BIN}" run --project "${PROJECT_ROOT}" python \
+      "${PROJECT_ROOT}/scripts/trigger_sck_permission_prompt.py" \
+      --url "$(url)" \
+      --command "${npx_bin}" \
+      --command-args -y mcp-remote
+  )
+}
+
 command="${1:-}"
 if [[ -z "${command}" ]]; then
   usage
@@ -359,6 +375,9 @@ case "${command}" in
     ;;
   status)
     status_daemon
+    ;;
+  trigger-screen-recording-permission)
+    trigger_permission_prompt
     ;;
   follow)
     follow_daemon "$@"
