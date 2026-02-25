@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -262,6 +263,11 @@ class TestVerificationAndQueueTools(unittest.TestCase):
         )
         self.assertEqual(clean_payload["action_details"]["action"], "normalized_grid")
         self.assertTrue(cleaned.exists())
+        normalization = clean_payload["action_details"]["normalization"]
+        self.assertEqual(normalization["applied_style_profile"]["anchor_x"], 120)
+        self.assertEqual(normalization["applied_style_profile"]["directive_x"], 48)
+        cleaned_text = cleaned.read_text(encoding="utf-8")
+        self.assertIn("TEXT 48", cleaned_text)
 
         inspect_payload = server.inspectSchematicVisualQuality(
             asc_path=str(cleaned),
@@ -289,8 +295,10 @@ class TestVerificationAndQueueTools(unittest.TestCase):
         netlist = self.temp_dir / "queued.cir"
         netlist.write_text("* queue\n.end\n", encoding="utf-8")
         with patch("ltspice_mcp.server._ensure_job_worker", return_value=None):
-            queued = server.queueSimulationJob(netlist_path=str(netlist))
+            queued = server.queueSimulationJob(netlist_path=str(netlist), priority=20, max_retries=2)
         self.assertEqual(queued["status"], "queued")
+        self.assertEqual(queued["priority"], 20)
+        self.assertEqual(queued["max_retries"], 2)
         job_id = queued["job_id"]
 
         listed = server.listJobs(limit=10)
@@ -302,6 +310,89 @@ class TestVerificationAndQueueTools(unittest.TestCase):
 
         canceled = server.cancelJob(job_id=job_id)
         self.assertEqual(canceled["status"], "canceled")
+
+    def test_queue_priority_controls_dispatch_order(self) -> None:
+        low_path = self.temp_dir / "low_priority.cir"
+        high_path = self.temp_dir / "high_priority.cir"
+        low_path.write_text("* low\n.end\n", encoding="utf-8")
+        high_path.write_text("* high\n.end\n", encoding="utf-8")
+
+        order: list[str] = []
+
+        def fake_run(*, netlist_path: Path, ascii_raw: bool, timeout_seconds: int | None, cancel_requested):
+            order.append(netlist_path.name)
+            run = _make_run(self.temp_dir, run_id=f"priority-{len(order)}")
+            return run, False
+
+        with patch("ltspice_mcp.server._ensure_job_worker", return_value=None):
+            low_job = server.queueSimulationJob(netlist_path=str(low_path), priority=200, max_retries=0)
+            high_job = server.queueSimulationJob(netlist_path=str(high_path), priority=10, max_retries=0)
+
+        with patch("ltspice_mcp.server._run_process_simulation_with_cancel", side_effect=fake_run):
+            server._ensure_job_worker()
+            deadline = time.time() + 8.0
+            while time.time() < deadline:
+                low_status = server.jobStatus(low_job["job_id"], include_run=False)["status"]
+                high_status = server.jobStatus(high_job["job_id"], include_run=False)["status"]
+                if low_status in {"succeeded", "failed", "canceled"} and high_status in {
+                    "succeeded",
+                    "failed",
+                    "canceled",
+                }:
+                    break
+                time.sleep(0.05)
+
+        self.assertGreaterEqual(len(order), 2)
+        self.assertEqual(order[0], "high_priority.cir")
+        self.assertEqual(order[1], "low_priority.cir")
+
+    def test_queue_retry_policy_retries_then_succeeds(self) -> None:
+        retry_path = self.temp_dir / "retry_job.cir"
+        retry_path.write_text("* retry\n.end\n", encoding="utf-8")
+        calls = {"count": 0}
+
+        def fake_run(*, netlist_path: Path, ascii_raw: bool, timeout_seconds: int | None, cancel_requested):
+            calls["count"] += 1
+            run = _make_run(self.temp_dir, run_id=f"retry-{calls['count']}")
+            if calls["count"] == 1:
+                run.return_code = 255
+                run.issues = ["Intentional failure"]
+            return run, False
+
+        with patch("ltspice_mcp.server._run_process_simulation_with_cancel", side_effect=fake_run):
+            queued = server.queueSimulationJob(
+                netlist_path=str(retry_path),
+                priority=50,
+                max_retries=1,
+            )
+            deadline = time.time() + 8.0
+            while time.time() < deadline:
+                status = server.jobStatus(queued["job_id"], include_run=False)
+                if status["status"] in {"succeeded", "failed", "canceled"}:
+                    break
+                time.sleep(0.05)
+
+        final_status = server.jobStatus(queued["job_id"], include_run=False)
+        self.assertEqual(final_status["status"], "succeeded")
+        self.assertEqual(final_status["retry_count"], 1)
+        self.assertEqual(calls["count"], 2)
+
+    def test_queue_persists_across_reconfigure(self) -> None:
+        netlist = self.temp_dir / "persist_job.cir"
+        netlist.write_text("* persist\n.end\n", encoding="utf-8")
+        with patch("ltspice_mcp.server._ensure_job_worker", return_value=None):
+            queued = server.queueSimulationJob(
+                netlist_path=str(netlist),
+                priority=7,
+                max_retries=3,
+            )
+            server._configure_runner(workdir=self.temp_dir, ltspice_binary=None, timeout=10)
+
+        restored = server.jobStatus(queued["job_id"], include_run=False)
+        self.assertEqual(restored["status"], "queued")
+        self.assertEqual(restored["priority"], 7)
+        self.assertEqual(restored["max_retries"], 3)
+        self.assertIn("persisted queue state", str(restored.get("summary", "")).lower())
 
 
 if __name__ == "__main__":

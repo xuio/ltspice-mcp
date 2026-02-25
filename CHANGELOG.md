@@ -1,5 +1,30 @@
 # Changelog
 
+## v1.31.0 - 2026-02-25
+
+### Added
+- Queue hardening features:
+  - persisted queue state (`.ltspice_mcp_jobs.json`) across daemon restarts,
+  - priority scheduling for queued jobs (`priority`, lower value = higher priority),
+  - per-job retry policy (`max_retries`, `retry_count`).
+- Extended queue metadata in status payloads (`priority`, retry counters, queue sequence).
+
+### Improved
+- `_configure_runner` now restores persisted jobs and resumes queued work automatically.
+- `_stop_job_worker` now performs safe state persistence before teardown.
+- Auto-clean style normalization now applies a shared style profile:
+  - anchored schematic placement,
+  - directive text block alignment,
+  - consistent grid snapping/translation behavior.
+- Refreshed common ASC fixtures to the normalized style profile.
+
+### Tests
+- Added queue regression tests for:
+  - priority dispatch ordering,
+  - retry-to-success flow,
+  - persistence across runner reconfiguration.
+- Existing development/contract/schematic/streamable-http tests verified against these changes.
+
 ## v1.30.0 - 2026-02-25
 
 ### Added

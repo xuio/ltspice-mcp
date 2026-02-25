@@ -89,7 +89,9 @@ ltspice-mcp \
   - quality inspection (`inspectSchematicVisualQuality`),
   - auto-cleaner (`autoCleanSchematicLayout`).
 - Queue-based simulation control:
-  - `queueSimulationJob`, `listJobs`, `jobStatus`, `cancelJob`.
+  - `queueSimulationJob`, `listJobs`, `jobStatus`, `cancelJob`,
+  - persisted queue state across daemon restart,
+  - priority scheduling and per-job retry policy.
 - Daemon diagnostics:
   - `tailDaemonLog`,
   - `getRecentErrors`,

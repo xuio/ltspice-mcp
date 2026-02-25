@@ -25,3 +25,7 @@ Notes:
 - Keep filenames stable so tests/calibration scripts can map each topology.
 - Keep circuits functionally equivalent; visual/layout refinements are expected.
 - If you want additional topologies, add new `.asc` files in this folder.
+- Canonical visual style in this repo:
+  - grid-aligned coordinates (`16` units),
+  - left-to-right signal flow anchored near `x=120, y=156`,
+  - simulation directives grouped at the lower-left (`x=48`) with `24` unit line spacing.

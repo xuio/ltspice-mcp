@@ -51,6 +51,7 @@ Granular permission helpers:
    - `renderLtspicePlotImage` or `renderLtspicePlotPresetImage`
 5. For long simulations:
    - `queueSimulationJob`, `listJobs`, `jobStatus`, `cancelJob`
+   - use `priority` (lower first) and `max_retries` for queue policy
 6. For schematic cleanup:
    - `inspectSchematicVisualQuality`, `autoCleanSchematicLayout`
 

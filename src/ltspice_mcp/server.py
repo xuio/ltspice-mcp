@@ -137,9 +137,22 @@ _uvicorn_noise_filters_installed = False
 _job_lock = threading.RLock()
 _jobs: dict[str, dict[str, Any]] = {}
 _job_order: list[str] = []
-_job_queue: queue.Queue[str] = queue.Queue()
+_job_queue: queue.PriorityQueue[tuple[int, int, str]] = queue.PriorityQueue()
 _job_worker_thread: threading.Thread | None = None
 _job_worker_stop = threading.Event()
+_job_state_path: Path = _DEFAULT_WORKDIR / ".ltspice_mcp_jobs.json"
+_job_seq = 0
+_JOB_TERMINAL_STATUSES = {"succeeded", "failed", "canceled"}
+
+# Visual style defaults calibrated from manually curated fixture schematics.
+_SCHEMATIC_STYLE_PROFILE: dict[str, int] = {
+    "grid": 16,
+    "anchor_x": 120,
+    "anchor_y": 156,
+    "directive_x": 48,
+    "directive_gap_y": 96,
+    "directive_line_step": 24,
+}
 
 
 def _configure_logging(log_level: str | None = None) -> str:
@@ -592,6 +605,108 @@ def _save_run_state() -> None:
     tmp_path = _state_path.with_suffix(".tmp")
     tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     tmp_path.replace(_state_path)
+
+
+def _next_job_seq() -> int:
+    global _job_seq
+    _job_seq += 1
+    return _job_seq
+
+
+def _save_job_state() -> None:
+    with _job_lock:
+        if not _job_order:
+            if _job_state_path.exists():
+                try:
+                    _job_state_path.unlink()
+                except Exception:
+                    pass
+            return
+        payload = {
+            "version": 1,
+            "job_seq": int(_job_seq),
+            "job_order": list(_job_order),
+            "jobs": [dict(_jobs[job_id]) for job_id in _job_order if job_id in _jobs],
+        }
+    _job_state_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = _job_state_path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp_path.replace(_job_state_path)
+
+
+def _enqueue_job_locked(job_id: str) -> None:
+    job = _jobs.get(job_id)
+    if job is None:
+        return
+    if str(job.get("status", "")).lower() != "queued":
+        return
+    priority = int(job.get("priority", 50))
+    seq = _next_job_seq()
+    _job_queue.put((priority, seq, job_id))
+    job["queue_seq"] = seq
+
+
+def _load_job_state() -> None:
+    global _job_seq
+    _jobs.clear()
+    _job_order.clear()
+    _job_seq = 0
+    if not _job_state_path.exists():
+        return
+    try:
+        payload = json.loads(_job_state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    entries = payload.get("jobs", [])
+    if not isinstance(entries, list):
+        return
+
+    ordered_ids: list[str] = []
+    if isinstance(payload.get("job_order"), list):
+        ordered_ids = [str(item) for item in payload["job_order"] if isinstance(item, str)]
+
+    loaded: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        job_id = str(entry.get("job_id", "")).strip()
+        if not job_id:
+            continue
+        job = dict(entry)
+        job["job_id"] = job_id
+        job["status"] = str(job.get("status", "queued")).lower()
+        job["cancel_requested"] = bool(job.get("cancel_requested", False))
+        job["priority"] = int(job.get("priority", 50))
+        job["max_retries"] = max(0, int(job.get("max_retries", 0)))
+        job["retry_count"] = max(0, int(job.get("retry_count", 0)))
+        job["created_at"] = str(job.get("created_at") or _now_iso())
+        if job["status"] not in _JOB_TERMINAL_STATUSES:
+            # Jobs that were queued/running before daemon restart resume from queue.
+            job["status"] = "queued"
+            job["started_at"] = None
+            job["finished_at"] = None
+            if not job["cancel_requested"]:
+                job["summary"] = "Resumed from persisted queue state."
+        loaded[job_id] = job
+
+    for job_id in ordered_ids:
+        if job_id in loaded:
+            _job_order.append(job_id)
+    for job_id in loaded:
+        if job_id not in _job_order:
+            _job_order.append(job_id)
+    _jobs.update(loaded)
+    _job_seq = max(int(payload.get("job_seq", 0)), len(_job_order))
+
+    with _job_lock:
+        for job_id in _job_order:
+            job = _jobs.get(job_id)
+            if job is None:
+                continue
+            if job.get("cancel_requested"):
+                continue
+            if str(job.get("status", "")).lower() == "queued":
+                _enqueue_job_locked(job_id)
 
 
 def _load_run_state() -> None:
@@ -1835,6 +1950,10 @@ def _job_public_payload(job: dict[str, Any]) -> dict[str, Any]:
         "cancel_requested": bool(job.get("cancel_requested", False)),
         "kind": job.get("kind"),
         "source_path": job.get("source_path"),
+        "priority": int(job.get("priority", 50)),
+        "max_retries": int(job.get("max_retries", 0)),
+        "retry_count": int(job.get("retry_count", 0)),
+        "queue_seq": job.get("queue_seq"),
         "run_id": job.get("run_id"),
         "error": job.get("error"),
         "summary": job.get("summary"),
@@ -1851,15 +1970,19 @@ def _ensure_job_worker() -> None:
         def _worker() -> None:
             while not _job_worker_stop.is_set():
                 try:
-                    job_id = _job_queue.get(timeout=0.25)
+                    item = _job_queue.get(timeout=0.25)
                 except queue.Empty:
                     continue
-                if not isinstance(job_id, str):
+                if not (isinstance(item, tuple) and len(item) == 3 and isinstance(item[2], str)):
                     _job_queue.task_done()
                     continue
+                _priority, _seq, job_id = item
                 with _job_lock:
                     job = _jobs.get(job_id)
                 if job is None:
+                    _job_queue.task_done()
+                    continue
+                if str(job.get("status", "")).lower() != "queued":
                     _job_queue.task_done()
                     continue
                 if job.get("cancel_requested"):
@@ -1867,11 +1990,14 @@ def _ensure_job_worker() -> None:
                         job["status"] = "canceled"
                         job["finished_at"] = _now_iso()
                         job["summary"] = "Canceled before start."
+                        _save_job_state()
                     _job_queue.task_done()
                     continue
                 with _job_lock:
                     job["status"] = "running"
                     job["started_at"] = _now_iso()
+                    job["summary"] = "Running simulation."
+                    _save_job_state()
                 try:
                     run, canceled = _run_process_simulation_with_cancel(
                         netlist_path=Path(str(job["source_path"])).expanduser().resolve(),
@@ -1882,21 +2008,54 @@ def _ensure_job_worker() -> None:
                     _register_run(run)
                     with _job_lock:
                         job["run_id"] = run.run_id
+                        job["error"] = None
                         if canceled:
                             job["status"] = "canceled"
                             job["summary"] = "Canceled while running."
+                            job["finished_at"] = _now_iso()
                         elif run.succeeded:
                             job["status"] = "succeeded"
                             job["summary"] = "Simulation completed successfully."
+                            job["finished_at"] = _now_iso()
                         else:
-                            job["status"] = "failed"
-                            job["summary"] = "; ".join(run.issues[:3]) if run.issues else "Simulation failed."
-                        job["finished_at"] = _now_iso()
+                            retry_count = int(job.get("retry_count", 0))
+                            max_retries = int(job.get("max_retries", 0))
+                            if retry_count < max_retries and not job.get("cancel_requested"):
+                                job["retry_count"] = retry_count + 1
+                                job["status"] = "queued"
+                                job["started_at"] = None
+                                job["finished_at"] = None
+                                job["summary"] = (
+                                    f"Attempt failed; retry {job['retry_count']} of {max_retries} scheduled."
+                                )
+                                job["error"] = "; ".join(run.issues[:3]) if run.issues else "Simulation failed."
+                                _enqueue_job_locked(job_id)
+                            else:
+                                job["status"] = "failed"
+                                job["summary"] = "; ".join(run.issues[:3]) if run.issues else "Simulation failed."
+                                job["error"] = "; ".join(run.issues[:3]) if run.issues else "Simulation failed."
+                                job["finished_at"] = _now_iso()
+                        _save_job_state()
                 except Exception as exc:  # noqa: BLE001
                     with _job_lock:
-                        job["status"] = "failed"
-                        job["error"] = str(exc)
-                        job["finished_at"] = _now_iso()
+                        retry_count = int(job.get("retry_count", 0))
+                        max_retries = int(job.get("max_retries", 0))
+                        if retry_count < max_retries and not job.get("cancel_requested"):
+                            job["retry_count"] = retry_count + 1
+                            job["status"] = "queued"
+                            job["started_at"] = None
+                            job["finished_at"] = None
+                            job["summary"] = (
+                                f"Runtime error; retry {job['retry_count']} of {max_retries} scheduled."
+                            )
+                            job["error"] = str(exc)
+                            _enqueue_job_locked(job_id)
+                        else:
+                            job["status"] = "failed"
+                            job["error"] = str(exc)
+                            job["summary"] = f"Runtime error: {exc}"
+                            job["finished_at"] = _now_iso()
+                        _save_job_state()
                 _job_queue.task_done()
 
         _job_worker_thread = threading.Thread(
@@ -1913,6 +2072,8 @@ def _queue_simulation_job(
     ascii_raw: bool,
     timeout_seconds: int | None,
     kind: str,
+    priority: int,
+    max_retries: int,
 ) -> dict[str, Any]:
     _ensure_job_worker()
     job_id = uuid.uuid4().hex[:12]
@@ -1927,6 +2088,10 @@ def _queue_simulation_job(
         "timeout_seconds": timeout_seconds,
         "kind": kind,
         "source_path": str(source_path),
+        "priority": int(priority),
+        "max_retries": max(0, int(max_retries)),
+        "retry_count": 0,
+        "queue_seq": None,
         "run_id": None,
         "error": None,
         "summary": "Queued",
@@ -1934,12 +2099,13 @@ def _queue_simulation_job(
     with _job_lock:
         _jobs[job_id] = job
         _job_order.append(job_id)
-    _job_queue.put(job_id)
+        _enqueue_job_locked(job_id)
+        _save_job_state()
     return _job_public_payload(job)
 
 
 def _stop_job_worker() -> None:
-    global _job_worker_thread
+    global _job_worker_thread, _job_seq
     thread: threading.Thread | None
     with _job_lock:
         _job_worker_stop.set()
@@ -1947,6 +2113,7 @@ def _stop_job_worker() -> None:
     if thread is not None and thread.is_alive():
         thread.join(timeout=2)
     with _job_lock:
+        _save_job_state()
         _job_worker_thread = None
         while True:
             try:
@@ -1956,6 +2123,7 @@ def _stop_job_worker() -> None:
                 break
         _jobs.clear()
         _job_order.clear()
+        _job_seq = 0
 
 
 def _parse_schematic_geometry(path: Path) -> dict[str, Any]:
@@ -2138,45 +2306,179 @@ def _normalize_schematic_grid(
     def _snap(value: int) -> int:
         return int(round(value / grid) * grid)
 
+    entries: list[dict[str, Any]] = []
+    layout_points: list[tuple[int, int]] = []
+
     for raw in lines:
-        parts = raw.split()
+        stripped = raw.strip()
+        if not stripped:
+            entries.append({"kind": "blank", "raw": ""})
+            continue
+
+        text_match = re.match(r"^TEXT\s+(-?\d+)\s+(-?\d+)\s+(.+)$", stripped, re.IGNORECASE)
+        if text_match:
+            x_old = int(text_match.group(1))
+            y_old = int(text_match.group(2))
+            x_new = _snap(x_old)
+            y_new = _snap(y_old)
+            if x_new != x_old:
+                coord_adjustments += 1
+            if y_new != y_old:
+                coord_adjustments += 1
+            tail = text_match.group(3)
+            is_directive = "!." in tail.casefold()
+            entry = {
+                "kind": "text",
+                "x": x_new,
+                "y": y_new,
+                "tail": tail,
+                "is_directive": is_directive,
+            }
+            entries.append(entry)
+            if not is_directive:
+                layout_points.append((x_new, y_new))
+            continue
+
+        parts = stripped.split()
         if not parts:
-            normalized_lines.append(raw)
+            entries.append({"kind": "blank", "raw": ""})
             continue
         keyword = parts[0].upper()
         mutable = list(parts)
+        shift_indices: tuple[int, ...] = ()
         try:
-            if keyword in {"SYMBOL", "WINDOW"} and len(parts) >= 4:
-                for index in (2, 3):
-                    old = int(parts[index])
-                    new = _snap(old)
-                    if new != old:
-                        coord_adjustments += 1
-                    mutable[index] = str(new)
-            elif keyword in {"WIRE"} and len(parts) >= 5:
-                for index in (1, 2, 3, 4):
-                    old = int(parts[index])
-                    new = _snap(old)
-                    if new != old:
-                        coord_adjustments += 1
-                    mutable[index] = str(new)
-            elif keyword in {"FLAG", "TEXT"} and len(parts) >= 3:
-                for index in (1, 2):
-                    old = int(parts[index])
-                    new = _snap(old)
-                    if new != old:
-                        coord_adjustments += 1
-                    mutable[index] = str(new)
+            if keyword == "SYMBOL" and len(mutable) >= 4:
+                shift_indices = (2, 3)
+            elif keyword == "WIRE" and len(mutable) >= 5:
+                shift_indices = (1, 2, 3, 4)
+            elif keyword == "FLAG" and len(mutable) >= 3:
+                shift_indices = (1, 2)
+            elif keyword == "WINDOW" and len(mutable) >= 4:
+                # WINDOW coordinates are symbol-local offsets; snap but do not translate globally.
+                shift_indices = (2, 3)
+
+            for index in shift_indices:
+                old = int(mutable[index])
+                new = _snap(old)
+                if new != old:
+                    coord_adjustments += 1
+                mutable[index] = str(new)
         except Exception:
-            normalized_lines.append(raw)
+            entries.append({"kind": "raw", "raw": stripped})
             continue
-        normalized_lines.append(" ".join(mutable))
+
+        entries.append({"kind": "tokens", "keyword": keyword, "parts": mutable})
+        if keyword == "WIRE" and len(mutable) >= 5:
+            layout_points.append((int(mutable[1]), int(mutable[2])))
+            layout_points.append((int(mutable[3]), int(mutable[4])))
+        elif keyword == "SYMBOL" and len(mutable) >= 4:
+            layout_points.append((int(mutable[2]), int(mutable[3])))
+        elif keyword == "FLAG" and len(mutable) >= 3:
+            layout_points.append((int(mutable[1]), int(mutable[2])))
+
+    style_grid = max(2, int(_SCHEMATIC_STYLE_PROFILE["grid"]))
+    style_anchor_x = _SCHEMATIC_STYLE_PROFILE["anchor_x"]
+    style_anchor_y = _SCHEMATIC_STYLE_PROFILE["anchor_y"]
+    style_directive_x = _SCHEMATIC_STYLE_PROFILE["directive_x"]
+    style_directive_gap_y = _SCHEMATIC_STYLE_PROFILE["directive_gap_y"]
+    style_directive_step = _SCHEMATIC_STYLE_PROFILE["directive_line_step"]
+
+    min_x = min((point[0] for point in layout_points), default=style_anchor_x)
+    min_y = min((point[1] for point in layout_points), default=style_anchor_y)
+    dx = _snap(style_anchor_x - min_x)
+    dy = _snap(style_anchor_y - min_y)
+    if style_grid != grid:
+        # Respect the caller grid while keeping profile-aligned placement anchors.
+        dx = int(round(dx / grid) * grid)
+        dy = int(round(dy / grid) * grid)
+
+    shifted_layout_points: list[tuple[int, int]] = []
+    for entry in entries:
+        kind = entry.get("kind")
+        if kind == "tokens":
+            keyword = str(entry.get("keyword", "")).upper()
+            parts = list(entry.get("parts") or [])
+            try:
+                if keyword == "SYMBOL" and len(parts) >= 4:
+                    for idx in (2, 3):
+                        old = int(parts[idx])
+                        new = old + (dx if idx == 2 else dy)
+                        if new != old:
+                            coord_adjustments += 1
+                        parts[idx] = str(new)
+                    shifted_layout_points.append((int(parts[2]), int(parts[3])))
+                elif keyword == "WIRE" and len(parts) >= 5:
+                    for idx in (1, 2, 3, 4):
+                        old = int(parts[idx])
+                        new = old + (dx if idx in {1, 3} else dy)
+                        if new != old:
+                            coord_adjustments += 1
+                        parts[idx] = str(new)
+                    shifted_layout_points.append((int(parts[1]), int(parts[2])))
+                    shifted_layout_points.append((int(parts[3]), int(parts[4])))
+                elif keyword == "FLAG" and len(parts) >= 3:
+                    for idx in (1, 2):
+                        old = int(parts[idx])
+                        new = old + (dx if idx == 1 else dy)
+                        if new != old:
+                            coord_adjustments += 1
+                        parts[idx] = str(new)
+                    shifted_layout_points.append((int(parts[1]), int(parts[2])))
+            except Exception:
+                pass
+            entry["parts"] = parts
+        elif kind == "text" and not bool(entry.get("is_directive", False)):
+            old_x = int(entry["x"])
+            old_y = int(entry["y"])
+            new_x = old_x + dx
+            new_y = old_y + dy
+            if new_x != old_x:
+                coord_adjustments += 1
+            if new_y != old_y:
+                coord_adjustments += 1
+            entry["x"] = new_x
+            entry["y"] = new_y
+            shifted_layout_points.append((new_x, new_y))
+
+    max_y = max((point[1] for point in shifted_layout_points), default=style_anchor_y)
+    directive_base_y = _snap(max_y + style_directive_gap_y)
+    directive_index = 0
+    for entry in entries:
+        if entry.get("kind") != "text" or not bool(entry.get("is_directive", False)):
+            continue
+        old_x = int(entry["x"])
+        old_y = int(entry["y"])
+        new_x = _snap(style_directive_x)
+        new_y = _snap(directive_base_y + directive_index * style_directive_step)
+        directive_index += 1
+        if new_x != old_x:
+            coord_adjustments += 1
+        if new_y != old_y:
+            coord_adjustments += 1
+        entry["x"] = new_x
+        entry["y"] = new_y
+
+    for entry in entries:
+        kind = entry.get("kind")
+        if kind == "blank":
+            normalized_lines.append("")
+        elif kind == "raw":
+            normalized_lines.append(str(entry.get("raw", "")))
+        elif kind == "text":
+            normalized_lines.append(
+                f"TEXT {int(entry['x'])} {int(entry['y'])} {str(entry['tail'])}".rstrip()
+            )
+        else:
+            parts = entry.get("parts") or []
+            normalized_lines.append(" ".join(str(item) for item in parts))
 
     output.write_text("\n".join(normalized_lines).rstrip() + "\n", encoding="utf-8")
     return {
         "source_path": str(source),
         "output_path": str(output),
         "grid": grid,
+        "applied_style_profile": dict(_SCHEMATIC_STYLE_PROFILE),
+        "translation": {"dx": dx, "dy": dy},
         "coord_adjustments": coord_adjustments,
     }
 
@@ -3388,6 +3690,13 @@ def _lint_schematic_file(
 
 
 _load_run_state()
+_load_job_state()
+if any(
+    str(_jobs[job_id].get("status", "")).lower() == "queued" and not _jobs[job_id].get("cancel_requested")
+    for job_id in _job_order
+    if job_id in _jobs
+):
+    _ensure_job_worker()
 
 
 @mcp.resource(
@@ -4071,6 +4380,8 @@ def queueSimulationJob(
     circuit_name: str = "queued_job",
     ascii_raw: bool = False,
     timeout_seconds: int | None = None,
+    priority: int = 50,
+    max_retries: int = 0,
 ) -> dict[str, Any]:
     """Queue a simulation job and return a job id for status polling/cancelation."""
     global _loaded_netlist
@@ -4089,20 +4400,35 @@ def queueSimulationJob(
         ascii_raw=ascii_raw,
         timeout_seconds=timeout_seconds,
         kind="netlist",
+        priority=max(0, min(1000, int(priority))),
+        max_retries=max(0, int(max_retries)),
     )
 
 
 @mcp.tool()
-def listJobs(limit: int = 50, status: str | None = None) -> dict[str, Any]:
+def listJobs(
+    limit: int = 50,
+    status: str | None = None,
+    order_by: Literal["created_at", "priority"] = "created_at",
+) -> dict[str, Any]:
     """List queued/running/completed simulation jobs."""
     safe_limit = max(1, min(500, int(limit)))
     status_filter = status.strip().lower() if status else None
     with _job_lock:
+        pool = [job for job_id in _job_order if (job := _jobs.get(job_id)) is not None]
+        if order_by == "priority":
+            selected_jobs = sorted(
+                pool,
+                key=lambda job: (
+                    int(job.get("priority", 50)),
+                    int(job.get("queue_seq", 1_000_000)),
+                    str(job.get("created_at", "")),
+                ),
+            )
+        else:
+            selected_jobs = list(reversed(pool))
         selected = []
-        for job_id in reversed(_job_order):
-            job = _jobs.get(job_id)
-            if job is None:
-                continue
+        for job in selected_jobs:
             if status_filter and str(job.get("status", "")).lower() != status_filter:
                 continue
             selected.append(_job_public_payload(job))
@@ -4111,6 +4437,7 @@ def listJobs(limit: int = 50, status: str | None = None) -> dict[str, Any]:
     return {
         "limit": safe_limit,
         "status_filter": status_filter,
+        "order_by": order_by,
         "count": len(selected),
         "jobs": selected,
     }
@@ -4146,6 +4473,7 @@ def cancelJob(job_id: str, force: bool = False) -> dict[str, Any]:
             job["finished_at"] = _now_iso()
         elif force:
             job["summary"] = "Force-cancel requested. Worker will terminate process on next poll."
+        _save_job_state()
     return jobStatus(job_id=job_id, include_run=False)
 
 
@@ -4162,6 +4490,8 @@ def getLtspiceStatus() -> dict[str, Any]:
         "default_timeout_seconds": _runner.default_timeout_seconds,
         "runs_recorded": len(_run_order),
         "run_state_path": str(_state_path),
+        "jobs_recorded": len(_job_order),
+        "job_state_path": str(_job_state_path),
         "ltspice_lib_zip_path": str(DEFAULT_LTSPICE_LIB_ZIP.expanduser().resolve()),
         "ui_enabled_default": _ui_enabled,
         "schematic_single_window_default": _schematic_single_window_enabled,
@@ -6126,7 +6456,7 @@ def _configure_runner(
     schematic_single_window: bool | None = None,
     schematic_live_path: str | None = None,
 ) -> None:
-    global _runner, _loaded_netlist, _raw_cache, _state_path, _ui_enabled
+    global _runner, _loaded_netlist, _raw_cache, _state_path, _ui_enabled, _job_state_path
     global _schematic_single_window_enabled, _schematic_live_path
     global _symbol_library, _symbol_library_zip_path
     _stop_job_worker()
@@ -6136,6 +6466,7 @@ def _configure_runner(
         default_timeout_seconds=timeout,
     )
     _state_path = workdir / ".ltspice_mcp_runs.json"
+    _job_state_path = workdir / ".ltspice_mcp_jobs.json"
     _loaded_netlist = None
     _raw_cache = {}
     if _symbol_library is not None:
@@ -6155,6 +6486,13 @@ def _configure_runner(
     else:
         _schematic_live_path = (workdir / ".ui" / "live_schematic.asc").resolve()
     _load_run_state()
+    _load_job_state()
+    if any(
+        str(_jobs[job_id].get("status", "")).lower() == "queued" and not _jobs[job_id].get("cancel_requested")
+        for job_id in _job_order
+        if job_id in _jobs
+    ):
+        _ensure_job_worker()
 
 
 def _run_streamable_http_with_uvicorn(
