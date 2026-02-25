@@ -1,5 +1,29 @@
 # Changelog
 
+## v1.30.0 - 2026-02-25
+
+### Added
+- Verification and study automation MCP tools:
+  - `runVerificationPlan`
+  - `runMeasAutomation`
+  - `parseMeasResults`
+  - `runSweepStudy`
+- Schematic quality tools:
+  - `autoCleanSchematicLayout`
+  - `inspectSchematicVisualQuality`
+- Daemon health umbrella tool:
+  - `daemonDoctor`
+- Queue/cancellation MCP tools:
+  - `queueSimulationJob`
+  - `listJobs`
+  - `jobStatus`
+  - `cancelJob`
+- New test module `tests/test_verification_queue_tools.py` covering the features above.
+
+### Improved
+- Queue worker shutdown is now deadlock-safe and is reset automatically during `_configure_runner`.
+- README and AGENT_README now include the new verification, sweep, visual QA, doctor, and queue workflows.
+
 ## v1.29.0 - 2026-02-25
 
 ### Added

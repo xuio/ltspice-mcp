@@ -44,9 +44,15 @@ Granular permission helpers:
 3. Inspect results:
    - `getPlotNames`, `getVectorsInfo`, `getVectorData`
    - `getBandwidth`, `getGainPhaseMargin`, `getRiseFallTime`, `getSettlingTime`
+   - `parseMeasResults`, `runVerificationPlan`
+   - `runSweepStudy`
 4. Render visuals:
    - `renderLtspiceSchematicImage`
    - `renderLtspicePlotImage` or `renderLtspicePlotPresetImage`
+5. For long simulations:
+   - `queueSimulationJob`, `listJobs`, `jobStatus`, `cancelJob`
+6. For schematic cleanup:
+   - `inspectSchematicVisualQuality`, `autoCleanSchematicLayout`
 
 ## 4) Screenshot and Window Behavior
 
@@ -65,6 +71,7 @@ If you pass `render_session_id`, window auto-close is skipped until:
 1. Check daemon:
    - `tailDaemonLog`
    - `getRecentErrors`
+   - `daemonDoctor`
 2. Check capture health:
    - `getCaptureHealth`
 3. Retry permission flow if needed.

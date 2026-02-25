@@ -81,10 +81,20 @@ ltspice-mcp \
   - gain/phase margin,
   - rise/fall time,
   - settling time.
+- Verification and automation:
+  - `.meas` generation + parsing (`runMeasAutomation`, `parseMeasResults`),
+  - one-shot assertion plans (`runVerificationPlan`),
+  - stepped/Monte-Carlo studies (`runSweepStudy`).
+- Schematic visual quality tools:
+  - quality inspection (`inspectSchematicVisualQuality`),
+  - auto-cleaner (`autoCleanSchematicLayout`).
+- Queue-based simulation control:
+  - `queueSimulationJob`, `listJobs`, `jobStatus`, `cancelJob`.
 - Daemon diagnostics:
   - `tailDaemonLog`,
   - `getRecentErrors`,
   - `getCaptureHealth`.
+  - `daemonDoctor`.
 - Run persistence and artifacts with UTF-8 log sidecars (`*.log.utf8.txt`).
 
 ## MCP Tool Overview
@@ -119,6 +129,8 @@ ltspice-mcp \
 - `resolveSchematicSimulationTarget`
 - `simulateSchematicFile`
 - `autoDebugSchematic`
+- `autoCleanSchematicLayout`
+- `inspectSchematicVisualQuality`
 
 ### Simulation
 - `loadCircuit`
@@ -126,6 +138,10 @@ ltspice-mcp \
 - `runSimulation`
 - `simulateNetlist`
 - `simulateNetlistFile`
+- `queueSimulationJob`
+- `listJobs`
+- `jobStatus`
+- `cancelJob`
 
 ### Plot/data/analysis
 - `getPlotNames`
@@ -136,6 +152,10 @@ ltspice-mcp \
 - `getGainPhaseMargin`
 - `getRiseFallTime`
 - `getSettlingTime`
+- `runSweepStudy`
+- `parseMeasResults`
+- `runMeasAutomation`
+- `runVerificationPlan`
 
 ### Model/library/debug telemetry
 - `getLtspiceLibraryStatus`
@@ -150,6 +170,7 @@ ltspice-mcp \
 - `tailDaemonLog`
 - `getRecentErrors`
 - `getCaptureHealth`
+- `daemonDoctor`
 - `readAgentGuide`
 
 ## MCP Resources
