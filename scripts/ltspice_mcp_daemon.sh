@@ -17,6 +17,8 @@ WORKDIR="${LTSPICE_MCP_DAEMON_WORKDIR:-${DEFAULT_WORKDIR}}"
 TIMEOUT="${LTSPICE_MCP_DAEMON_TIMEOUT:-180}"
 LTSPICE_BINARY="${LTSPICE_MCP_DAEMON_LTSPICE_BINARY:-/Applications/LTspice.app/Contents/MacOS/LTspice}"
 UV_BIN="${UV_BIN:-uv}"
+AUTO_FIRST_RUN_PERMISSION_SETUP="${LTSPICE_MCP_DAEMON_AUTO_FIRST_RUN_PERMISSION_SETUP:-1}"
+FIRST_RUN_PERMISSION_MARKER="${DAEMON_DIR}/first-run-permissions.done"
 
 if [[ "${HTTP_PATH}" != /* ]]; then
   HTTP_PATH="/${HTTP_PATH}"
@@ -33,6 +35,11 @@ Commands:
   stop                  Stop the daemon
   restart               Restart the daemon
   status                Print daemon status
+  trigger-initial-permissions
+                        Run both permission triggers (Screen Recording + Accessibility)
+  check-accessibility   Check macOS Accessibility access through MCP daemon
+  trigger-accessibility-permission
+                        Intentionally trigger Accessibility permission flow
   trigger-screen-recording-permission
                         Intentionally trigger ScreenCaptureKit permission flow
   follow [--lines N]    Follow daemon logs in real time
@@ -49,6 +56,7 @@ Environment overrides:
   LTSPICE_MCP_DAEMON_TIMEOUT
   LTSPICE_MCP_DAEMON_LTSPICE_BINARY
   LTSPICE_MCP_DAEMON_DIR
+  LTSPICE_MCP_DAEMON_AUTO_FIRST_RUN_PERMISSION_SETUP (default: 1)
   UV_BIN
   NPX_BIN
 EOF
@@ -148,12 +156,23 @@ is_running() {
   return 1
 }
 
+write_first_run_permission_marker() {
+  {
+    echo "completed_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    echo "url=$(url)"
+  } > "${FIRST_RUN_PERMISSION_MARKER}"
+}
+
 start_daemon() {
+  local skip_first_run_setup="${1:-false}"
   if is_running; then
     local pid
     pid="$(pid_from_file)"
     echo "ltspice-mcp daemon already running (pid ${pid})"
     echo "URL: $(url)"
+    if [[ "${skip_first_run_setup}" != "true" ]]; then
+      run_first_run_permission_setup_if_needed || true
+    fi
     return 0
   fi
 
@@ -223,6 +242,9 @@ start_daemon() {
   echo "Started ltspice-mcp daemon (pid ${pid})"
   echo "URL: $(url)"
   echo "Log: ${log_file}"
+  if [[ "${skip_first_run_setup}" != "true" ]]; then
+    run_first_run_permission_setup_if_needed || true
+  fi
 }
 
 stop_daemon() {
@@ -342,9 +364,8 @@ list_logs() {
   ls -1t "${LOG_DIR}"/ltspice-mcp-daemon-*.log 2>/dev/null | head -n "${count}" || true
 }
 
-trigger_permission_prompt() {
+run_screen_recording_permission_trigger() {
   local npx_bin="${NPX_BIN:-npx}"
-  start_daemon
   (
     cd "${PROJECT_ROOT}"
     "${UV_BIN}" run --project "${PROJECT_ROOT}" python \
@@ -353,6 +374,89 @@ trigger_permission_prompt() {
       --command "${npx_bin}" \
       --command-args -y mcp-remote
   )
+}
+
+trigger_permission_prompt() {
+  start_daemon true
+  run_screen_recording_permission_trigger
+}
+
+run_accessibility_check() {
+  local npx_bin="${NPX_BIN:-npx}"
+  (
+    cd "${PROJECT_ROOT}"
+    "${UV_BIN}" run --project "${PROJECT_ROOT}" python \
+      "${PROJECT_ROOT}/scripts/trigger_accessibility_permission.py" \
+      --mode check \
+      --url "$(url)" \
+      --command "${npx_bin}" \
+      --command-args -y mcp-remote
+  )
+}
+
+check_accessibility() {
+  start_daemon true
+  run_accessibility_check
+}
+
+run_accessibility_permission_trigger() {
+  local npx_bin="${NPX_BIN:-npx}"
+  (
+    cd "${PROJECT_ROOT}"
+    "${UV_BIN}" run --project "${PROJECT_ROOT}" python \
+      "${PROJECT_ROOT}/scripts/trigger_accessibility_permission.py" \
+      --mode trigger \
+      --open-settings \
+      --url "$(url)" \
+      --command "${npx_bin}" \
+      --command-args -y mcp-remote
+  )
+}
+
+trigger_accessibility_permission() {
+  start_daemon true
+  run_accessibility_permission_trigger
+}
+
+run_initial_permission_triggers() {
+  run_screen_recording_permission_trigger
+  run_accessibility_permission_trigger
+}
+
+trigger_initial_permissions() {
+  start_daemon true
+  if run_initial_permission_triggers; then
+    write_first_run_permission_marker
+    echo "Initial permission setup marker updated:"
+    echo "  ${FIRST_RUN_PERMISSION_MARKER}"
+  fi
+}
+
+run_first_run_permission_setup_if_needed() {
+  local auto_flag
+  auto_flag="$(echo "${AUTO_FIRST_RUN_PERMISSION_SETUP}" | tr '[:upper:]' '[:lower:]')"
+  case "${auto_flag}" in
+    0|false|no|off)
+      return 0
+      ;;
+  esac
+
+  if [[ -f "${FIRST_RUN_PERMISSION_MARKER}" ]]; then
+    return 0
+  fi
+
+  echo "First run setup: triggering one-time permission checks."
+  echo "This may open macOS permission/settings dialogs."
+  if run_initial_permission_triggers; then
+    write_first_run_permission_marker
+    echo "First run permission setup completed."
+    echo "Marker: ${FIRST_RUN_PERMISSION_MARKER}"
+  else
+    echo "First run permission setup did not complete."
+    echo "You can retry manually:"
+    echo "  ./scripts/ltspice_mcp_daemon.sh trigger-initial-permissions"
+    return 1
+  fi
 }
 
 command="${1:-}"
@@ -375,6 +479,15 @@ case "${command}" in
     ;;
   status)
     status_daemon
+    ;;
+  trigger-initial-permissions)
+    trigger_initial_permissions
+    ;;
+  check-accessibility)
+    check_accessibility
+    ;;
+  trigger-accessibility-permission)
+    trigger_accessibility_permission
     ;;
   trigger-screen-recording-permission)
     trigger_permission_prompt

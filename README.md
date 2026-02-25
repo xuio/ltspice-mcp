@@ -56,6 +56,31 @@ source .venv/bin/activate
 pip install -e .
 ```
 
+## First-time setup (required for screenshots)
+
+Use the daemon helper script. On the first `start`, it now runs a one-time permission setup automatically.
+
+```bash
+./scripts/ltspice_mcp_daemon.sh start
+```
+
+What happens on first run:
+- Screen Recording flow is triggered so macOS can grant capture access.
+- Accessibility flow is triggered so the daemon can close LTspice windows after screenshots.
+
+If macOS opens permission dialogs or settings panes, allow access and then verify:
+
+```bash
+./scripts/ltspice_mcp_daemon.sh check-accessibility
+./scripts/ltspice_mcp_daemon.sh trigger-screen-recording-permission
+```
+
+You can re-run both permission triggers anytime:
+
+```bash
+./scripts/ltspice_mcp_daemon.sh trigger-initial-permissions
+```
+
 ## Run
 
 ```bash
@@ -239,6 +264,9 @@ Agent/LLM operations after code changes:
 ```bash
 ./scripts/ltspice_mcp_daemon.sh restart
 ./scripts/ltspice_mcp_daemon.sh status
+./scripts/ltspice_mcp_daemon.sh trigger-initial-permissions
+./scripts/ltspice_mcp_daemon.sh check-accessibility
+./scripts/ltspice_mcp_daemon.sh trigger-accessibility-permission
 ./scripts/ltspice_mcp_daemon.sh trigger-screen-recording-permission
 ./scripts/ltspice_mcp_daemon.sh follow
 ./scripts/ltspice_mcp_daemon.sh latest-log
@@ -248,7 +276,12 @@ Agent/LLM operations after code changes:
 ```
 
 Permission prompt helper:
+- On the first daemon start, permission setup runs automatically once and drops a marker at `.mcp-workdir/daemon/first-run-permissions.done`.
+- `./scripts/ltspice_mcp_daemon.sh trigger-initial-permissions` runs both permission triggers manually (Screen Recording + Accessibility).
 - `./scripts/ltspice_mcp_daemon.sh trigger-screen-recording-permission` forces an MCP-over-HTTP image render call (through `mcp-remote`) that exercises ScreenCaptureKit so macOS can show/refresh Screen Recording permission state.
+- `./scripts/ltspice_mcp_daemon.sh check-accessibility` verifies whether the daemon process can use macOS Accessibility APIs to close LTspice windows.
+- `./scripts/ltspice_mcp_daemon.sh trigger-accessibility-permission` intentionally exercises LTspice UI open/close control through MCP and opens the Accessibility settings pane when access is denied.
+- Set `LTSPICE_MCP_DAEMON_AUTO_FIRST_RUN_PERMISSION_SETUP=0` to disable automatic first-run permission setup.
 
 ## UI integration (optional)
 
