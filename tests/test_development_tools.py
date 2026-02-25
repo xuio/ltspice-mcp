@@ -252,6 +252,47 @@ class TestDevelopmentTools(unittest.TestCase):
         self.assertFalse(payload["valid"])
         self.assertGreaterEqual(len(payload["errors"]), 1)
 
+    def test_lint_and_validate_support_utf16_ltspice_style(self) -> None:
+        asc_path = self.temp_dir / "lint_utf16_style.asc"
+        asc_path.write_bytes(
+            (
+                "Version 4\n"
+                "SHEET 1 880 680\n"
+                "WIRE 192 160 96 160\n"
+                "WIRE 288 160 192 160\n"
+                "WIRE 288 224 288 160\n"
+                "FLAG 288 224 0\n"
+                "SYMBOL voltage 96 144 R0\n"
+                "SYMATTR InstName V1\n"
+                "SYMATTR Value AC 1\n"
+                "SYMBOL Diode 192 176 R0\n"
+                "WINDOW 0 24 64 Left 2\n"
+                "WINDOW 3 24 0 Left 2\n"
+                "SYMATTR InstName D1\n"
+                "SYMBOL Res 272 160 R0\n"
+                "SYMATTR InstName R1\n"
+                "SYMATTR Value 1k\n"
+                "TEXT 48 560 Left 2 !.op\n"
+            ).encode("utf-16le")
+        )
+
+        validation = server.validateSchematic(str(asc_path))
+        self.assertTrue(validation["valid"])
+        self.assertEqual(validation["components"], 3)
+        self.assertEqual(validation["wires"], 3)
+        self.assertTrue(validation["has_ground"])
+        self.assertIn(".op", [item.lower() for item in validation["simulation_directives"]])
+
+        lint_payload = server.lintSchematic(
+            asc_path=str(asc_path),
+            strict=False,
+            lib_zip_path=str(self.temp_dir / "missing_lib.zip"),
+        )
+        self.assertTrue(lint_payload["valid"])
+        self.assertEqual(lint_payload["component_count"], 3)
+        self.assertEqual(lint_payload["wire_count"], 3)
+        self.assertEqual(lint_payload["flag_count"], 1)
+
     def test_tool_telemetry_records_calls(self) -> None:
         server.resetToolTelemetry()
         server.listIntentCircuitTemplates()

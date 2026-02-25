@@ -1811,7 +1811,7 @@ def _default_vectors_for_plot_preset(dataset: RawDataset, preset: str) -> list[s
 
 
 def _validate_schematic_file(path: Path) -> dict[str, Any]:
-    text = path.read_text(encoding="utf-8", errors="ignore")
+    text = read_text_auto(path)
     components = 0
     wires = 0
     flags = 0
@@ -1822,19 +1822,22 @@ def _validate_schematic_file(path: Path) -> dict[str, Any]:
         line = raw.strip()
         if not line:
             continue
-        if line.startswith("SYMBOL "):
+        parts = line.split()
+        if not parts:
+            continue
+        keyword = parts[0].upper()
+        if keyword == "SYMBOL":
             components += 1
             continue
-        if line.startswith("WIRE "):
+        if keyword == "WIRE":
             wires += 1
             continue
-        if line.startswith("FLAG "):
+        if keyword == "FLAG":
             flags += 1
-            parts = line.split()
             if len(parts) >= 4 and parts[-1].strip().lower() in {"0", "gnd", "ground"}:
                 has_ground = True
             continue
-        if line.startswith("TEXT ") and "!" in line:
+        if keyword == "TEXT" and "!" in line:
             directive = line.split("!", 1)[1].strip()
             if directive:
                 directives.append(directive)
@@ -1885,7 +1888,7 @@ def _lint_schematic_file(
     strict: bool = False,
 ) -> dict[str, Any]:
     validation = _validate_schematic_file(path)
-    text = path.read_text(encoding="utf-8", errors="ignore")
+    text = read_text_auto(path)
 
     components: list[dict[str, Any]] = []
     current_component: dict[str, Any] | None = None
@@ -1899,7 +1902,7 @@ def _lint_schematic_file(
         if not line:
             continue
         parts = line.split()
-        keyword = parts[0]
+        keyword = parts[0].upper()
         if keyword == "SYMBOL" and len(parts) >= 5:
             try:
                 component = {
