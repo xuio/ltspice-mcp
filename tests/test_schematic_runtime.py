@@ -101,6 +101,33 @@ class TestSchematicRuntimeTools(unittest.TestCase):
                 abort_on_validation_error=True,
             )
 
+    def test_simulate_schematic_file_requires_sidecar_on_macos(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_simulate_schematic_macos_test_"))
+        asc_path = temp_dir / "no_sidecar.asc"
+        asc_path.write_text(
+            "Version 4\n"
+            "SHEET 1 880 680\n"
+            "SYMBOL voltage 120 120 R0\n"
+            "SYMATTR InstName V1\n"
+            "SYMATTR Value DC 1\n"
+            "FLAG 120 216 0\n"
+            "TEXT 48 560 Left 2 !.op\n",
+            encoding="utf-8",
+        )
+
+        server._configure_runner(workdir=temp_dir, ltspice_binary=None, timeout=10)
+        with (
+            patch("ltspice_mcp.server.platform.system", return_value="Darwin"),
+            patch("ltspice_mcp.server._run_simulation_with_ui") as run_mock,
+        ):
+            with self.assertRaisesRegex(ValueError, "does not support LTspice batch simulation directly from \\.asc"):
+                server.simulateSchematicFile(
+                    asc_path=str(asc_path),
+                    validate_first=True,
+                    abort_on_validation_error=False,
+                )
+            run_mock.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

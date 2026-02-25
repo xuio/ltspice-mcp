@@ -10,6 +10,7 @@ import logging
 import math
 import mimetypes
 import os
+import platform
 import re
 import shutil
 import struct
@@ -20,7 +21,7 @@ from collections import deque
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import mcp.types as types
 from mcp.server.fastmcp import FastMCP
@@ -296,7 +297,12 @@ def _log_tool_event(event: str, **fields: Any) -> None:
 def _telemetry_tool(func):
     if getattr(func, "__ltspice_tool_wrapped__", False):
         return func
-    signature = inspect.signature(func)
+    # Evaluate forward-reference annotations before preserving the signature.
+    # This keeps FastMCP return-type handling correct for CallToolResult tools.
+    try:
+        signature = inspect.signature(func, eval_str=True)
+    except Exception:  # noqa: BLE001
+        signature = inspect.signature(func)
     tool_name = func.__name__
 
     @functools.wraps(func)
@@ -2476,7 +2482,7 @@ def renderLtspicePlotImage(
     y_min: float | None = None,
     y_max: float | None = None,
     dual_axis: bool | None = None,
-    pane_layout: str = "single",
+    pane_layout: Literal["single", "split", "per_trace"] = "single",
     title: str | None = None,
     validate_capture: bool = True,
     render_session_id: str | None = None,
@@ -2485,6 +2491,7 @@ def renderLtspicePlotImage(
     Render one or more vectors from a RAW dataset to a plot image and return it through MCP.
 
     Supports run_id/raw_path resolution and optional step filtering for stepped runs.
+    pane_layout: single | split | per_trace
     """
     if not vectors:
         raise ValueError("vectors must contain at least one vector name")
@@ -2610,7 +2617,7 @@ def generatePlotSettings(
     y_min: float | None = None,
     y_max: float | None = None,
     dual_axis: bool | None = None,
-    pane_layout: str = "single",
+    pane_layout: Literal["single", "split", "per_trace"] = "single",
     output_path: str | None = None,
 ) -> dict[str, Any]:
     """Generate a LTspice .plt file from vectors and return parsed settings for debugging."""
@@ -3322,6 +3329,12 @@ def simulateSchematicFile(
                 run_target = candidate
                 sidecar_netlist = candidate
                 break
+        if sidecar_netlist is None and platform.system() == "Darwin":
+            raise ValueError(
+                "simulateSchematicFile on macOS does not support LTspice batch simulation "
+                "directly from .asc files. Create a sidecar netlist next to the schematic "
+                "(.cir/.net/.sp/.spi) and retry, or use simulateNetlist/simulateNetlistFile."
+            )
 
     _loaded_netlist = run_target
     run, ui_events, effective_ui = _run_simulation_with_ui(

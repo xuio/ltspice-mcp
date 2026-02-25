@@ -337,7 +337,8 @@ Schematic debug workflow:
 - `lintSchematic`: deeper structural linting (pin connectivity, dangling wire endpoints, duplicate InstName detection)
 - `simulateSchematicFile`: runs `.asc` directly in batch mode and optionally includes preflight validation in the response
 - use `abort_on_validation_error=true` when you want to block execution until preflight issues are fixed
-- schematics generated from netlists/templates include a sidecar `.cir`; `simulateSchematicFile` prefers this sidecar for reliable batch execution
+- schematics generated from netlists/templates include a sidecar `.cir`; `simulateSchematicFile` uses this sidecar
+- macOS note: LTspice batch simulation does not run `.asc` directly; `simulateSchematicFile` requires a sidecar netlist (`.cir`/`.net`/`.sp`/`.spi`) next to the schematic
 
 Template notes:
 - built-in template JSON: `src/ltspice_mcp/schematic_templates.json`
