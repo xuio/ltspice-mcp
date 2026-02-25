@@ -3,7 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from subprocess import CompletedProcess
+from subprocess import CompletedProcess, TimeoutExpired
 from unittest.mock import patch
 
 from ltspice_mcp.ltspice import (
@@ -79,6 +79,48 @@ class TestScreenCaptureKitPath(unittest.TestCase):
         cmd = run_mock.call_args[0][0]
         self.assertEqual(cmd[0], str(helper_path))
         self.assertEqual(cmd[2], "foo.asc")
+
+    def test_screencapturekit_helper_retries_after_timeout(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_sck_retry_test_"))
+        output_path = temp_dir / "capture.png"
+        helper_path = temp_dir / "ltspice-sck-helper"
+        timeout_exc = TimeoutExpired(cmd=[str(helper_path)], timeout=3.0)
+
+        def _run_side_effect(cmd: list[str], **_: object) -> CompletedProcess[str]:
+            if _run_side_effect.calls == 0:
+                _run_side_effect.calls += 1
+                raise timeout_exc
+            output_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+            return CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout='{"window_id": 101, "capture_mode": "screencapturekit_window"}\n',
+                stderr="",
+            )
+        _run_side_effect.calls = 0  # type: ignore[attr-defined]
+
+        with (
+            patch("ltspice_mcp.ltspice.platform.system", return_value="Darwin"),
+            patch(
+                "ltspice_mcp.ltspice._ensure_screencapturekit_helper",
+                return_value=(
+                    helper_path,
+                    {"helper_path": str(helper_path), "helper_source": "compiled_cache", "compiled": False},
+                ),
+            ),
+            patch("ltspice_mcp.ltspice.subprocess.run", side_effect=_run_side_effect) as run_mock,
+        ):
+            payload = _capture_ltspice_window_with_screencapturekit(
+                output_path=output_path,
+                title_hint="foo.asc",
+                timeout_seconds=6.0,
+                attempts=2,
+                retry_delay=0.0,
+            )
+
+        self.assertEqual(payload["window_id"], 101)
+        self.assertEqual(payload["capture_diagnostics"]["attempt_count"], 2)
+        self.assertEqual(run_mock.call_count, 2)
 
     def test_capture_ltspice_window_screenshot_uses_sck_and_background_open(self) -> None:
         temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_sck_path_test_"))
@@ -206,9 +248,55 @@ class TestCloseLtspiceWindow(unittest.TestCase):
         self.assertFalse(payload["closed"])
         self.assertIn("selector", payload["error"])
 
+    def test_close_ltspice_window_uses_ax_helper_first(self) -> None:
+        with (
+            patch("ltspice_mcp.ltspice.platform.system", return_value="Darwin"),
+            patch(
+                "ltspice_mcp.ltspice._close_ltspice_window_with_ax_helper",
+                return_value={
+                    "closed": True,
+                    "partially_closed": False,
+                    "matched_windows": 1,
+                    "closed_windows": 1,
+                    "close_strategy": "ax_helper",
+                    "status": "OK",
+                    "return_code": 0,
+                },
+            ) as helper_mock,
+            patch("ltspice_mcp.ltspice.subprocess.run") as run_mock,
+        ):
+            payload = close_ltspice_window("foo.asc")
+        self.assertTrue(payload["closed"])
+        self.assertEqual(payload["close_strategy"], "ax_helper")
+        helper_mock.assert_called_once()
+        run_mock.assert_not_called()
+
+    def test_close_ltspice_window_returns_ax_helper_no_match_without_fallback(self) -> None:
+        with (
+            patch("ltspice_mcp.ltspice.platform.system", return_value="Darwin"),
+            patch(
+                "ltspice_mcp.ltspice._close_ltspice_window_with_ax_helper",
+                return_value={
+                    "closed": False,
+                    "partially_closed": False,
+                    "matched_windows": 0,
+                    "closed_windows": 0,
+                    "close_strategy": "ax_helper",
+                    "status": "OK",
+                    "return_code": 0,
+                },
+            ),
+            patch("ltspice_mcp.ltspice.subprocess.run") as run_mock,
+        ):
+            payload = close_ltspice_window("foo.asc")
+        self.assertFalse(payload["closed"])
+        self.assertEqual(payload["status"], "OK")
+        run_mock.assert_not_called()
+
     def test_close_ltspice_window_reports_no_match_as_not_closed(self) -> None:
         with (
             patch("ltspice_mcp.ltspice.platform.system", return_value="Darwin"),
+            patch("ltspice_mcp.ltspice._close_ltspice_window_with_ax_helper", return_value=None),
             patch("ltspice_mcp.ltspice.subprocess.run") as run_mock,
         ):
             run_mock.return_value = CompletedProcess(
@@ -226,21 +314,23 @@ class TestCloseLtspiceWindow(unittest.TestCase):
     def test_close_ltspice_window_parses_close_strategy_suffix(self) -> None:
         with (
             patch("ltspice_mcp.ltspice.platform.system", return_value="Darwin"),
+            patch("ltspice_mcp.ltspice._close_ltspice_window_with_ax_helper", return_value=None),
             patch("ltspice_mcp.ltspice.subprocess.run") as run_mock,
         ):
             run_mock.return_value = CompletedProcess(
                 args=["osascript"],
                 returncode=0,
-                stdout="OK|1|1|menu\n",
+                stdout="OK|1|1|ax\n",
                 stderr="",
             )
             payload = close_ltspice_window("foo.asc")
         self.assertTrue(payload["closed"])
-        self.assertEqual(payload["close_strategy"], "menu")
+        self.assertEqual(payload["close_strategy"], "ax")
 
     def test_close_ltspice_window_retries_until_closed(self) -> None:
         with (
             patch("ltspice_mcp.ltspice.platform.system", return_value="Darwin"),
+            patch("ltspice_mcp.ltspice._close_ltspice_window_with_ax_helper", return_value=None),
             patch("ltspice_mcp.ltspice.subprocess.run") as run_mock,
         ):
             run_mock.side_effect = [
@@ -253,7 +343,7 @@ class TestCloseLtspiceWindow(unittest.TestCase):
                 CompletedProcess(
                     args=["osascript"],
                     returncode=0,
-                    stdout="OK|1|1|menu\n",
+                    stdout="OK|1|1|ax\n",
                     stderr="",
                 ),
             ]

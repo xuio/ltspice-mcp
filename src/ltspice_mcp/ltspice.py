@@ -276,6 +276,265 @@ if failed {
 _SCK_HELPER_FILENAME = "ltspice-sck-helper"
 _SCK_HELPER_HASH_FILENAME = ".ltspice-sck-helper.sha256"
 _SCK_HELPER_SWIFT_FILENAME = "ltspice-sck-helper.swift"
+_AX_CLOSE_HELPER_FILENAME = "ltspice-ax-close-helper"
+_AX_CLOSE_HELPER_HASH_FILENAME = ".ltspice-ax-close-helper.sha256"
+_AX_CLOSE_HELPER_SWIFT_FILENAME = "ltspice-ax-close-helper.swift"
+
+_AX_CLOSE_HELPER_SOURCE = r"""
+import Foundation
+import AppKit
+import ApplicationServices
+
+let args = CommandLine.arguments
+if args.count < 6 {
+    fputs("usage: <titleContains> <titleExact> <windowId> <maxPasses> <settleMs>\n", stderr)
+    exit(2)
+}
+
+let titleContains = args[1].trimmingCharacters(in: .whitespacesAndNewlines)
+let titleExact = args[2].trimmingCharacters(in: .whitespacesAndNewlines)
+let windowIdRaw = args[3].trimmingCharacters(in: .whitespacesAndNewlines)
+let maxPasses = max(1, min(15, Int(args[4]) ?? 1))
+let settleMs = max(0, min(2000, Int(args[5]) ?? 150))
+let targetWindowId: Int64? = Int64(windowIdRaw)
+
+func emitJSON(_ payload: [String: Any]) {
+    if let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+       let text = String(data: data, encoding: .utf8) {
+        print(text)
+    }
+}
+
+func cfString(_ value: String) -> CFString {
+    return value as CFString
+}
+
+func runningLTspicePids() -> [pid_t] {
+    var pids: [pid_t] = []
+    for app in NSWorkspace.shared.runningApplications {
+        if app.isTerminated {
+            continue
+        }
+        let name = app.localizedName ?? ""
+        let bundleId = app.bundleIdentifier ?? ""
+        if name == "LTspice" || bundleId.lowercased().contains("ltspice") {
+            pids.append(app.processIdentifier)
+        }
+    }
+    return pids
+}
+
+func asAXElement(_ value: Any?) -> AXUIElement? {
+    guard let value else {
+        return nil
+    }
+    let ref = value as CFTypeRef
+    if CFGetTypeID(ref) == AXUIElementGetTypeID() {
+        return unsafeBitCast(ref, to: AXUIElement.self)
+    }
+    return nil
+}
+
+func elementKey(_ element: AXUIElement) -> String {
+    let opaque = Unmanaged.passUnretained(element).toOpaque()
+    return "\(opaque)"
+}
+
+func windowTitle(_ window: AXUIElement) -> String {
+    var value: CFTypeRef?
+    if AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &value) == .success,
+       let title = value as? String {
+        return title
+    }
+    return ""
+}
+
+func windowNumber(_ window: AXUIElement) -> Int64? {
+    var value: CFTypeRef?
+    if AXUIElementCopyAttributeValue(window, cfString("AXWindowNumber"), &value) != .success {
+        return nil
+    }
+    if let number = value as? NSNumber {
+        return number.int64Value
+    }
+    return nil
+}
+
+func closeWindow(_ window: AXUIElement) -> Bool {
+    var closeButtonValue: CFTypeRef?
+    if AXUIElementCopyAttributeValue(window, kAXCloseButtonAttribute as CFString, &closeButtonValue) == .success,
+       let closeButtonValue,
+       let closeButton = asAXElement(closeButtonValue),
+       AXUIElementPerformAction(closeButton, kAXPressAction as CFString) == .success {
+        return true
+    }
+    if AXUIElementPerformAction(window, cfString("AXClose")) == .success {
+        return true
+    }
+    return false
+}
+
+func appendWindow(_ elementRef: CFTypeRef?, into windows: inout [AXUIElement], seen: inout Set<String>) {
+    guard let window = asAXElement(elementRef) else {
+        return
+    }
+    let key = elementKey(window)
+    if seen.contains(key) {
+        return
+    }
+    seen.insert(key)
+    windows.append(window)
+}
+
+func candidateWindows(_ appElement: AXUIElement) -> [AXUIElement] {
+    var windows: [AXUIElement] = []
+    var seen: Set<String> = []
+
+    var rawWindows: CFTypeRef?
+    if AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &rawWindows) == .success,
+       let rawWindows {
+        if let array = rawWindows as? [Any] {
+            for item in array {
+                appendWindow(item as CFTypeRef, into: &windows, seen: &seen)
+            }
+        } else if let array = rawWindows as? NSArray {
+            for item in array {
+                appendWindow(item as CFTypeRef, into: &windows, seen: &seen)
+            }
+        }
+    }
+
+    var focusedWindow: CFTypeRef?
+    if AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &focusedWindow) == .success {
+        appendWindow(focusedWindow, into: &windows, seen: &seen)
+    }
+
+    var mainWindow: CFTypeRef?
+    if AXUIElementCopyAttributeValue(appElement, kAXMainWindowAttribute as CFString, &mainWindow) == .success {
+        appendWindow(mainWindow, into: &windows, seen: &seen)
+    }
+
+    return windows
+}
+
+func matchesSelector(_ window: AXUIElement) -> Bool {
+    let title = windowTitle(window)
+    let number = windowNumber(window)
+    var isMatch = false
+    if let targetWindowId, number == targetWindowId {
+        isMatch = true
+    }
+    if !isMatch && !titleExact.isEmpty && title == titleExact {
+        isMatch = true
+    }
+    if !isMatch && !titleContains.isEmpty && title.localizedCaseInsensitiveContains(titleContains) {
+        isMatch = true
+    }
+    return isMatch
+}
+
+func matchingWindows() -> [AXUIElement] {
+    var matches: [AXUIElement] = []
+    var seen: Set<String> = []
+    for pid in runningLTspicePids() {
+        let appElement = AXUIElementCreateApplication(pid)
+        for window in candidateWindows(appElement) {
+            if !matchesSelector(window) {
+                continue
+            }
+            let key = elementKey(window)
+            if seen.contains(key) {
+                continue
+            }
+            seen.insert(key)
+            matches.append(window)
+        }
+    }
+    return matches
+}
+
+if titleContains.isEmpty && titleExact.isEmpty && targetWindowId == nil {
+    emitJSON([
+        "status": "INVALID_SELECTORS",
+        "closed": false,
+        "matched_windows": 0,
+        "closed_windows": 0
+    ])
+    exit(2)
+}
+
+if !AXIsProcessTrusted() {
+    emitJSON([
+        "status": "AX_NOT_TRUSTED",
+        "closed": false,
+        "matched_windows": 0,
+        "closed_windows": 0
+    ])
+    exit(1)
+}
+
+let pids = runningLTspicePids()
+if pids.isEmpty {
+    emitJSON([
+        "status": "PROCESS_MISSING",
+        "closed": false,
+        "matched_windows": 0,
+        "closed_windows": 0,
+        "remaining_windows": 0
+    ])
+    exit(0)
+}
+
+let initialMatches = matchingWindows()
+let initialMatchedCount = initialMatches.count
+var passEvents: [[String: Any]] = []
+var totalCloseActions = 0
+
+for passIndex in 1...maxPasses {
+    let matches = matchingWindows()
+    if matches.isEmpty {
+        break
+    }
+    var closeActions = 0
+    for window in matches {
+        if closeWindow(window) {
+            closeActions += 1
+        }
+    }
+    totalCloseActions += closeActions
+    if settleMs > 0 {
+        usleep(useconds_t(settleMs * 1000))
+    }
+    let remaining = matchingWindows().count
+    passEvents.append([
+        "pass": passIndex,
+        "matched": matches.count,
+        "close_actions": closeActions,
+        "remaining": remaining
+    ])
+    if remaining == 0 {
+        break
+    }
+}
+
+let remainingCount = matchingWindows().count
+let closedCount = totalCloseActions
+let closed = remainingCount == 0 && totalCloseActions > 0
+let partiallyClosed = !closed && closedCount > 0
+
+emitJSON([
+    "status": "OK",
+    "closed": closed,
+    "partially_closed": partiallyClosed,
+    "matched_windows": max(initialMatchedCount, closedCount + remainingCount),
+    "closed_windows": closedCount,
+    "remaining_windows": remainingCount,
+    "close_strategy": "ax_helper",
+    "pid_count": pids.count,
+    "attempt_count": passEvents.count,
+    "attempts": passEvents
+])
+"""
 
 
 def _resolve_sck_helper_path() -> tuple[Path, bool]:
@@ -289,6 +548,19 @@ def _resolve_sck_helper_path() -> tuple[Path, bool]:
         else (Path.home() / "Library" / "Application Support" / "ltspice-mcp" / "bin")
     )
     return (helper_dir / _SCK_HELPER_FILENAME).resolve(), False
+
+
+def _resolve_ax_close_helper_path() -> tuple[Path, bool]:
+    explicit = os.getenv("LTSPICE_MCP_AX_CLOSE_HELPER_PATH")
+    if explicit:
+        return Path(explicit).expanduser().resolve(), True
+    helper_dir_raw = os.getenv("LTSPICE_MCP_AX_CLOSE_HELPER_DIR")
+    helper_dir = (
+        Path(helper_dir_raw).expanduser()
+        if helper_dir_raw
+        else (Path.home() / "Library" / "Application Support" / "ltspice-mcp" / "bin")
+    )
+    return (helper_dir / _AX_CLOSE_HELPER_FILENAME).resolve(), False
 
 
 def _ensure_screencapturekit_helper() -> tuple[Path, dict[str, Any]]:
@@ -376,6 +648,108 @@ def _ensure_screencapturekit_helper() -> tuple[Path, dict[str, Any]]:
             if compile_proc.returncode != 0:
                 raise RuntimeError(
                     "swiftc failed to build ScreenCaptureKit helper "
+                    f"(rc={compile_proc.returncode}): {compile_stderr or compile_stdout}"
+                )
+            helper_path.chmod(0o755)
+            helper_hash_path.write_text(f"{source_hash}\n", encoding="utf-8")
+            compiled = True
+
+    return helper_path, {
+        "helper_path": str(helper_path),
+        "helper_source": "compiled_now" if compiled else "compiled_cache_after_lock",
+        "compiled": compiled,
+        "swiftc_path": swiftc,
+        "source_hash": source_hash,
+        "compile_command": compile_command or None,
+        "compile_stdout": compile_stdout,
+        "compile_stderr": compile_stderr,
+    }
+
+
+def _ensure_ax_close_helper() -> tuple[Path, dict[str, Any]]:
+    helper_path, explicit = _resolve_ax_close_helper_path()
+    if explicit:
+        if not _is_executable(helper_path):
+            raise RuntimeError(
+                "LTSPICE_MCP_AX_CLOSE_HELPER_PATH is set but not executable: "
+                f"{helper_path}"
+            )
+        return helper_path, {
+            "helper_path": str(helper_path),
+            "helper_source": "env_path",
+            "compiled": False,
+        }
+
+    swiftc = shutil.which("swiftc")
+    if swiftc is None:
+        raise RuntimeError(
+            "swiftc not found; install Xcode command line tools "
+            "or set LTSPICE_MCP_AX_CLOSE_HELPER_PATH to a prebuilt helper executable."
+        )
+
+    helper_dir = helper_path.parent
+    helper_dir.mkdir(parents=True, exist_ok=True)
+    helper_source_path = helper_dir / _AX_CLOSE_HELPER_SWIFT_FILENAME
+    helper_hash_path = helper_dir / _AX_CLOSE_HELPER_HASH_FILENAME
+    helper_lock_path = helper_dir / ".ltspice-ax-close-helper.lock"
+
+    source_hash = hashlib.sha256(_AX_CLOSE_HELPER_SOURCE.encode("utf-8")).hexdigest()
+    existing_hash = ""
+    if helper_hash_path.exists():
+        try:
+            existing_hash = helper_hash_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            existing_hash = ""
+
+    if _is_executable(helper_path) and existing_hash == source_hash:
+        return helper_path, {
+            "helper_path": str(helper_path),
+            "helper_source": "compiled_cache",
+            "compiled": False,
+            "swiftc_path": swiftc,
+            "source_hash": source_hash,
+        }
+
+    compile_stdout = ""
+    compile_stderr = ""
+    compile_command: list[str] = []
+    compiled = False
+
+    with helper_lock_path.open("a+", encoding="utf-8") as lock_handle:
+        try:
+            import fcntl
+
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            pass
+
+        existing_hash = ""
+        if helper_hash_path.exists():
+            try:
+                existing_hash = helper_hash_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                existing_hash = ""
+
+        if not (_is_executable(helper_path) and existing_hash == source_hash):
+            helper_source_path.write_text(_AX_CLOSE_HELPER_SOURCE, encoding="utf-8")
+            compile_command = [
+                swiftc,
+                "-O",
+                "-o",
+                str(helper_path),
+                str(helper_source_path),
+            ]
+            compile_proc = subprocess.run(
+                compile_command,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            compile_stdout = compile_proc.stdout.strip()
+            compile_stderr = compile_proc.stderr.strip()
+            if compile_proc.returncode != 0:
+                raise RuntimeError(
+                    "swiftc failed to build LTspice AX close helper "
                     f"(rc={compile_proc.returncode}): {compile_stderr or compile_stdout}"
                 )
             helper_path.chmod(0o755)
@@ -562,6 +936,97 @@ def open_in_ltspice_ui(
     }
 
 
+def _close_ltspice_window_with_ax_helper(
+    *,
+    title_hint: str,
+    exact_title: str | None,
+    window_id: int | None,
+    attempts: int,
+    retry_delay: float,
+) -> dict[str, Any] | None:
+    helper_disabled = os.getenv("LTSPICE_MCP_AX_CLOSE_HELPER_ENABLED", "1").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    if helper_disabled:
+        return None
+
+    try:
+        helper_path, helper_details = _ensure_ax_close_helper()
+    except Exception as exc:
+        return {
+            "closed": False,
+            "partially_closed": False,
+            "matched_windows": 0,
+            "closed_windows": 0,
+            "close_strategy": "ax_helper_unavailable",
+            "status": "AX_HELPER_UNAVAILABLE",
+            "return_code": 1,
+            "title_hint": title_hint,
+            "exact_title": exact_title,
+            "window_id": window_id,
+            "error": str(exc),
+        }
+
+    settle_ms = max(0, min(2000, int(round(max(0.0, retry_delay) * 1000.0))))
+    command = [
+        str(helper_path),
+        title_hint,
+        exact_title or "",
+        str(window_id) if isinstance(window_id, int) and window_id > 0 else "",
+        str(max(1, min(15, int(attempts)))),
+        str(settle_ms),
+    ]
+    proc = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    helper_payload: dict[str, Any] = {}
+    for raw in reversed(proc.stdout.splitlines()):
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            candidate = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            helper_payload = candidate
+            break
+
+    status = str(helper_payload.get("status") or ("OK" if proc.returncode == 0 else "AX_HELPER_FAILED"))
+    matched_windows = int(helper_payload.get("matched_windows") or 0)
+    closed_windows = int(helper_payload.get("closed_windows") or 0)
+    closed = bool(helper_payload.get("closed"))
+    partially_closed = bool(helper_payload.get("partially_closed"))
+    if not partially_closed:
+        partially_closed = (not closed) and closed_windows > 0
+
+    return {
+        "closed": closed,
+        "partially_closed": partially_closed,
+        "matched_windows": matched_windows,
+        "closed_windows": closed_windows,
+        "close_strategy": str(helper_payload.get("close_strategy") or "ax_helper"),
+        "status": status,
+        "return_code": proc.returncode,
+        "title_hint": title_hint,
+        "exact_title": exact_title,
+        "window_id": window_id,
+        "command": command,
+        "stdout": proc.stdout.strip(),
+        "stderr": proc.stderr.strip(),
+        "attempt_count": helper_payload.get("attempt_count"),
+        "attempts": helper_payload.get("attempts"),
+        "helper_details": helper_details,
+    }
+
+
 def close_ltspice_window(
     title_hint: str,
     *,
@@ -587,6 +1052,19 @@ def close_ltspice_window(
 
     def _escape_applescript_string(value: str) -> str:
         return value.replace("\\", "\\\\").replace('"', '\\"')
+
+    helper_event = _close_ltspice_window_with_ax_helper(
+        title_hint=title_contains,
+        exact_title=title_exact or None,
+        window_id=target_window_id,
+        attempts=attempts,
+        retry_delay=retry_delay,
+    )
+    if helper_event is not None:
+        helper_status = str(helper_event.get("status") or "")
+        # Keep AX helper as the default path to avoid Space-dependent System Events behavior.
+        if helper_status != "AX_HELPER_UNAVAILABLE":
+            return helper_event
 
     escaped_contains = _escape_applescript_string(title_contains)
     escaped_exact = _escape_applescript_string(title_exact)
@@ -634,52 +1112,7 @@ def close_ltspice_window(
         '      end try\n'
         '      if didClose then set closeCount to closeCount + 1\n'
         '    end repeat\n'
-        '    set closeStrategy to "ax"\n'
-        '    if closeCount < matchCount or matchCount is 0 then\n'
-        '      set menuMatchCount to 0\n'
-        '      try\n'
-        '        try\n'
-        '          set visible to true\n'
-        '        end try\n'
-        '        delay 0.08\n'
-        '        set windowMenu to menu 1 of menu bar item "Window" of menu bar 1\n'
-        '        set fileMenu to menu 1 of menu bar item "File" of menu bar 1\n'
-        '        set safetyCount to 0\n'
-        '        repeat while safetyCount < 120\n'
-        '          set safetyCount to safetyCount + 1\n'
-        '          set matchedMenuItem to missing value\n'
-        '          repeat with mi in menu items of windowMenu\n'
-        '            set itemName to ""\n'
-        '            try\n'
-        '              set itemName to (name of mi) as text\n'
-        '            end try\n'
-        '            set menuItemMatch to false\n'
-        '            if targetExactName is not "" and itemName is targetExactName then set menuItemMatch to true\n'
-        '            if (not menuItemMatch) and targetContainsName is not "" and itemName contains targetContainsName then set menuItemMatch to true\n'
-        '            if menuItemMatch then\n'
-        '              set matchedMenuItem to mi\n'
-        '              exit repeat\n'
-        '            end if\n'
-        '          end repeat\n'
-        '          if matchedMenuItem is missing value then exit repeat\n'
-        '          set menuMatchCount to menuMatchCount + 1\n'
-        '          try\n'
-        '            click matchedMenuItem\n'
-        '            delay 0.06\n'
-        '            try\n'
-        '              click menu item "Close" of fileMenu\n'
-        '            on error\n'
-        '              keystroke "w" using command down\n'
-        '            end try\n'
-        '            set closeCount to closeCount + 1\n'
-        '            set closeStrategy to "menu"\n'
-        '            delay 0.05\n'
-        '          end try\n'
-        '        end repeat\n'
-        '      end try\n'
-        '      if menuMatchCount > matchCount then set matchCount to menuMatchCount\n'
-        '    end if\n'
-        '    return "OK|" & (matchCount as text) & "|" & (closeCount as text) & "|" & closeStrategy\n'
+        '    return "OK|" & (matchCount as text) & "|" & (closeCount as text) & "|ax"\n'
         '  end tell\n'
         'end tell'
     )
@@ -745,6 +1178,8 @@ def close_ltspice_window(
     result["attempt_count"] = len(attempt_events)
     if len(attempt_events) > 1:
         result["attempts"] = attempt_events
+    if helper_event is not None:
+        result["ax_helper_event"] = helper_event
     return result
 
 
@@ -753,73 +1188,140 @@ def _capture_ltspice_window_with_screencapturekit(
     output_path: Path,
     title_hint: str | None = None,
     timeout_seconds: float = 20.0,
+    attempts: int = 3,
+    retry_delay: float = 0.4,
 ) -> dict[str, Any]:
     if platform.system() != "Darwin":
         raise RuntimeError("ScreenCaptureKit capture is currently implemented for macOS only.")
     helper_path, helper_details = _ensure_screencapturekit_helper()
-    helper_timeout = max(2.0, min(15.0, timeout_seconds - 2.0))
+    max_attempts = max(1, min(5, int(attempts)))
+    delay_seconds = max(0.0, float(retry_delay))
+    total_timeout = max(3.0, float(timeout_seconds))
+    per_attempt_timeout = max(3.0, min(total_timeout, (total_timeout / max_attempts) + 2.0))
+    helper_timeout = max(1.5, min(15.0, per_attempt_timeout - 1.0))
+    attempt_events: list[dict[str, Any]] = []
+    last_error_message = "unknown ScreenCaptureKit failure"
 
-    started_monotonic = time.monotonic()
-    command = [
-        str(helper_path),
-        str(output_path),
-        (title_hint or ""),
-        f"{helper_timeout:.3f}",
-    ]
-    proc = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=timeout_seconds,
-    )
+    def _extract_payload(stdout: str) -> dict[str, Any]:
+        for raw in reversed(stdout.splitlines()):
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                candidate = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                return candidate
+        return {}
 
-    duration_seconds = round(time.monotonic() - started_monotonic, 6)
-
-    if proc.returncode != 0:
-        message = (proc.stderr.strip() or proc.stdout.strip() or "unknown ScreenCaptureKit failure")
-        raise RuntimeError(
-            f"ScreenCaptureKit capture failed after {duration_seconds:.3f}s: {message}"
+    def _is_retryable_sck_error(message: str) -> bool:
+        lowered = message.lower()
+        markers = (
+            "timed out waiting for first stream frame",
+            "no ltspice windows found",
+            "selected content was unavailable",
+            "stream failed with",
         )
+        return any(marker in lowered for marker in markers)
 
-    payload: dict[str, Any] = {}
-    for raw in reversed(proc.stdout.splitlines()):
-        line = raw.strip()
-        if not line:
-            continue
+    for attempt_index in range(max_attempts):
+        started_monotonic = time.monotonic()
+        command = [
+            str(helper_path),
+            str(output_path),
+            (title_hint or ""),
+            f"{helper_timeout:.3f}",
+        ]
         try:
-            candidate = json.loads(line)
-        except json.JSONDecodeError:
+            proc = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=per_attempt_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            duration_seconds = round(time.monotonic() - started_monotonic, 6)
+            last_error_message = (
+                f"helper process timed out after {per_attempt_timeout:.3f}s "
+                f"(attempt {attempt_index + 1}/{max_attempts})"
+            )
+            attempt_events.append(
+                {
+                    "attempt": attempt_index + 1,
+                    "return_code": None,
+                    "duration_seconds": duration_seconds,
+                    "error": last_error_message,
+                    "timed_out": True,
+                }
+            )
+            if attempt_index + 1 < max_attempts and delay_seconds > 0:
+                time.sleep(delay_seconds)
             continue
-        if isinstance(candidate, dict):
-            payload = candidate
-            break
 
-    # ScreenCaptureKit finalization can lag a fraction after helper exit.
-    # Use a fixed post-capture settle to avoid flaky "missing file" failures.
-    if not output_path.exists():
-        time.sleep(0.2)
-    if not output_path.exists():
-        raise FileNotFoundError(
-            "ScreenCaptureKit did not produce image: "
-            f"{output_path} (stdout={proc.stdout.strip()[:400]!r}, stderr={proc.stderr.strip()[:400]!r})"
+        duration_seconds = round(time.monotonic() - started_monotonic, 6)
+        payload = _extract_payload(proc.stdout)
+        message = (proc.stderr.strip() or proc.stdout.strip() or "unknown ScreenCaptureKit failure")
+        last_error_message = message
+
+        attempt_events.append(
+            {
+                "attempt": attempt_index + 1,
+                "return_code": proc.returncode,
+                "duration_seconds": duration_seconds,
+                "stdout_line_count": len([line for line in proc.stdout.splitlines() if line.strip()]),
+                "stderr": proc.stderr.strip(),
+                "error": "" if proc.returncode == 0 else message,
+            }
         )
 
-    diagnostics = {
-        "helper_command": command,
-        "duration_seconds": duration_seconds,
-        "return_code": proc.returncode,
-        "stdout_line_count": len([line for line in proc.stdout.splitlines() if line.strip()]),
-        "stderr": proc.stderr.strip(),
-        "helper_details": helper_details,
-    }
-    if payload:
-        payload["capture_diagnostics"] = diagnostics
-        return payload
-    return {
-        "capture_mode": "screencapturekit_window",
-        "capture_diagnostics": diagnostics,
-    }
+        if proc.returncode == 0:
+            # ScreenCaptureKit finalization can lag slightly after helper exit.
+            file_ready = output_path.exists()
+            if not file_ready:
+                time.sleep(0.2)
+                file_ready = output_path.exists()
+            if file_ready:
+                diagnostics = {
+                    "helper_command": command,
+                    "duration_seconds": duration_seconds,
+                    "return_code": proc.returncode,
+                    "stdout_line_count": len([line for line in proc.stdout.splitlines() if line.strip()]),
+                    "stderr": proc.stderr.strip(),
+                    "helper_details": helper_details,
+                    "attempt_count": len(attempt_events),
+                    "attempts": attempt_events,
+                }
+                if payload:
+                    payload["capture_diagnostics"] = diagnostics
+                    return payload
+                return {
+                    "capture_mode": "screencapturekit_window",
+                    "capture_diagnostics": diagnostics,
+                }
+
+            last_error_message = (
+                "ScreenCaptureKit helper reported success but did not produce an image file: "
+                f"{output_path}"
+            )
+            attempt_events[-1]["error"] = last_error_message
+            if attempt_index + 1 < max_attempts and delay_seconds > 0:
+                time.sleep(delay_seconds)
+            continue
+
+        retryable = _is_retryable_sck_error(message)
+        if attempt_index + 1 < max_attempts and retryable:
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
+            continue
+        break
+
+    raise RuntimeError(
+        "ScreenCaptureKit capture failed after "
+        f"{len(attempt_events)} attempt(s): {last_error_message}; "
+        f"diagnostics={json.dumps({'attempts': attempt_events, 'helper_details': helper_details})}"
+    )
 
 
 def _downscale_image_file(path: Path, downscale_factor: float) -> dict[str, Any]:
