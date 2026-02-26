@@ -15,6 +15,7 @@ import queue
 import random
 import re
 import shutil
+import subprocess
 import struct
 import threading
 import time
@@ -58,6 +59,7 @@ from .ltspice import (
     get_ltspice_version,
     is_ltspice_ui_running,
     open_in_ltspice_ui,
+    read_ltspice_window_text,
     tail_text_file,
 )
 from .models import RawDataset, SimulationDiagnostic, SimulationRun
@@ -111,6 +113,10 @@ _DEFAULT_BINARY = os.getenv("LTSPICE_BINARY")
 _DEFAULT_UI_ENABLED = _read_env_bool("LTSPICE_MCP_UI_ENABLED", default=False)
 _DEFAULT_JSON_RESPONSE = _read_env_bool("LTSPICE_MCP_JSON_RESPONSE", default=True)
 _DEFAULT_STATELESS_HTTP = _read_env_bool("LTSPICE_MCP_STATELESS_HTTP", default=True)
+_SYNC_TOOL_TIMEOUT_MARGIN_SECONDS = max(
+    0,
+    int(os.getenv("LTSPICE_MCP_SYNC_TIMEOUT_MARGIN_SECONDS", "10")),
+)
 _DEFAULT_SCHEMATIC_SINGLE_WINDOW = _read_env_bool(
     "LTSPICE_MCP_SCHEMATIC_SINGLE_WINDOW",
     default=True,
@@ -1677,6 +1683,20 @@ def _now_iso() -> str:
     return datetime.now().astimezone().isoformat()
 
 
+def _effective_sync_timeout(timeout_seconds: int | None) -> int | None:
+    if timeout_seconds is None:
+        return None
+    requested = max(1, int(timeout_seconds))
+    margin = int(_SYNC_TOOL_TIMEOUT_MARGIN_SECONDS)
+    if margin <= 0:
+        return requested
+    # Keep small explicit timeouts untouched; trim only larger values so sync tools
+    # can return structured payloads before client-side tool-call deadlines.
+    if requested <= margin + 5:
+        return requested
+    return max(1, requested - margin)
+
+
 def _read_netlist_text(path: Path) -> str:
     text = read_text_auto(path)
     return text if text.endswith("\n") else text + "\n"
@@ -1781,6 +1801,10 @@ _MEAS_AT_VALUE_RE = re.compile(
     rf"\bAT\s*=?\s*(?P<value>{_MEAS_NUMBER_PATTERN})\b",
     re.IGNORECASE,
 )
+_MEAS_STATEMENT_RE = re.compile(
+    r"^\s*\.meas(?:ure)?\s+\S+\s+(?P<name>[A-Za-z_][\w.$-]*)\s+(?P<body>.+?)\s*$",
+    re.IGNORECASE,
+)
 _MEAS_HEADER_TOKEN_RE = re.compile(r"^\s*[A-Za-z_][\w()*/+.,:<>=-]*\s*$")
 _MEAS_AUX_HEADER_TOKENS = {
     "step",
@@ -1796,7 +1820,23 @@ _MEAS_AUX_HEADER_TOKENS = {
 _MEAS_IGNORED_KEYS = {
     "tnom",
     "temp",
+    "asciirawfile",
+    "backannotation",
+    "circuit",
+    "command",
+    "flags",
+    "offset",
+    "plotname",
+    "title",
+    "version",
 }
+_MEAS_RAW_HEADER_RE = re.compile(
+    r"^\s*(?:"
+    r"circuit|asciirawfile|plotname|flags|offset|command|backannotation|title|version"
+    r"|no\.\s*(?:variables|points)"
+    r")\s*[:=]",
+    re.IGNORECASE,
+)
 _SPICE_SUFFIX_SCALE: dict[str, float] = {
     "t": 1e12,
     "g": 1e9,
@@ -1832,7 +1872,11 @@ def _parse_spice_number_token(token: str) -> float | None:
     return float(value)
 
 
-def _extract_meas_numeric_from_rhs(rhs: str) -> tuple[float, str] | None:
+def _extract_meas_numeric_from_rhs(
+    rhs: str,
+    *,
+    prefer_at: bool | None = None,
+) -> tuple[float, str] | None:
     # Try the value segment after '=' first for lines like:
     #   vpp: PP(v(out))=0.731107 FROM 0 TO 0.008
     #   mag_1k: mag(v(out))=(-1.44507dB,0°) at 1000
@@ -1850,7 +1894,12 @@ def _extract_meas_numeric_from_rhs(rhs: str) -> tuple[float, str] | None:
     #   expr=(value,phase) at <time_or_freq>
     # preserve the measured value itself; do not replace it with the AT axis coordinate.
     at_match = _MEAS_AT_VALUE_RE.search(rhs)
-    if at_match and not value_segment.lstrip().startswith("("):
+    use_at_value = (
+        bool(at_match) and not value_segment.lstrip().startswith("(")
+        if prefer_at is None
+        else bool(prefer_at and at_match)
+    )
+    if use_at_value and at_match:
         at_token = at_match.group("value")
         parsed_at = _parse_spice_number_token(at_token)
         if parsed_at is not None:
@@ -1860,6 +1909,75 @@ def _extract_meas_numeric_from_rhs(rhs: str) -> tuple[float, str] | None:
         if parsed is not None:
             return parsed, token
     return None
+
+
+def _parse_meas_statement_kinds(netlist_text: str) -> dict[str, str]:
+    kinds: dict[str, str] = {}
+    for raw_line in netlist_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("*", ";")):
+            continue
+        match = _MEAS_STATEMENT_RE.match(line)
+        if not match:
+            continue
+        name = match.group("name").strip()
+        body = match.group("body").strip().lower()
+        kind = "other"
+        if body.startswith("when ") or " when " in body:
+            kind = "when"
+        elif body.startswith("find ") or " find " in body:
+            kind = "find"
+        kinds[name] = kind
+    return kinds
+
+
+def _apply_meas_statement_kinds(
+    parsed: dict[str, Any],
+    *,
+    statement_kinds: dict[str, str],
+) -> None:
+    measurements = parsed.get("measurements")
+    measurement_text = parsed.get("measurements_text")
+    measurement_display = parsed.get("measurements_display")
+    measurement_steps = parsed.get("measurement_steps")
+    if not isinstance(measurements, dict):
+        return
+    if not isinstance(measurement_text, dict) or not isinstance(measurement_display, dict):
+        return
+    if not isinstance(measurement_steps, dict):
+        measurement_steps = {}
+    measurement_key_lookup = {str(key).strip().lower(): key for key in measurements}
+
+    for name, kind in statement_kinds.items():
+        name_key = measurement_key_lookup.get(str(name).strip().lower())
+        if name_key is None:
+            continue
+        if measurement_steps.get(name_key):
+            continue
+        rhs = str(measurement_display.get(name_key) or "").strip()
+        if not rhs:
+            continue
+        if kind == "find":
+            extracted = _extract_meas_numeric_from_rhs(rhs, prefer_at=False)
+        elif kind == "when":
+            extracted = _extract_meas_numeric_from_rhs(rhs, prefer_at=True)
+        else:
+            continue
+        if extracted is None:
+            continue
+        value, token = extracted
+        measurements[name_key] = value
+        measurement_text[name_key] = token
+
+    items = parsed.get("items")
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "")
+            if name and name in measurements:
+                item["value"] = measurements[name]
+                item["value_text"] = measurement_text.get(name)
 
 
 def _select_meas_table_columns(
@@ -1889,7 +2007,23 @@ def _looks_like_meas_table_header(tokens: list[str]) -> bool:
     return all(_MEAS_HEADER_TOKEN_RE.match(token) for token in tokens)
 
 
-def _parse_meas_results_from_text(text: str) -> dict[str, Any]:
+def _parse_meas_results_from_text(
+    text: str,
+    *,
+    expected_names: set[str] | None = None,
+) -> dict[str, Any]:
+    expected_lookup: set[str] | None = None
+    if expected_names is not None:
+        expected_lookup = {name.strip().lower() for name in expected_names if name and name.strip()}
+
+    def _name_allowed(name: str) -> bool:
+        normalized = name.strip().lower()
+        if not normalized or normalized in _MEAS_IGNORED_KEYS:
+            return False
+        if expected_lookup is not None and normalized not in expected_lookup:
+            return False
+        return True
+
     measurements: dict[str, float] = {}
     measurement_text: dict[str, str] = {}
     measurement_display: dict[str, str] = {}
@@ -1902,9 +2036,16 @@ def _parse_meas_results_from_text(text: str) -> dict[str, Any]:
     pending_header_seen = False
 
     for line in raw_lines:
+        if _MEAS_RAW_HEADER_RE.match(line):
+            continue
+
         match_measure = _MEAS_MEASUREMENT_RE.match(line)
         if match_measure:
-            pending_name = match_measure.group("name").strip()
+            candidate_name = match_measure.group("name").strip()
+            if not _name_allowed(candidate_name):
+                pending_name = None
+                continue
+            pending_name = candidate_name
             if pending_name and pending_name not in measurement_order:
                 measurement_order.append(pending_name)
             if pending_name:
@@ -1917,7 +2058,7 @@ def _parse_meas_results_from_text(text: str) -> dict[str, Any]:
         match_value = _MEAS_VALUE_RE.match(line)
         if match_value:
             name = match_value.group("name").strip()
-            if name.strip().lower() in _MEAS_IGNORED_KEYS:
+            if not _name_allowed(name):
                 continue
             raw_value = match_value.group("value").strip()
             parsed_value = _parse_spice_number_token(raw_value)
@@ -1935,6 +2076,8 @@ def _parse_meas_results_from_text(text: str) -> dict[str, Any]:
         match_colon_line = _MEAS_COLON_LINE_RE.match(line)
         if match_colon_line:
             name = match_colon_line.group("name").strip()
+            if not _name_allowed(name):
+                continue
             rhs = match_colon_line.group("rhs").strip()
             extracted = _extract_meas_numeric_from_rhs(rhs)
             if extracted is not None:
@@ -1980,6 +2123,13 @@ def _parse_meas_results_from_text(text: str) -> dict[str, Any]:
                 tokens[pending_value_column] if len(tokens) > pending_value_column else None
             )
             parsed_value = _parse_spice_number_token(raw_value or "")
+            if parsed_value is None and raw_value:
+                for candidate_token in _MEAS_NUMERIC_TOKEN_RE.findall(raw_value):
+                    candidate_value = _parse_spice_number_token(candidate_token)
+                    if candidate_value is not None:
+                        parsed_value = candidate_value
+                        raw_value = candidate_token
+                        break
             if parsed_value is None:
                 extracted = _extract_meas_numeric_from_rhs(stripped)
                 if extracted is not None:
@@ -3164,6 +3314,7 @@ def _run_simulation_with_ui(
     open_raw_after_run: bool,
 ) -> tuple[SimulationRun, list[dict[str, Any]], bool]:
     effective_ui = _ui_enabled if show_ui is None else bool(show_ui)
+    effective_timeout = _effective_sync_timeout(timeout_seconds)
     ui_events: list[dict[str, Any]] = []
 
     if effective_ui:
@@ -3184,9 +3335,15 @@ def _run_simulation_with_ui(
         _runner.run_file(
             netlist_path,
             ascii_raw=ascii_raw,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=effective_timeout,
         )
     )
+    if timeout_seconds is not None and effective_timeout is not None and effective_timeout != timeout_seconds:
+        run.warnings.append(
+            "Requested timeout was reduced by "
+            f"{_SYNC_TOOL_TIMEOUT_MARGIN_SECONDS}s for sync tool-call safety "
+            f"({timeout_seconds}s -> {effective_timeout}s)."
+        )
 
     if effective_ui and open_raw_after_run:
         try:
@@ -4355,7 +4512,19 @@ def parseMeasResults(
             "warning": "No log file available for the selected run.",
         }
     text = read_text_auto(log_target)
-    parsed = _parse_meas_results_from_text(text)
+    netlist_target = run.netlist_path
+    statement_kinds: dict[str, str] = {}
+    expected_measurements: set[str] | None = None
+    if netlist_target is not None and netlist_target.exists():
+        try:
+            netlist_text = read_text_auto(netlist_target)
+            statement_kinds = _parse_meas_statement_kinds(netlist_text)
+            expected_measurements = set(statement_kinds.keys())
+        except Exception:
+            pass
+    parsed = _parse_meas_results_from_text(text, expected_names=expected_measurements)
+    if statement_kinds:
+        _apply_meas_statement_kinds(parsed, statement_kinds=statement_kinds)
     return {
         "run_id": run.run_id,
         "log_path": str(log_target),
@@ -5792,6 +5961,64 @@ def openLtspiceUi(
         return _open_ui_target(path=Path(path).expanduser().resolve())
     run = _resolve_run(run_id)
     return _open_ui_target(run=run, target=target)
+
+
+@mcp.tool()
+def readLtspiceUiText(
+    run_id: str | None = None,
+    path: str | None = None,
+    target: str = "log",
+    title_hint: str | None = None,
+    exact_title: str | None = None,
+    window_id: int | None = None,
+    max_chars: int = 200000,
+    open_if_needed: bool = True,
+    background: bool = True,
+    settle_seconds: float = 0.8,
+) -> dict[str, Any]:
+    """
+    Read visible LTspice window text using macOS Accessibility APIs.
+
+    Use this to compare parser outputs against text displayed in LTspice UI
+    (for example values shown in log windows).
+    """
+    resolved_path: Path | None = None
+    if path:
+        resolved_path = Path(path).expanduser().resolve()
+    elif run_id:
+        run = _resolve_run(run_id)
+        resolved_path = _target_path_from_run(run, target)
+
+    open_event: dict[str, Any] | None = None
+    if open_if_needed:
+        if resolved_path is None:
+            raise ValueError("Provide run_id or path when open_if_needed is true.")
+        open_event = open_in_ltspice_ui(resolved_path, background=background)
+        if settle_seconds > 0:
+            time.sleep(min(5.0, max(0.0, float(settle_seconds))))
+
+    effective_title_hint = (
+        (title_hint or "").strip()
+        or (resolved_path.name if resolved_path is not None else "")
+    )
+    payload = read_ltspice_window_text(
+        title_hint=effective_title_hint,
+        exact_title=exact_title,
+        window_id=window_id,
+        max_chars=max_chars,
+    )
+    payload.update(
+        {
+            "run_id": run_id,
+            "target": target,
+            "path": str(resolved_path) if resolved_path is not None else None,
+            "open_event": open_event,
+            "open_if_needed": bool(open_if_needed),
+            "background": bool(background),
+            "settle_seconds": float(settle_seconds),
+        }
+    )
+    return payload
 
 
 @mcp.tool()

@@ -363,6 +363,9 @@ _SCK_HELPER_SWIFT_FILENAME = "ltspice-sck-helper.swift"
 _AX_CLOSE_HELPER_FILENAME = "ltspice-ax-close-helper"
 _AX_CLOSE_HELPER_HASH_FILENAME = ".ltspice-ax-close-helper.sha256"
 _AX_CLOSE_HELPER_SWIFT_FILENAME = "ltspice-ax-close-helper.swift"
+_AX_TEXT_HELPER_FILENAME = "ltspice-ax-text-helper"
+_AX_TEXT_HELPER_HASH_FILENAME = ".ltspice-ax-text-helper.sha256"
+_AX_TEXT_HELPER_SWIFT_FILENAME = "ltspice-ax-text-helper.swift"
 
 _AX_CLOSE_HELPER_SOURCE = r"""
 import Foundation
@@ -735,6 +738,472 @@ emitJSON([
 ])
 """
 
+_AX_TEXT_HELPER_SOURCE = r"""
+import Foundation
+import AppKit
+import ApplicationServices
+import CoreGraphics
+
+let args = CommandLine.arguments
+if args.count < 5 {
+    fputs("usage: <titleContains> <titleExact> <windowId> <maxChars>\n", stderr)
+    exit(2)
+}
+
+let titleContains = args[1].trimmingCharacters(in: .whitespacesAndNewlines)
+let titleExact = args[2].trimmingCharacters(in: .whitespacesAndNewlines)
+let windowIdRaw = args[3].trimmingCharacters(in: .whitespacesAndNewlines)
+let targetWindowId: Int64? = Int64(windowIdRaw)
+let maxChars = max(512, min(2_000_000, Int(args[4]) ?? 200_000))
+
+func emitJSON(_ payload: [String: Any]) {
+    if let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+       let text = String(data: data, encoding: .utf8) {
+        print(text)
+    }
+}
+
+func cfString(_ value: String) -> CFString {
+    return value as CFString
+}
+
+func runningLTspicePids() -> Set<pid_t> {
+    var pids: [pid_t] = []
+    for app in NSWorkspace.shared.runningApplications {
+        if app.isTerminated {
+            continue
+        }
+        let name = app.localizedName ?? ""
+        let bundleId = app.bundleIdentifier ?? ""
+        if name == "LTspice" || bundleId.lowercased().contains("ltspice") {
+            pids.append(app.processIdentifier)
+        }
+    }
+    return Set(pids)
+}
+
+func asAXElement(_ value: Any?) -> AXUIElement? {
+    guard let value else {
+        return nil
+    }
+    let ref = value as CFTypeRef
+    if CFGetTypeID(ref) == AXUIElementGetTypeID() {
+        return unsafeBitCast(ref, to: AXUIElement.self)
+    }
+    return nil
+}
+
+func asInt64(_ value: Any?) -> Int64? {
+    if let number = value as? NSNumber {
+        return number.int64Value
+    }
+    if let intValue = value as? Int {
+        return Int64(intValue)
+    }
+    if let text = value as? String {
+        return Int64(text)
+    }
+    return nil
+}
+
+func asPid(_ value: Any?) -> pid_t? {
+    guard let intValue = asInt64(value) else {
+        return nil
+    }
+    return pid_t(intValue)
+}
+
+func windowTitle(_ window: AXUIElement) -> String {
+    var value: CFTypeRef?
+    if AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &value) == .success,
+       let title = value as? String {
+        return title
+    }
+    return ""
+}
+
+func windowNumber(_ window: AXUIElement) -> Int64? {
+    var value: CFTypeRef?
+    if AXUIElementCopyAttributeValue(window, cfString("AXWindowNumber"), &value) != .success {
+        return nil
+    }
+    if let number = value as? NSNumber {
+        return number.int64Value
+    }
+    return nil
+}
+
+func windowPoint(_ window: AXUIElement, key: String) -> CGPoint? {
+    var value: CFTypeRef?
+    if AXUIElementCopyAttributeValue(window, key as CFString, &value) != .success {
+        return nil
+    }
+    guard let axValue = value else {
+        return nil
+    }
+    if CFGetTypeID(axValue) != AXValueGetTypeID() {
+        return nil
+    }
+    let typed = unsafeBitCast(axValue, to: AXValue.self)
+    var point = CGPoint.zero
+    if AXValueGetType(typed) != .cgPoint {
+        return nil
+    }
+    if AXValueGetValue(typed, .cgPoint, &point) {
+        return point
+    }
+    return nil
+}
+
+func windowSize(_ window: AXUIElement) -> CGSize? {
+    var value: CFTypeRef?
+    if AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &value) != .success {
+        return nil
+    }
+    guard let axValue = value else {
+        return nil
+    }
+    if CFGetTypeID(axValue) != AXValueGetTypeID() {
+        return nil
+    }
+    let typed = unsafeBitCast(axValue, to: AXValue.self)
+    var size = CGSize.zero
+    if AXValueGetType(typed) != .cgSize {
+        return nil
+    }
+    if AXValueGetValue(typed, .cgSize, &size) {
+        return size
+    }
+    return nil
+}
+
+func windowKey(_ window: AXUIElement, pid: pid_t) -> String {
+    let title = windowTitle(window)
+    let position = windowPoint(window, key: kAXPositionAttribute as String) ?? .zero
+    let size = windowSize(window) ?? .zero
+    return "\(pid)|\(title)|\(Int(position.x))|\(Int(position.y))|\(Int(size.width))|\(Int(size.height))"
+}
+
+func appendWindow(_ elementRef: CFTypeRef?, pid: pid_t, into windows: inout [AXUIElement], seen: inout Set<String>) {
+    guard let window = asAXElement(elementRef) else {
+        return
+    }
+    let key = windowKey(window, pid: pid)
+    if seen.contains(key) {
+        return
+    }
+    seen.insert(key)
+    windows.append(window)
+}
+
+func candidateWindows(_ appElement: AXUIElement, pid: pid_t) -> [AXUIElement] {
+    var windows: [AXUIElement] = []
+    var seen: Set<String> = []
+    var rawWindows: CFTypeRef?
+    if AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &rawWindows) == .success,
+       let rawWindows {
+        if let array = rawWindows as? [Any] {
+            for item in array {
+                appendWindow(item as CFTypeRef, pid: pid, into: &windows, seen: &seen)
+            }
+        } else if let array = rawWindows as? NSArray {
+            for item in array {
+                appendWindow(item as CFTypeRef, pid: pid, into: &windows, seen: &seen)
+            }
+        }
+    }
+
+    var focusedWindow: CFTypeRef?
+    if AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &focusedWindow) == .success {
+        appendWindow(focusedWindow, pid: pid, into: &windows, seen: &seen)
+    }
+
+    var mainWindow: CFTypeRef?
+    if AXUIElementCopyAttributeValue(appElement, kAXMainWindowAttribute as CFString, &mainWindow) == .success {
+        appendWindow(mainWindow, pid: pid, into: &windows, seen: &seen)
+    }
+    return windows
+}
+
+func matchesSelector(_ window: AXUIElement) -> Bool {
+    let title = windowTitle(window)
+    let number = windowNumber(window)
+    var isMatch = false
+    if let targetWindowId, number == targetWindowId {
+        isMatch = true
+    }
+    if !isMatch && !titleExact.isEmpty && title == titleExact {
+        isMatch = true
+    }
+    if !isMatch && !titleContains.isEmpty && title.localizedCaseInsensitiveContains(titleContains) {
+        isMatch = true
+    }
+    return isMatch
+}
+
+func cgMatchingWindows() -> [[String: Any]] {
+    guard let info = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else {
+        return []
+    }
+    var matches: [[String: Any]] = []
+    for entry in info {
+        let owner = entry[kCGWindowOwnerName as String] as? String ?? ""
+        if owner != "LTspice" {
+            continue
+        }
+        let title = entry[kCGWindowName as String] as? String ?? ""
+        let windowNumber = asInt64(entry[kCGWindowNumber as String])
+        var isMatch = false
+        if let targetWindowId, let windowNumber, windowNumber == targetWindowId {
+            isMatch = true
+        }
+        if !isMatch && !titleExact.isEmpty && title == titleExact {
+            isMatch = true
+        }
+        if !isMatch && !titleContains.isEmpty && title.localizedCaseInsensitiveContains(titleContains) {
+            isMatch = true
+        }
+        if isMatch {
+            matches.append(entry)
+        }
+    }
+    return matches
+}
+
+func cgMatchingPidSet() -> Set<pid_t> {
+    var pids: Set<pid_t> = []
+    for entry in cgMatchingWindows() {
+        if let pid = asPid(entry[kCGWindowOwnerPID as String]) {
+            pids.insert(pid)
+        }
+    }
+    return pids
+}
+
+func appendTextCandidate(_ value: Any?, into chunks: inout [String]) {
+    guard let value else {
+        return
+    }
+    if let text = value as? String {
+        let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleaned.isEmpty {
+            chunks.append(cleaned)
+        }
+        return
+    }
+    if let attributed = value as? NSAttributedString {
+        appendTextCandidate(attributed.string, into: &chunks)
+        return
+    }
+    if let array = value as? [Any] {
+        for item in array {
+            appendTextCandidate(item, into: &chunks)
+        }
+        return
+    }
+    if let array = value as? NSArray {
+        for item in array {
+            appendTextCandidate(item, into: &chunks)
+        }
+    }
+}
+
+func appendChildElements(_ value: Any?, into children: inout [AXUIElement]) {
+    if let element = asAXElement(value) {
+        children.append(element)
+        return
+    }
+    if let array = value as? [Any] {
+        for item in array {
+            appendChildElements(item, into: &children)
+        }
+        return
+    }
+    if let array = value as? NSArray {
+        for item in array {
+            appendChildElements(item, into: &children)
+        }
+    }
+}
+
+func elementKey(_ element: AXUIElement) -> String {
+    let opaque = Unmanaged.passUnretained(element).toOpaque()
+    return String(UInt(bitPattern: opaque))
+}
+
+func collectWindowText(_ root: AXUIElement) -> [String] {
+    let childAttributes = Set<String>([
+        kAXChildrenAttribute as String,
+        "AXVisibleChildren",
+        "AXContents",
+        "AXRows",
+        "AXColumns",
+        "AXCells"
+    ])
+    let preferredTextAttributes = Set<String>([
+        kAXValueAttribute as String,
+        kAXTitleAttribute as String,
+        kAXDescriptionAttribute as String,
+        kAXHelpAttribute as String,
+        "AXText"
+    ])
+    var queue: [(AXUIElement, Int)] = [(root, 0)]
+    var visited: Set<String> = []
+    var chunks: [String] = []
+    let maxDepth = 24
+    let maxNodes = 5000
+
+    while !queue.isEmpty && visited.count < maxNodes {
+        let (element, depth) = queue.removeFirst()
+        let key = elementKey(element)
+        if visited.contains(key) {
+            continue
+        }
+        visited.insert(key)
+
+        var namesRef: CFArray?
+        if AXUIElementCopyAttributeNames(element, &namesRef) != .success {
+            continue
+        }
+        guard let namesAny = namesRef else {
+            continue
+        }
+
+        let names = (namesAny as? [String]) ?? ((namesAny as? NSArray)?.compactMap { $0 as? String } ?? [])
+        if names.isEmpty {
+            continue
+        }
+        for attr in names {
+            var value: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, attr as CFString, &value) != .success {
+                continue
+            }
+            guard let raw = value else {
+                continue
+            }
+            if preferredTextAttributes.contains(attr) || raw is String || raw is NSAttributedString {
+                appendTextCandidate(raw, into: &chunks)
+            }
+            if depth < maxDepth && childAttributes.contains(attr) {
+                var children: [AXUIElement] = []
+                appendChildElements(raw, into: &children)
+                for child in children {
+                    queue.append((child, depth + 1))
+                }
+            }
+        }
+    }
+    return chunks
+}
+
+func selectBestText(_ chunks: [String]) -> String {
+    var ordered: [String] = []
+    var seen: Set<String> = []
+    for chunk in chunks {
+        let cleaned = chunk.trimmingCharacters(in: .whitespacesAndNewlines)
+        if cleaned.isEmpty {
+            continue
+        }
+        if seen.insert(cleaned).inserted {
+            ordered.append(cleaned)
+        }
+    }
+    if ordered.isEmpty {
+        return ""
+    }
+    let measurementChunks = ordered.filter {
+        let lowered = $0.lowercased()
+        return lowered.contains("measurement:") || lowered.contains(".meas")
+    }
+    let selected = measurementChunks.isEmpty ? ordered : measurementChunks
+    let combined = selected.joined(separator: "\n")
+    if combined.count <= maxChars {
+        return combined
+    }
+    return String(combined.prefix(maxChars))
+}
+
+if titleContains.isEmpty && titleExact.isEmpty && targetWindowId == nil {
+    emitJSON([
+        "status": "INVALID_SELECTORS",
+        "ok": false,
+        "text": "",
+        "matched_windows": 0
+    ])
+    exit(2)
+}
+
+if !AXIsProcessTrusted() {
+    emitJSON([
+        "status": "AX_NOT_TRUSTED",
+        "ok": false,
+        "text": "",
+        "matched_windows": 0
+    ])
+    exit(1)
+}
+
+let pids = runningLTspicePids()
+if pids.isEmpty {
+    emitJSON([
+        "status": "PROCESS_MISSING",
+        "ok": false,
+        "text": "",
+        "matched_windows": 0
+    ])
+    exit(0)
+}
+
+let matchingPidSet = cgMatchingPidSet()
+let targetPids = matchingPidSet.isEmpty ? pids : matchingPidSet
+var matches: [AXUIElement] = []
+for pid in targetPids {
+    let appElement = AXUIElementCreateApplication(pid)
+    for window in candidateWindows(appElement, pid: pid) {
+        if matchesSelector(window) {
+            matches.append(window)
+        }
+    }
+}
+if matches.isEmpty && targetPids != pids {
+    for pid in pids {
+        let appElement = AXUIElementCreateApplication(pid)
+        for window in candidateWindows(appElement, pid: pid) {
+            if matchesSelector(window) {
+                matches.append(window)
+            }
+        }
+    }
+}
+
+guard let selected = matches.first else {
+    let titles = cgMatchingWindows().compactMap { $0[kCGWindowName as String] as? String }
+    emitJSON([
+        "status": "WINDOW_NOT_FOUND",
+        "ok": false,
+        "text": "",
+        "matched_windows": matches.count,
+        "candidate_titles": Array(titles.prefix(12))
+    ])
+    exit(1)
+}
+
+let chunks = collectWindowText(selected)
+let text = selectBestText(chunks)
+let title = windowTitle(selected)
+let number = windowNumber(selected)
+emitJSON([
+    "status": text.isEmpty ? "OK_NO_TEXT" : "OK",
+    "ok": !text.isEmpty,
+    "text": text,
+    "text_length": text.count,
+    "window_title": title,
+    "window_id": number as Any,
+    "matched_windows": matches.count,
+    "chunk_count": chunks.count
+])
+"""
+
 
 def _resolve_sck_helper_path() -> tuple[Path, bool]:
     explicit = os.getenv("LTSPICE_MCP_SCK_HELPER_PATH")
@@ -760,6 +1229,19 @@ def _resolve_ax_close_helper_path() -> tuple[Path, bool]:
         else (Path.home() / "Library" / "Application Support" / "ltspice-mcp" / "bin")
     )
     return (helper_dir / _AX_CLOSE_HELPER_FILENAME).resolve(), False
+
+
+def _resolve_ax_text_helper_path() -> tuple[Path, bool]:
+    explicit = os.getenv("LTSPICE_MCP_AX_TEXT_HELPER_PATH")
+    if explicit:
+        return Path(explicit).expanduser().resolve(), True
+    helper_dir_raw = os.getenv("LTSPICE_MCP_AX_TEXT_HELPER_DIR")
+    helper_dir = (
+        Path(helper_dir_raw).expanduser()
+        if helper_dir_raw
+        else (Path.home() / "Library" / "Application Support" / "ltspice-mcp" / "bin")
+    )
+    return (helper_dir / _AX_TEXT_HELPER_FILENAME).resolve(), False
 
 
 def _ensure_screencapturekit_helper() -> tuple[Path, dict[str, Any]]:
@@ -949,6 +1431,108 @@ def _ensure_ax_close_helper() -> tuple[Path, dict[str, Any]]:
             if compile_proc.returncode != 0:
                 raise RuntimeError(
                     "swiftc failed to build LTspice AX close helper "
+                    f"(rc={compile_proc.returncode}): {compile_stderr or compile_stdout}"
+                )
+            helper_path.chmod(0o755)
+            helper_hash_path.write_text(f"{source_hash}\n", encoding="utf-8")
+            compiled = True
+
+    return helper_path, {
+        "helper_path": str(helper_path),
+        "helper_source": "compiled_now" if compiled else "compiled_cache_after_lock",
+        "compiled": compiled,
+        "swiftc_path": swiftc,
+        "source_hash": source_hash,
+        "compile_command": compile_command or None,
+        "compile_stdout": compile_stdout,
+        "compile_stderr": compile_stderr,
+    }
+
+
+def _ensure_ax_text_helper() -> tuple[Path, dict[str, Any]]:
+    helper_path, explicit = _resolve_ax_text_helper_path()
+    if explicit:
+        if not _is_executable(helper_path):
+            raise RuntimeError(
+                "LTSPICE_MCP_AX_TEXT_HELPER_PATH is set but not executable: "
+                f"{helper_path}"
+            )
+        return helper_path, {
+            "helper_path": str(helper_path),
+            "helper_source": "env_path",
+            "compiled": False,
+        }
+
+    swiftc = shutil.which("swiftc")
+    if swiftc is None:
+        raise RuntimeError(
+            "swiftc not found; install Xcode command line tools "
+            "or set LTSPICE_MCP_AX_TEXT_HELPER_PATH to a prebuilt helper executable."
+        )
+
+    helper_dir = helper_path.parent
+    helper_dir.mkdir(parents=True, exist_ok=True)
+    helper_source_path = helper_dir / _AX_TEXT_HELPER_SWIFT_FILENAME
+    helper_hash_path = helper_dir / _AX_TEXT_HELPER_HASH_FILENAME
+    helper_lock_path = helper_dir / ".ltspice-ax-text-helper.lock"
+
+    source_hash = hashlib.sha256(_AX_TEXT_HELPER_SOURCE.encode("utf-8")).hexdigest()
+    existing_hash = ""
+    if helper_hash_path.exists():
+        try:
+            existing_hash = helper_hash_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            existing_hash = ""
+
+    if _is_executable(helper_path) and existing_hash == source_hash:
+        return helper_path, {
+            "helper_path": str(helper_path),
+            "helper_source": "compiled_cache",
+            "compiled": False,
+            "swiftc_path": swiftc,
+            "source_hash": source_hash,
+        }
+
+    compile_stdout = ""
+    compile_stderr = ""
+    compile_command: list[str] = []
+    compiled = False
+
+    with helper_lock_path.open("a+", encoding="utf-8") as lock_handle:
+        try:
+            import fcntl
+
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            pass
+
+        existing_hash = ""
+        if helper_hash_path.exists():
+            try:
+                existing_hash = helper_hash_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                existing_hash = ""
+
+        if not (_is_executable(helper_path) and existing_hash == source_hash):
+            helper_source_path.write_text(_AX_TEXT_HELPER_SOURCE, encoding="utf-8")
+            compile_command = [
+                swiftc,
+                "-O",
+                "-o",
+                str(helper_path),
+                str(helper_source_path),
+            ]
+            compile_proc = subprocess.run(
+                compile_command,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            compile_stdout = compile_proc.stdout.strip()
+            compile_stderr = compile_proc.stderr.strip()
+            if compile_proc.returncode != 0:
+                raise RuntimeError(
+                    "swiftc failed to build LTspice AX text helper "
                     f"(rc={compile_proc.returncode}): {compile_stderr or compile_stdout}"
                 )
             helper_path.chmod(0o755)
@@ -1648,6 +2232,92 @@ def close_ltspice_window(
         exact_title=title_exact or None,
         window_id=target_window_id,
     )
+
+
+def read_ltspice_window_text(
+    *,
+    title_hint: str = "",
+    exact_title: str | None = None,
+    window_id: int | None = None,
+    max_chars: int = 200000,
+) -> dict[str, Any]:
+    title_contains = title_hint.strip()
+    title_exact = (exact_title or "").strip()
+    target_window_id = window_id if isinstance(window_id, int) and window_id > 0 else None
+    if not title_contains and not title_exact and target_window_id is None:
+        return {
+            "ok": False,
+            "status": "INVALID_SELECTORS",
+            "error": "Provide at least one selector (title_hint, exact_title, or positive window_id)",
+            "text": "",
+            "matched_windows": 0,
+        }
+    if platform.system() != "Darwin":
+        raise RuntimeError("LTspice UI integration is currently implemented for macOS only.")
+
+    safe_max_chars = max(512, min(2_000_000, int(max_chars)))
+    try:
+        helper_path, helper_details = _ensure_ax_text_helper()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "AX_HELPER_UNAVAILABLE",
+            "error": str(exc),
+            "text": "",
+            "matched_windows": 0,
+        }
+
+    command = [
+        str(helper_path),
+        title_contains,
+        title_exact,
+        str(target_window_id) if target_window_id is not None else "",
+        str(safe_max_chars),
+    ]
+    proc = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    helper_payload: dict[str, Any] = {}
+    for raw in reversed(proc.stdout.splitlines()):
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            candidate = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            helper_payload = candidate
+            break
+
+    status = str(helper_payload.get("status") or ("OK" if proc.returncode == 0 else "AX_TEXT_HELPER_FAILED"))
+    text_value = str(helper_payload.get("text") or "")
+    if len(text_value) > safe_max_chars:
+        text_value = text_value[:safe_max_chars]
+
+    return {
+        "ok": bool(proc.returncode == 0 and status == "OK" and text_value),
+        "status": status,
+        "text": text_value,
+        "text_length": len(text_value),
+        "matched_windows": int(helper_payload.get("matched_windows") or 0),
+        "window_title": helper_payload.get("window_title"),
+        "window_id": helper_payload.get("window_id"),
+        "chunk_count": helper_payload.get("chunk_count"),
+        "candidate_titles": helper_payload.get("candidate_titles"),
+        "title_hint": title_contains,
+        "exact_title": title_exact or None,
+        "max_chars": safe_max_chars,
+        "return_code": proc.returncode,
+        "command": command,
+        "stdout": proc.stdout.strip(),
+        "stderr": proc.stderr.strip(),
+        "helper_details": helper_details,
+    }
 
 
 def _capture_ltspice_window_with_screencapturekit(

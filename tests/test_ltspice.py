@@ -7,7 +7,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from ltspice_mcp.ltspice import LTspiceRunner, _write_utf8_log_sidecar, analyze_log, get_ltspice_version
+from ltspice_mcp.ltspice import (
+    LTspiceRunner,
+    _write_utf8_log_sidecar,
+    analyze_log,
+    get_ltspice_version,
+    read_ltspice_window_text,
+)
 
 
 class TestLtspiceLogDiagnostics(unittest.TestCase):
@@ -129,6 +135,39 @@ class TestLtspiceLogDiagnostics(unittest.TestCase):
         )
         categories = {item.category for item in run.diagnostics}
         self.assertIn("artifact_stale_or_missing", categories)
+
+    def test_read_ltspice_window_text_parses_helper_payload(self) -> None:
+        with (
+            patch("ltspice_mcp.ltspice.platform.system", return_value="Darwin"),
+            patch(
+                "ltspice_mcp.ltspice._ensure_ax_text_helper",
+                return_value=(Path("/tmp/ltspice-ax-text-helper"), {"helper_source": "test"}),
+            ),
+            patch(
+                "ltspice_mcp.ltspice.subprocess.run",
+                return_value=SimpleNamespace(
+                    returncode=0,
+                    stdout='{"status":"OK","text":"Measurement: v1\\nv1: MAX(v(out))=1","matched_windows":1,"window_title":"demo.log"}\n',
+                    stderr="",
+                ),
+            ) as run_mock,
+        ):
+            payload = read_ltspice_window_text(title_hint="demo.log", max_chars=2000)
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["status"], "OK")
+        self.assertIn("Measurement: v1", payload["text"])
+        self.assertEqual(payload["matched_windows"], 1)
+        self.assertEqual(payload["window_title"], "demo.log")
+        self.assertEqual(
+            run_mock.call_args.args[0],
+            ["/tmp/ltspice-ax-text-helper", "demo.log", "", "", "2000"],
+        )
+
+    def test_read_ltspice_window_text_requires_selector(self) -> None:
+        payload = read_ltspice_window_text(title_hint="", exact_title=None, window_id=None)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["status"], "INVALID_SELECTORS")
 
 
 if __name__ == "__main__":

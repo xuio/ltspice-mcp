@@ -277,6 +277,100 @@ class TestVerificationAndQueueTools(unittest.TestCase):
         self.assertNotIn("tnom", payload["measurements"])
         self.assertNotIn("temp", payload["measurements"])
 
+    def test_parse_meas_results_run_id_ignores_timeout_header_values(self) -> None:
+        run = _make_run(self.temp_dir, run_id="failed_meas_headers")
+        run.return_code = -1
+        assert run.log_path is not None
+        run.log_path.write_text(
+            "\n".join(
+                [
+                    "Circuit = 250",
+                    "AsciiRawFile = 1",
+                    "No. Variables: 5",
+                    "No. Points: 1001",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        server._register_run(run)
+
+        payload = server.parseMeasResults(run_id=run.run_id)
+        self.assertEqual(payload["count"], 0)
+        self.assertEqual(payload["measurements"], {})
+
+    def test_run_process_simulation_with_cancel_uses_subprocess_module(self) -> None:
+        class _FakeProc:
+            def __init__(self) -> None:
+                self._poll_calls = 0
+                self.returncode = 0
+
+            def poll(self):  # noqa: ANN001
+                self._poll_calls += 1
+                return None if self._poll_calls == 1 else self.returncode
+
+            def communicate(self):  # noqa: ANN001
+                return ("", "")
+
+            def terminate(self) -> None:
+                return None
+
+            def wait(self, timeout=None):  # noqa: ANN001
+                return self.returncode
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+        netlist = self.temp_dir / "queue_subprocess.cir"
+        netlist.write_text("* queue subprocess\n.end\n", encoding="utf-8")
+        fake_proc = _FakeProc()
+        with (
+            patch.object(
+                server._runner,
+                "ensure_executable",
+                return_value=Path("/Applications/LTspice.app/Contents/MacOS/LTspice"),
+            ),
+            patch("ltspice_mcp.server.subprocess.Popen", return_value=fake_proc) as popen_mock,
+            patch("ltspice_mcp.server.time.sleep", return_value=None),
+        ):
+            run, canceled = server._run_process_simulation_with_cancel(
+                netlist_path=netlist,
+                ascii_raw=False,
+                timeout_seconds=5,
+                cancel_requested=lambda: False,
+            )
+        self.assertFalse(canceled)
+        self.assertEqual(run.return_code, 0)
+        self.assertEqual(run.command[0], "/Applications/LTspice.app/Contents/MacOS/LTspice")
+        self.assertEqual(run.command[1], "-b")
+        self.assertEqual(Path(run.command[2]).resolve(), netlist.resolve())
+        popen_mock.assert_called_once()
+
+    def test_run_simulation_with_ui_applies_timeout_margin(self) -> None:
+        netlist = self.temp_dir / "timeout_margin.cir"
+        netlist.write_text("* timeout margin\n.end\n", encoding="utf-8")
+        run = _make_run(self.temp_dir, run_id="timeout_margin_run")
+        original_margin = server._SYNC_TOOL_TIMEOUT_MARGIN_SECONDS
+        try:
+            server._SYNC_TOOL_TIMEOUT_MARGIN_SECONDS = 10
+            with (
+                patch.object(server._runner, "run_file", return_value=run) as run_file_mock,
+                patch("ltspice_mcp.server._register_run", side_effect=lambda value: value),
+            ):
+                _run, _events, _effective_ui = server._run_simulation_with_ui(
+                    netlist_path=netlist,
+                    ascii_raw=False,
+                    timeout_seconds=180,
+                    show_ui=False,
+                    open_raw_after_run=False,
+                )
+            self.assertEqual(run_file_mock.call_args.kwargs["timeout_seconds"], 170)
+            self.assertTrue(
+                any("Requested timeout was reduced" in warning for warning in run.warnings),
+            )
+        finally:
+            server._SYNC_TOOL_TIMEOUT_MARGIN_SECONDS = original_margin
+
     def test_run_meas_automation_injects_meas_netlist(self) -> None:
         netlist = self.temp_dir / "base.cir"
         netlist.write_text("* base\nR1 in out 1k\n.end\n", encoding="utf-8")
