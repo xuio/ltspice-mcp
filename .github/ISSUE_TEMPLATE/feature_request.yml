@@ -1,0 +1,46 @@
+name: Feature request
+description: Suggest an improvement for LTspice MCP
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Proposals with concrete use cases and success criteria are easiest to implement.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or workflow gap
+      description: What are you trying to do that is hard today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the MCP tool behavior or API shape you want.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+
+  - type: textarea
+    id: examples
+    attributes:
+      label: Example tool calls or outputs
+      description: Optional, but very helpful.
+
+  - type: checkboxes
+    id: impact
+    attributes:
+      label: Expected impact
+      options:
+        - label: Improves reliability/correctness
+        - label: Improves performance
+        - label: Improves onboarding/documentation
+        - label: Adds new simulation/design capability

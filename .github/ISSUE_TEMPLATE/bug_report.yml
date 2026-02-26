@@ -1,0 +1,88 @@
+name: Bug report
+description: Report a reproducible defect in LTspice MCP
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Please provide enough detail so we can reproduce quickly.
+
+  - type: input
+    id: mcp_version
+    attributes:
+      label: LTspice MCP version
+      placeholder: "e.g. 1.32.0"
+    validations:
+      required: true
+
+  - type: input
+    id: ltspice_version
+    attributes:
+      label: LTspice version
+      placeholder: "e.g. 17.2.4"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: transport
+    attributes:
+      label: MCP transport
+      options:
+        - streamable-http
+        - sse
+        - stdio
+        - unknown
+    validations:
+      required: true
+
+  - type: textarea
+    id: tool_call
+    attributes:
+      label: Tool call and parameters
+      description: Paste the exact MCP tool name and arguments.
+      placeholder: |
+        tool: simulateNetlistFile
+        args:
+          netlist_path: /path/to/file.cir
+          ascii_raw: true
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start daemon...
+        2. Call tool...
+        3. Observe error...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs and diagnostics
+      description: Include snippets from `tailDaemonLog`, `getRecentErrors`, or run details.
+      render: shell
+
+  - type: textarea
+    id: artifacts
+    attributes:
+      label: Artifact paths (if applicable)
+      description: raw/log/netlist paths, run_id, screenshots, etc.
