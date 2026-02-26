@@ -1772,8 +1772,11 @@ _MEAS_MEASUREMENT_RE = re.compile(
     re.IGNORECASE,
 )
 _MEAS_NUMERIC_TOKEN_RE = re.compile(_MEAS_NUMBER_PATTERN)
-_MEAS_AT_VALUE_RE = re.compile(rf"\bAT\s+(?P<value>{_MEAS_NUMBER_PATTERN})\b")
-_MEAS_HEADER_TOKEN_RE = re.compile(r"^\s*[A-Za-z_][\w()*/+.-]*\s*$")
+_MEAS_AT_VALUE_RE = re.compile(
+    rf"\bAT\s*=?\s*(?P<value>{_MEAS_NUMBER_PATTERN})\b",
+    re.IGNORECASE,
+)
+_MEAS_HEADER_TOKEN_RE = re.compile(r"^\s*[A-Za-z_][\w()*/+.,:<>=-]*\s*$")
 _MEAS_AUX_HEADER_TOKENS = {
     "step",
     "from",
@@ -1784,6 +1787,10 @@ _MEAS_AUX_HEADER_TOKENS = {
     "freq",
     "frequency",
     "param",
+}
+_MEAS_IGNORED_KEYS = {
+    "tnom",
+    "temp",
 }
 _SPICE_SUFFIX_SCALE: dict[str, float] = {
     "t": 1e12,
@@ -1821,22 +1828,28 @@ def _parse_spice_number_token(token: str) -> float | None:
 
 
 def _extract_meas_numeric_from_rhs(rhs: str) -> tuple[float, str] | None:
-    # For WHEN-style results LTspice emits:
-    #   expr=const AT <time_or_freq>
-    # Use the AT value (the measured crossing point), not the condition constant.
-    at_match = _MEAS_AT_VALUE_RE.search(rhs)
-    if at_match:
-        at_token = at_match.group("value")
-        parsed_at = _parse_spice_number_token(at_token)
-        if parsed_at is not None:
-            return parsed_at, at_token
-
     # Try the value segment after '=' first for lines like:
     #   vpp: PP(v(out))=0.731107 FROM 0 TO 0.008
     #   mag_1k: mag(v(out))=(-1.44507dB,0°) at 1000
     candidate_text = rhs
+    value_segment = rhs
     if "=" in rhs:
-        candidate_text = rhs.split("=", 1)[1]
+        value_segment = rhs.split("=", 1)[1]
+        candidate_text = value_segment
+
+    # For WHEN-style results LTspice emits:
+    #   expr=const at <time_or_freq>
+    # Use the AT value (the measured crossing point), not the condition constant.
+    #
+    # For FIND-style results:
+    #   expr=(value,phase) at <time_or_freq>
+    # preserve the measured value itself; do not replace it with the AT axis coordinate.
+    at_match = _MEAS_AT_VALUE_RE.search(rhs)
+    if at_match and not value_segment.lstrip().startswith("("):
+        at_token = at_match.group("value")
+        parsed_at = _parse_spice_number_token(at_token)
+        if parsed_at is not None:
+            return parsed_at, at_token
     for token in _MEAS_NUMERIC_TOKEN_RE.findall(candidate_text):
         parsed = _parse_spice_number_token(token)
         if parsed is not None:
@@ -1861,6 +1874,14 @@ def _select_meas_table_columns(
     if candidate_indexes:
         return step_column, candidate_indexes[-1]
     return step_column, max(0, len(headers) - 1)
+
+
+def _looks_like_meas_table_header(tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    if len(tokens) >= 2 and tokens[0].strip().lower() == "step":
+        return True
+    return all(_MEAS_HEADER_TOKEN_RE.match(token) for token in tokens)
 
 
 def _parse_meas_results_from_text(text: str) -> dict[str, Any]:
@@ -1891,6 +1912,8 @@ def _parse_meas_results_from_text(text: str) -> dict[str, Any]:
         match_value = _MEAS_VALUE_RE.match(line)
         if match_value:
             name = match_value.group("name").strip()
+            if name.strip().lower() in _MEAS_IGNORED_KEYS:
+                continue
             raw_value = match_value.group("value").strip()
             parsed_value = _parse_spice_number_token(raw_value)
             if parsed_value is None:
@@ -1925,11 +1948,7 @@ def _parse_meas_results_from_text(text: str) -> dict[str, Any]:
                 continue
 
             tokens = [token for token in re.split(r"\s+", stripped) if token]
-            if (
-                not pending_header_seen
-                and tokens
-                and all(_MEAS_HEADER_TOKEN_RE.match(token) for token in tokens)
-            ):
+            if not pending_header_seen and _looks_like_meas_table_header(tokens):
                 pending_header_seen = True
                 pending_step_column, pending_value_column = _select_meas_table_columns(
                     pending_name=pending_name,
@@ -7106,6 +7125,429 @@ def getSettlingTime(
         "raw_path": str(dataset.path),
         "vector": vector,
         **result,
+        **_step_payload(dataset, selected_step),
+    }
+
+
+def _format_meas_number(value: float) -> str:
+    if not math.isfinite(value):
+        raise ValueError(f"Cannot format non-finite measurement value: {value!r}")
+    return f"{value:.16g}"
+
+
+def _resolve_run_for_dataset_context(
+    *,
+    dataset: RawDataset,
+    run_id: str | None,
+) -> SimulationRun:
+    if run_id:
+        return _resolve_run(run_id)
+    raw_target = dataset.path.expanduser().resolve()
+    for candidate_id in reversed(_run_order):
+        run = _runs.get(candidate_id)
+        if run is None:
+            continue
+        for raw_file in run.raw_files:
+            try:
+                if raw_file.expanduser().resolve() == raw_target:
+                    return run
+            except Exception:
+                continue
+    raise ValueError(
+        "Could not resolve the simulation run for the selected RAW file. "
+        "Pass run_id from a simulate* tool result to enable LTspice-authoritative measurement validation."
+    )
+
+
+def _measurement_value_for_step(
+    *,
+    parsed: dict[str, Any],
+    measurement_name: str,
+    step_index: int,
+) -> float | None:
+    steps_by_name = parsed.get("measurement_steps", {})
+    step_rows: list[dict[str, Any]] = []
+    if isinstance(steps_by_name, dict):
+        candidate_rows = steps_by_name.get(measurement_name, [])
+        if isinstance(candidate_rows, list):
+            step_rows = [row for row in candidate_rows if isinstance(row, dict)]
+    if step_rows:
+        expected_step = step_index + 1
+        seen_explicit_step = False
+        for row in step_rows:
+            step_value = row.get("step")
+            if step_value is None:
+                continue
+            seen_explicit_step = True
+            try:
+                if int(step_value) == expected_step:
+                    value = row.get("value")
+                    return float(value) if value is not None else None
+            except Exception:
+                continue
+        if seen_explicit_step:
+            return None
+        if 0 <= step_index < len(step_rows):
+            value = step_rows[step_index].get("value")
+            return float(value) if value is not None else None
+
+    measurements = parsed.get("measurements", {})
+    if isinstance(measurements, dict) and measurement_name in measurements:
+        value = measurements.get(measurement_name)
+        return float(value) if value is not None else None
+    return None
+
+
+def _measurement_text_for_step(
+    *,
+    parsed: dict[str, Any],
+    measurement_name: str,
+    step_index: int,
+) -> str | None:
+    steps_by_name = parsed.get("measurement_steps", {})
+    step_rows: list[dict[str, Any]] = []
+    if isinstance(steps_by_name, dict):
+        candidate_rows = steps_by_name.get(measurement_name, [])
+        if isinstance(candidate_rows, list):
+            step_rows = [row for row in candidate_rows if isinstance(row, dict)]
+    if step_rows:
+        expected_step = step_index + 1
+        seen_explicit_step = False
+        for row in step_rows:
+            step_value = row.get("step")
+            if step_value is None:
+                continue
+            seen_explicit_step = True
+            try:
+                if int(step_value) == expected_step:
+                    value_text = row.get("value_text")
+                    return str(value_text) if value_text is not None else None
+            except Exception:
+                continue
+        if seen_explicit_step:
+            return None
+        if 0 <= step_index < len(step_rows):
+            value_text = step_rows[step_index].get("value_text")
+            return str(value_text) if value_text is not None else None
+
+    measurements_text = parsed.get("measurements_text", {})
+    if isinstance(measurements_text, dict) and measurement_name in measurements_text:
+        value_text = measurements_text.get(measurement_name)
+        return str(value_text) if value_text is not None else None
+    return None
+
+
+def _compare_analysis_to_ltspice_value(
+    *,
+    analysis_key: str,
+    analysis_value: float | None,
+    measurement_name: str,
+    ltspice_value: float | None,
+    abs_tolerance: float,
+    rel_tolerance_pct: float,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "analysis_key": analysis_key,
+        "measurement_name": measurement_name,
+        "analysis_value": analysis_value,
+        "ltspice_value": ltspice_value,
+        "abs_tolerance": abs_tolerance,
+        "rel_tolerance_pct": rel_tolerance_pct,
+        "passed": False,
+        "reason": None,
+        "abs_error": None,
+        "rel_error_pct": None,
+    }
+    if analysis_value is None and ltspice_value is None:
+        payload["passed"] = True
+        payload["reason"] = "not_available_in_both"
+        return payload
+    if analysis_value is None:
+        payload["reason"] = "analysis_missing"
+        return payload
+    if ltspice_value is None:
+        payload["reason"] = "ltspice_missing"
+        return payload
+    abs_error = abs(float(analysis_value) - float(ltspice_value))
+    denom = max(abs(float(ltspice_value)), 1e-30)
+    rel_error_pct = (abs_error / denom) * 100.0
+    passed = bool(abs_error <= abs_tolerance or rel_error_pct <= rel_tolerance_pct)
+    payload.update(
+        {
+            "passed": passed,
+            "reason": "within_tolerance" if passed else "mismatch",
+            "abs_error": abs_error,
+            "rel_error_pct": rel_error_pct,
+        }
+    )
+    return payload
+
+
+def _build_ac_metric_measurements(
+    *,
+    vector: str,
+    frequency_hz: list[float],
+    response: list[complex],
+    reference: str,
+    drop_db: float,
+) -> dict[str, Any]:
+    bandwidth = compute_bandwidth(
+        frequency_hz=frequency_hz,
+        response=response,
+        reference=reference,
+        drop_db=drop_db,
+    )
+    gain_phase = compute_gain_phase_margin(
+        frequency_hz=frequency_hz,
+        response=response,
+    )
+    magnitude = [abs(value) for value in response]
+    if not magnitude:
+        raise ValueError("Vector data is empty.")
+    ref_mode = reference.strip().lower()
+    if ref_mode == "peak":
+        ref_mag = max(magnitude)
+    elif ref_mode == "first":
+        ref_mag = magnitude[0]
+    else:
+        raise ValueError("reference must be one of: first, peak")
+    ref_mag = max(float(ref_mag), 1e-30)
+    threshold_db = 20.0 * math.log10(ref_mag) - float(drop_db)
+    vector_expr = vector.strip()
+    threshold_token = _format_meas_number(threshold_db)
+    statements = [
+        f".meas ac __mcp_bw_low WHEN db({vector_expr})={threshold_token} FALL=1",
+        f".meas ac __mcp_bw_high WHEN db({vector_expr})={threshold_token} RISE=1",
+        f".meas ac __mcp_gain_cross WHEN db({vector_expr})=0 CROSS=1",
+        f".meas ac __mcp_phase_at_gain FIND ph({vector_expr}) AT=__mcp_gain_cross",
+        ".meas ac __mcp_phase_margin PARAM 180+__mcp_phase_at_gain",
+        f".meas ac __mcp_phase_cross WHEN ph({vector_expr})=-180 CROSS=1",
+        f".meas ac __mcp_gain_at_phase FIND db({vector_expr}) AT=__mcp_phase_cross",
+        ".meas ac __mcp_gain_margin PARAM -__mcp_gain_at_phase",
+    ]
+    analysis = {
+        **bandwidth,
+        **gain_phase,
+    }
+    mapping = {
+        "lowpass_bandwidth_hz": "__mcp_bw_low",
+        "highpass_bandwidth_hz": "__mcp_bw_high",
+        "gain_crossover_hz": "__mcp_gain_cross",
+        "phase_crossover_hz": "__mcp_phase_cross",
+        "phase_margin_deg": "__mcp_phase_margin",
+        "gain_margin_db": "__mcp_gain_margin",
+    }
+    return {
+        "analysis_type": "ac",
+        "analysis": analysis,
+        "measurement_statements": statements,
+        "mapping": mapping,
+        "measurement_context": {
+            "reference_mode": ref_mode,
+            "reference_magnitude": ref_mag,
+            "threshold_db": threshold_db,
+            "drop_db": float(drop_db),
+        },
+    }
+
+
+def _build_tran_metric_measurements(
+    *,
+    vector: str,
+    time_s: list[float],
+    response: list[complex],
+    low_threshold_pct: float,
+    high_threshold_pct: float,
+    tolerance_percent: float,
+    target_value: float | None,
+) -> dict[str, Any]:
+    rise_fall = compute_rise_fall_time(
+        time_s=time_s,
+        signal=response,
+        low_threshold_pct=low_threshold_pct,
+        high_threshold_pct=high_threshold_pct,
+    )
+    settling = compute_settling_time(
+        time_s=time_s,
+        signal=response,
+        tolerance_percent=tolerance_percent,
+        target_value=target_value,
+    )
+    low_value = float(rise_fall["low_threshold_value"])
+    high_value = float(rise_fall["high_threshold_value"])
+    settle_target = float(settling["target_value"])
+    settle_band = float(settling["tolerance_band"])
+    vector_expr = vector.strip()
+    low_token = _format_meas_number(low_value)
+    high_token = _format_meas_number(high_value)
+    target_token = _format_meas_number(settle_target)
+    band_token = _format_meas_number(settle_band)
+    settling_expr = f"abs({vector_expr}-({target_token}))-{band_token}"
+    statements = [
+        f".meas tran __mcp_rise_start WHEN {vector_expr}={low_token} RISE=1",
+        f".meas tran __mcp_rise_end WHEN {vector_expr}={high_token} RISE=1",
+        ".meas tran __mcp_rise_time PARAM __mcp_rise_end-__mcp_rise_start",
+        f".meas tran __mcp_fall_start WHEN {vector_expr}={high_token} FALL=1",
+        f".meas tran __mcp_fall_end WHEN {vector_expr}={low_token} FALL=1",
+        ".meas tran __mcp_fall_time PARAM __mcp_fall_end-__mcp_fall_start",
+        f".meas tran __mcp_settle_first WHEN {settling_expr}=0 FALL=1",
+        f".meas tran __mcp_settle_time WHEN {settling_expr}=0 FALL=LAST",
+    ]
+    analysis = {
+        **rise_fall,
+        **settling,
+    }
+    mapping = {
+        "rise_start_s": "__mcp_rise_start",
+        "rise_end_s": "__mcp_rise_end",
+        "rise_time_s": "__mcp_rise_time",
+        "fall_start_s": "__mcp_fall_start",
+        "fall_end_s": "__mcp_fall_end",
+        "fall_time_s": "__mcp_fall_time",
+        "first_entry_time_s": "__mcp_settle_first",
+        "settling_time_s": "__mcp_settle_time",
+    }
+    return {
+        "analysis_type": "tran",
+        "analysis": analysis,
+        "measurement_statements": statements,
+        "mapping": mapping,
+        "measurement_context": {
+            "low_threshold_pct": float(low_threshold_pct),
+            "high_threshold_pct": float(high_threshold_pct),
+            "low_threshold_value": low_value,
+            "high_threshold_value": high_value,
+            "tolerance_percent": float(tolerance_percent),
+            "target_value": settle_target,
+            "tolerance_band": settle_band,
+        },
+    }
+
+
+@mcp.tool()
+def validateLtspiceMeasurements(
+    vector: str,
+    plot: str | None = None,
+    run_id: str | None = None,
+    raw_path: str | None = None,
+    step_index: int | None = None,
+    reference: str = "first",
+    drop_db: float = 3.0,
+    low_threshold_pct: float = 10.0,
+    high_threshold_pct: float = 90.0,
+    tolerance_percent: float = 2.0,
+    target_value: float | None = None,
+    abs_tolerance: float = 1e-5,
+    rel_tolerance_pct: float = 0.2,
+    show_ui: bool | None = None,
+    open_raw_after_run: bool = False,
+) -> dict[str, Any]:
+    """
+    Validate parsed metric endpoints against LTspice-native `.meas` values.
+
+    This reruns the source netlist with generated measurement directives and
+    compares LTspice's own reported values to the server's computed metrics.
+    """
+    if abs_tolerance < 0:
+        raise ValueError("abs_tolerance must be >= 0")
+    if rel_tolerance_pct < 0:
+        raise ValueError("rel_tolerance_pct must be >= 0")
+    if not vector.strip():
+        raise ValueError("vector must not be empty")
+
+    dataset = _resolve_dataset(plot=plot, run_id=run_id, raw_path=raw_path)
+    selected_step = _resolve_step_index(dataset, step_index)
+    scale_name = dataset.scale_name.lower()
+
+    if scale_name == "frequency":
+        bundle = _build_ac_metric_measurements(
+            vector=vector,
+            frequency_hz=dataset.scale_values(step_index=selected_step),
+            response=dataset.get_vector(vector, step_index=selected_step),
+            reference=reference,
+            drop_db=drop_db,
+        )
+    elif scale_name == "time":
+        bundle = _build_tran_metric_measurements(
+            vector=vector,
+            time_s=dataset.scale_values(step_index=selected_step),
+            response=dataset.get_vector(vector, step_index=selected_step),
+            low_threshold_pct=low_threshold_pct,
+            high_threshold_pct=high_threshold_pct,
+            tolerance_percent=tolerance_percent,
+            target_value=target_value,
+        )
+    else:
+        raise ValueError(
+            "validateLtspiceMeasurements requires time-domain or frequency-domain data "
+            f"(got scale '{dataset.scale_name}')."
+        )
+
+    run = _resolve_run_for_dataset_context(dataset=dataset, run_id=run_id)
+    meas_result = runMeasAutomation(
+        measurements=bundle["measurement_statements"],
+        netlist_path=str(run.netlist_path),
+        circuit_name=f"{run.netlist_path.stem}_metric_validation",
+        show_ui=show_ui,
+        open_raw_after_run=open_raw_after_run,
+    )
+    parsed_meas = meas_result["measurements"]
+    mapping: dict[str, str] = bundle["mapping"]
+    analysis_values: dict[str, Any] = bundle["analysis"]
+
+    comparisons: dict[str, Any] = {}
+    authoritative_values: dict[str, float | None] = {}
+    authoritative_values_text: dict[str, str | None] = {}
+    failures: list[str] = []
+    for analysis_key, measurement_name in mapping.items():
+        analysis_value = analysis_values.get(analysis_key)
+        ltspice_value = _measurement_value_for_step(
+            parsed=parsed_meas,
+            measurement_name=measurement_name,
+            step_index=selected_step,
+        )
+        ltspice_value_text = _measurement_text_for_step(
+            parsed=parsed_meas,
+            measurement_name=measurement_name,
+            step_index=selected_step,
+        )
+        authoritative_values[analysis_key] = ltspice_value
+        authoritative_values_text[analysis_key] = ltspice_value_text
+        analysis_float = float(analysis_value) if analysis_value is not None else None
+        comparison = _compare_analysis_to_ltspice_value(
+            analysis_key=analysis_key,
+            analysis_value=analysis_float,
+            measurement_name=measurement_name,
+            ltspice_value=ltspice_value,
+            abs_tolerance=float(abs_tolerance),
+            rel_tolerance_pct=float(rel_tolerance_pct),
+        )
+        comparisons[analysis_key] = comparison
+        if not comparison["passed"]:
+            failures.append(analysis_key)
+
+    return {
+        "overall_passed": len(failures) == 0,
+        "failure_count": len(failures),
+        "failures": failures,
+        "analysis_type": bundle["analysis_type"],
+        "vector": vector,
+        "plot_name": dataset.plot_name,
+        "raw_path": str(dataset.path),
+        "source_run_id": run.run_id,
+        "source_netlist_path": str(run.netlist_path),
+        "analysis_values": analysis_values,
+        "authoritative_values": authoritative_values,
+        "authoritative_values_text": authoritative_values_text,
+        "ltspice_measurements": parsed_meas,
+        "measurement_mapping": mapping,
+        "comparisons": comparisons,
+        "measurement_context": bundle["measurement_context"],
+        "measurement_statements": bundle["measurement_statements"],
+        "validation_run": meas_result["run"],
+        "validation_netlist_path": meas_result["meas_netlist_path"],
+        "abs_tolerance": float(abs_tolerance),
+        "rel_tolerance_pct": float(rel_tolerance_pct),
         **_step_payload(dataset, selected_step),
     }
 

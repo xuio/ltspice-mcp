@@ -88,6 +88,16 @@ class TestAnalysis(unittest.TestCase):
         self.assertAlmostEqual(result["settling_time_s"], 1.5, places=9)
         self.assertAlmostEqual(result["first_entry_time_s"], 1.5, places=9)
 
+    def test_compute_settling_time_handles_double_crossing_in_single_segment(self) -> None:
+        # 0->1 segment crosses lower bound then upper bound (entry + exit) even though
+        # both endpoints are outside the tolerance band on opposite sides.
+        t = [0.0, 1.0, 2.0]
+        y = [complex(0.8), complex(1.2), complex(1.05)]
+        result = compute_settling_time(t, y, tolerance_percent=10.0, target_value=1.0)
+        self.assertAlmostEqual(result["first_entry_time_s"], 0.25, places=9)
+        self.assertAlmostEqual(result["last_exit_time_s"], 0.75, places=9)
+        self.assertAlmostEqual(result["settling_time_s"], 5.0 / 3.0, places=9)
+
     def test_compute_rise_fall_time_rejects_non_monotonic_time(self) -> None:
         t = [0.0, 1.0, -0.5, 2.0]
         y = [complex(0.0), complex(0.2), complex(0.8), complex(1.0)]

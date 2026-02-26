@@ -424,51 +424,59 @@ def compute_settling_time(
     final_value = target_value if target_value is not None else values[-1]
     full_scale = max(max(values) - min(values), abs(final_value), 1e-15)
     band = full_scale * (tolerance_percent / 100.0)
+    low_bound = final_value - band
+    high_bound = final_value + band
 
-    band_error = [abs(value - final_value) - band for value in values]
-    outside = [error > 0.0 for error in band_error]
-    last_outside_idx = None
-    for idx, is_outside in enumerate(outside):
-        if is_outside:
-            last_outside_idx = idx
+    def _band_state(value: float) -> str:
+        if value < low_bound:
+            return "below"
+        if value > high_bound:
+            return "above"
+        return "inside"
 
-    first_inside_idx = next((idx for idx, is_outside in enumerate(outside) if not is_outside), None)
+    first_state = _band_state(values[0])
+    state = first_state
+    entry_events: list[float] = []
+    exit_events: list[float] = []
 
-    settling_time = None
-    if last_outside_idx is None:
-        settling_time = time_s[0]
-    elif last_outside_idx + 1 < len(time_s):
-        left = last_outside_idx
-        right = last_outside_idx + 1
-        if outside[left] and not outside[right]:
-            settling_time = _interpolate_x_at_y(
-                time_s[left],
-                band_error[left],
-                time_s[right],
-                band_error[right],
-                0.0,
-            )
-        else:
-            settling_time = time_s[right]
+    for idx in range(1, len(time_s)):
+        t0 = time_s[idx - 1]
+        t1 = time_s[idx]
+        v0 = values[idx - 1]
+        v1 = values[idx]
+        end_state = _band_state(v1)
 
-    first_entry_time = None
-    if first_inside_idx is not None:
-        if first_inside_idx == 0:
-            first_entry_time = time_s[0]
-        else:
-            left = first_inside_idx - 1
-            right = first_inside_idx
-            if outside[left] and not outside[right]:
-                first_entry_time = _interpolate_x_at_y(
-                    time_s[left],
-                    band_error[left],
-                    time_s[right],
-                    band_error[right],
-                    0.0,
-                )
+        crossings: list[tuple[float, float]] = []
+        dv = v1 - v0
+        dt = t1 - t0
+        if dv != 0 and dt != 0:
+            for threshold in (low_bound, high_bound):
+                alpha = (threshold - v0) / dv
+                if 0.0 < alpha < 1.0:
+                    crossings.append((t0 + alpha * dt, threshold))
+            crossings.sort(key=lambda pair: pair[0])
+
+        for t_cross, threshold in crossings:
+            if threshold == low_bound:
+                next_state = "inside" if dv > 0 else "below"
             else:
-                first_entry_time = time_s[first_inside_idx]
-    last_exit_time = time_s[last_outside_idx] if last_outside_idx is not None else None
+                next_state = "above" if dv > 0 else "inside"
+            if state != "inside" and next_state == "inside":
+                entry_events.append(t_cross)
+            elif state == "inside" and next_state != "inside":
+                exit_events.append(t_cross)
+            state = next_state
+
+        if state != end_state:
+            if state != "inside" and end_state == "inside":
+                entry_events.append(t1)
+            elif state == "inside" and end_state != "inside":
+                exit_events.append(t1)
+            state = end_state
+
+    first_entry_time = entry_events[0] if entry_events else (time_s[0] if first_state == "inside" else None)
+    settling_time = entry_events[-1] if entry_events else (time_s[0] if first_state == "inside" else None)
+    last_exit_time = exit_events[-1] if exit_events else None
 
     return {
         "tolerance_percent": tolerance_percent,

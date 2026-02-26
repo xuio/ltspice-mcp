@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import tempfile
 import time
 import unittest
@@ -154,6 +155,50 @@ class TestVerificationAndQueueTools(unittest.TestCase):
         self.assertEqual(rows[1]["step"], 2)
         self.assertAlmostEqual(rows[1]["value"], 0.00625, places=12)
 
+    def test_parse_meas_results_step_table_header_with_expression_equals(self) -> None:
+        log_path = self.temp_dir / "meas_step_expr_equals.log"
+        log_path.write_text(
+            "\n".join(
+                [
+                    "Measurement: __mcp_rise_start",
+                    "  step\tv(out)=0.06118127703666687",
+                    "     1\t6.38245e-05",
+                    "     2\t0.000126977",
+                    "",
+                    "Measurement: __mcp_rise_end",
+                    "  step\tv(out)=0.5506314933300018",
+                    "     1\t0.00240613",
+                    "     2\t0",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        payload = server.parseMeasResults(log_path=str(log_path))
+        self.assertEqual(payload["count"], 2)
+        rows = payload["measurement_steps"]["__mcp_rise_start"]
+        self.assertEqual(rows[0]["step"], 1)
+        self.assertAlmostEqual(rows[0]["value"], 6.38245e-05, places=12)
+        self.assertEqual(rows[1]["step"], 2)
+        self.assertAlmostEqual(rows[1]["value"], 0.000126977, places=12)
+        self.assertAlmostEqual(payload["measurements"]["__mcp_rise_start"], 0.000126977, places=12)
+        self.assertEqual(
+            server._measurement_value_for_step(
+                parsed=payload,
+                measurement_name="__mcp_rise_start",
+                step_index=0,
+            ),
+            rows[0]["value"],
+        )
+        self.assertEqual(
+            server._measurement_value_for_step(
+                parsed=payload,
+                measurement_name="__mcp_rise_start",
+                step_index=1,
+            ),
+            rows[1]["value"],
+        )
+
     def test_parse_meas_results_inline_expression_value(self) -> None:
         log_path = self.temp_dir / "meas_inline_expr.log"
         log_path.write_text(
@@ -192,6 +237,45 @@ class TestVerificationAndQueueTools(unittest.TestCase):
         self.assertAlmostEqual(payload["measurements"]["tsettle_dn"], 0.00407218, places=9)
         self.assertEqual(payload["measurements_text"]["tsettle_up"], "0.00406703")
         self.assertEqual(payload["measurements_text"]["tsettle_dn"], "0.00407218")
+
+    def test_parse_meas_results_handles_lowercase_at_without_breaking_find_values(self) -> None:
+        log_path = self.temp_dir / "meas_lowercase_at.log"
+        log_path.write_text(
+            "\n".join(
+                [
+                    "bw: db(v(out))=-3 at 1.5879k",
+                    "mag_1k: mag(v(out))=(-1.44507dB,0deg) at 1000",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        payload = server.parseMeasResults(log_path=str(log_path))
+        self.assertEqual(payload["count"], 2)
+        self.assertAlmostEqual(payload["measurements"]["bw"], 1587.9, places=9)
+        self.assertEqual(payload["measurements_text"]["bw"], "1.5879k")
+        self.assertAlmostEqual(payload["measurements"]["mag_1k"], -1.44507, places=6)
+        self.assertEqual(payload["measurements_text"]["mag_1k"], "-1.44507dB")
+
+    def test_parse_meas_results_ignores_simulator_preamble_scalars(self) -> None:
+        log_path = self.temp_dir / "meas_ignore_preamble.log"
+        log_path.write_text(
+            "\n".join(
+                [
+                    "tnom = 27",
+                    "temp = 27",
+                    "Measurement: gain",
+                    "gain: 1.234",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        payload = server.parseMeasResults(log_path=str(log_path))
+        self.assertEqual(payload["count"], 1)
+        self.assertIn("gain", payload["measurements"])
+        self.assertNotIn("tnom", payload["measurements"])
+        self.assertNotIn("temp", payload["measurements"])
 
     def test_run_meas_automation_injects_meas_netlist(self) -> None:
         netlist = self.temp_dir / "base.cir"
@@ -349,6 +433,150 @@ class TestVerificationAndQueueTools(unittest.TestCase):
         self.assertEqual(root["type"], "all_of")
         self.assertEqual(root["child_count"], 2)
         self.assertTrue(root["passed"])
+
+    def test_validate_ltspice_measurements_transient_metrics(self) -> None:
+        run = _make_run(self.temp_dir, run_id="tran-validate")
+        dataset = RawDataset(
+            path=self.temp_dir / "tran_validate.raw",
+            plot_name="Transient Analysis",
+            flags=set(),
+            metadata={},
+            variables=[
+                RawVariable(index=0, name="time", kind="time"),
+                RawVariable(index=1, name="V(out)", kind="voltage"),
+            ],
+            values=[
+                [0.0 + 0j, 0.1 + 0j, 0.2 + 0j, 0.3 + 0j, 0.4 + 0j],
+                [0.0 + 0j, 0.2 + 0j, 0.8 + 0j, 1.0 + 0j, 1.0 + 0j],
+            ],
+            steps=[],
+        )
+        with (
+            patch("ltspice_mcp.server._resolve_dataset", return_value=dataset),
+            patch("ltspice_mcp.server._resolve_run_for_dataset_context", return_value=run),
+            patch("ltspice_mcp.server.runMeasAutomation") as meas_mock,
+        ):
+            meas_mock.return_value = {
+                "run": {"run_id": "tran-meas", "succeeded": True},
+                "meas_netlist_path": str(self.temp_dir / "tran_meas.cir"),
+                "measurements": {
+                    "measurements": {
+                        "__mcp_rise_start": 0.05,
+                        "__mcp_rise_end": 0.25,
+                        "__mcp_rise_time": 0.2,
+                        "__mcp_settle_first": 0.29,
+                        "__mcp_settle_time": 0.29,
+                    },
+                    "measurements_text": {
+                        "__mcp_rise_start": "0.05",
+                        "__mcp_rise_end": "0.25",
+                        "__mcp_rise_time": "0.2",
+                        "__mcp_settle_first": "0.29",
+                        "__mcp_settle_time": "0.29",
+                    },
+                    "measurement_steps": {},
+                },
+            }
+            payload = server.validateLtspiceMeasurements(
+                vector="V(out)",
+                run_id=run.run_id,
+                low_threshold_pct=10.0,
+                high_threshold_pct=90.0,
+                tolerance_percent=2.0,
+                target_value=1.0,
+                abs_tolerance=1e-9,
+                rel_tolerance_pct=0.001,
+            )
+
+        self.assertTrue(payload["overall_passed"])
+        self.assertEqual(payload["failure_count"], 0)
+        self.assertAlmostEqual(payload["comparisons"]["rise_time_s"]["analysis_value"], 0.2, places=9)
+        self.assertAlmostEqual(payload["comparisons"]["rise_time_s"]["ltspice_value"], 0.2, places=9)
+        self.assertAlmostEqual(payload["authoritative_values"]["rise_time_s"], 0.2, places=9)
+        self.assertEqual(payload["authoritative_values_text"]["rise_time_s"], "0.2")
+        self.assertTrue(payload["comparisons"]["fall_time_s"]["passed"])
+        meas_mock.assert_called_once()
+
+    def test_validate_ltspice_measurements_ac_metrics(self) -> None:
+        run = _make_run(self.temp_dir, run_id="ac-validate")
+        freq = [10.0, 100.0, 1_000.0, 10_000.0, 100_000.0]
+        magnitudes = [10.0, 2.0, 1.0, 0.5, 0.1]
+        phases_deg = [-90.0, -120.0, -135.0, -180.0, -225.0]
+        response = [
+            mag * complex(math.cos(math.radians(phase)), math.sin(math.radians(phase)))
+            for mag, phase in zip(magnitudes, phases_deg, strict=True)
+        ]
+        dataset = RawDataset(
+            path=self.temp_dir / "ac_validate.raw",
+            plot_name="AC Analysis",
+            flags=set(),
+            metadata={},
+            variables=[
+                RawVariable(index=0, name="frequency", kind="frequency"),
+                RawVariable(index=1, name="V(out)", kind="voltage"),
+            ],
+            values=[
+                [value + 0j for value in freq],
+                response,
+            ],
+            steps=[],
+        )
+        expected_bw = server.compute_bandwidth(
+            frequency_hz=freq,
+            response=response,
+            reference="first",
+            drop_db=3.0,
+        )
+        expected_gp = server.compute_gain_phase_margin(
+            frequency_hz=freq,
+            response=response,
+        )
+        with (
+            patch("ltspice_mcp.server._resolve_dataset", return_value=dataset),
+            patch("ltspice_mcp.server._resolve_run_for_dataset_context", return_value=run),
+            patch("ltspice_mcp.server.runMeasAutomation") as meas_mock,
+        ):
+            meas_mock.return_value = {
+                "run": {"run_id": "ac-meas", "succeeded": True},
+                "meas_netlist_path": str(self.temp_dir / "ac_meas.cir"),
+                "measurements": {
+                    "measurements": {
+                        "__mcp_bw_low": expected_bw["lowpass_bandwidth_hz"],
+                        "__mcp_gain_cross": expected_gp["gain_crossover_hz"],
+                        "__mcp_phase_cross": expected_gp["phase_crossover_hz"],
+                        "__mcp_phase_margin": expected_gp["phase_margin_deg"],
+                        "__mcp_gain_margin": expected_gp["gain_margin_db"],
+                    },
+                    "measurements_text": {
+                        "__mcp_bw_low": f"{expected_bw['lowpass_bandwidth_hz']:.12g}",
+                        "__mcp_gain_cross": f"{expected_gp['gain_crossover_hz']:.12g}",
+                        "__mcp_phase_cross": f"{expected_gp['phase_crossover_hz']:.12g}",
+                        "__mcp_phase_margin": f"{expected_gp['phase_margin_deg']:.12g}",
+                        "__mcp_gain_margin": f"{expected_gp['gain_margin_db']:.12g}",
+                    },
+                    "measurement_steps": {},
+                },
+            }
+            payload = server.validateLtspiceMeasurements(
+                vector="V(out)",
+                run_id=run.run_id,
+                reference="first",
+                drop_db=3.0,
+                abs_tolerance=1e-9,
+                rel_tolerance_pct=0.001,
+            )
+
+        self.assertTrue(payload["overall_passed"])
+        self.assertEqual(payload["failure_count"], 0)
+        self.assertAlmostEqual(
+            payload["comparisons"]["lowpass_bandwidth_hz"]["analysis_value"],
+            expected_bw["lowpass_bandwidth_hz"],
+            places=9,
+        )
+        self.assertTrue(payload["comparisons"]["highpass_bandwidth_hz"]["passed"])
+        self.assertIsNotNone(payload["authoritative_values_text"]["lowpass_bandwidth_hz"])
+        self.assertIn("__mcp_phase_margin", "\n".join(payload["measurement_statements"]))
+        meas_mock.assert_called_once()
 
     def test_run_sweep_study_step_mode(self) -> None:
         netlist = self.temp_dir / "step_study.cir"
