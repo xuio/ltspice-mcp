@@ -371,6 +371,12 @@ class TestDevelopmentTools(unittest.TestCase):
         )
         self.assertFalse(filt.filter(transient_record))
 
+        delete_record = Mock()
+        delete_record.getMessage.return_value = (
+            '127.0.0.1 - "DELETE /mcp HTTP/1.1" 405 Method Not Allowed'
+        )
+        self.assertFalse(filt.filter(delete_record))
+
         normal_record = Mock()
         normal_record.getMessage.return_value = '127.0.0.1 - "POST /mcp HTTP/1.1" 200 OK'
         self.assertTrue(filt.filter(normal_record))
@@ -382,6 +388,15 @@ class TestDevelopmentTools(unittest.TestCase):
         self.assertFalse(filt.filter(noisy))
         normal = Mock()
         normal.getMessage.return_value = "Application startup complete."
+        self.assertTrue(filt.filter(normal))
+
+    def test_root_noise_filter_suppresses_stateless_termination_noise(self) -> None:
+        filt = server._RootNoiseFilter()
+        noisy = Mock()
+        noisy.getMessage.return_value = "Terminating session: None"
+        self.assertFalse(filt.filter(noisy))
+        normal = Mock()
+        normal.getMessage.return_value = "Terminating session: abc123"
         self.assertTrue(filt.filter(normal))
 
     def test_simulate_netlist_file_retries_on_convergence(self) -> None:

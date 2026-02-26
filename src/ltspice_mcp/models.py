@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import difflib
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -90,10 +92,43 @@ class RawDataset:
 
     def get_vector(self, name: str, step_index: int | None = None) -> list[complex]:
         step = self._resolve_step(step_index)
+        requested = name.strip()
+        if not requested:
+            raise KeyError("Unknown vector ''")
+
         for variable in self.variables:
-            if variable.name == name:
+            if variable.name == requested:
                 return self.values[variable.index][step.start : step.end]
-        raise KeyError(f"Unknown vector '{name}'")
+
+        casefold_matches = [
+            variable for variable in self.variables if variable.name.casefold() == requested.casefold()
+        ]
+        if len(casefold_matches) == 1:
+            variable = casefold_matches[0]
+            return self.values[variable.index][step.start : step.end]
+
+        normalized_requested = re.sub(r"\s+", "", requested).casefold()
+        normalized_matches = [
+            variable
+            for variable in self.variables
+            if re.sub(r"\s+", "", variable.name).casefold() == normalized_requested
+        ]
+        if len(normalized_matches) == 1:
+            variable = normalized_matches[0]
+            return self.values[variable.index][step.start : step.end]
+
+        names = [variable.name for variable in self.variables]
+        hint = ""
+        if names:
+            close = difflib.get_close_matches(requested, names, n=3, cutoff=0.55)
+            if close:
+                hint = f" Did you mean: {', '.join(close)}?"
+            else:
+                preview = ", ".join(names[:6])
+                if len(names) > 6:
+                    preview = f"{preview}, ..."
+                hint = f" Available vectors: {preview}."
+        raise KeyError(f"Unknown vector '{name}'.{hint}")
 
 
 @dataclass(slots=True)

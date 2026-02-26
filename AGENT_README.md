@@ -19,6 +19,12 @@ From repo root:
 Then use MCP endpoint:
 - `http://127.0.0.1:8765/mcp`
 
+HTTP compatibility defaults:
+- `json_response = true`
+- `stateless_http = true`
+
+These defaults avoid sticky-session issues in some MCP clients.
+
 ## 2) Required Permission Checks
 
 Run once or whenever captures fail:
@@ -123,6 +129,9 @@ Inspect response field:
 
 - URL-capable MCP clients can use `http://127.0.0.1:8765/mcp` directly.
 - Claude Desktop typically works best with `mcp-remote`.
+- If a client has session-related timeouts, force compatibility mode with:
+  - `LTSPICE_MCP_JSON_RESPONSE=1`
+  - `LTSPICE_MCP_STATELESS_HTTP=1`
 
 ## 9) Helper Binary Identity
 

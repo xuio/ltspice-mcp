@@ -52,6 +52,13 @@ python3 smoke_test_mcp.py \
 - `sse`: HTTP + SSE mode.
 - `streamable-http`: long-lived HTTP MCP mode (recommended for multi-client stability).
 
+`streamable-http` now defaults to compatibility mode:
+- JSON responses enabled.
+- Stateless HTTP enabled (no sticky session requirement).
+
+This improves interoperability with MCP clients that do not reliably persist
+session headers across requests.
+
 Direct run examples:
 
 ```bash
@@ -263,6 +270,8 @@ Core:
 - `LTSPICE_MCP_HOST`
 - `LTSPICE_MCP_PORT`
 - `LTSPICE_MCP_STREAMABLE_HTTP_PATH`
+- `LTSPICE_MCP_JSON_RESPONSE`
+- `LTSPICE_MCP_STATELESS_HTTP`
 
 UI/render:
 - `LTSPICE_MCP_UI_ENABLED`

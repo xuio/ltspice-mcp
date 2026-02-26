@@ -129,6 +129,7 @@ async def _run_smoke_test(args: argparse.Namespace) -> None:
                 "getGainPhaseMargin",
                 "getRiseFallTime",
                 "getSettlingTime",
+                "validateLtspiceMeasurements",
                 "listRuns",
                 "getRunDetails",
         }
@@ -587,6 +588,25 @@ C1 out 0 1u
         _require("gain_crossover_hz" in margins, "getGainPhaseMargin missing expected output")
         print("Gain/phase margin check passed")
 
+        ac_validate = _extract_call_result(
+            await session.call_tool(
+                "validateLtspiceMeasurements",
+                {
+                    "run_id": run_id,
+                    "vector": "V(out)",
+                    "abs_tolerance": 1e-5,
+                    "rel_tolerance_pct": 0.2,
+                },
+            )
+        )
+        _require(isinstance(ac_validate, dict), "validateLtspiceMeasurements (AC) did not return an object")
+        _require(ac_validate.get("overall_passed") is True, "AC LTspice measurement validation failed")
+        _require(
+            isinstance(ac_validate.get("authoritative_values_text"), dict),
+            "AC authoritative_values_text missing",
+        )
+        print("AC LTspice-authoritative validation check passed")
+
         runs = _extract_call_result(await session.call_tool("listRuns", {"limit": 10}))
         _require(isinstance(runs, list), "listRuns did not return a list")
         _require(any(item.get("run_id") == run_id for item in runs), "run_id not found in listRuns")
@@ -703,6 +723,34 @@ C1 out 0 1u
         _require(isinstance(settling, dict), "getSettlingTime did not return an object")
         _require("settling_time_s" in settling, "getSettlingTime missing expected output")
         print("Settling-time check passed")
+
+        tran_validate = _extract_call_result(
+            await session.call_tool(
+                "validateLtspiceMeasurements",
+                {
+                    "run_id": tran_id,
+                    "vector": "V(out)",
+                    "low_threshold_pct": 10.0,
+                    "high_threshold_pct": 90.0,
+                    "tolerance_percent": 2.0,
+                    "abs_tolerance": 1e-5,
+                    "rel_tolerance_pct": 0.2,
+                },
+            )
+        )
+        _require(
+            isinstance(tran_validate, dict),
+            "validateLtspiceMeasurements (TRAN) did not return an object",
+        )
+        _require(
+            tran_validate.get("overall_passed") is True,
+            "Transient LTspice measurement validation failed",
+        )
+        _require(
+            isinstance(tran_validate.get("authoritative_values_text"), dict),
+            "Transient authoritative_values_text missing",
+        )
+        print("Transient LTspice-authoritative validation check passed")
 
         telemetry = _extract_call_result(
             await session.call_tool(
