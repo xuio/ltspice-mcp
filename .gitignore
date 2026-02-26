@@ -15,3 +15,4 @@ runs/
 .tmp*/
 .ltspice_mcp_runs.json
 .mcp-workdir/
+images/
