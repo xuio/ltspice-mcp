@@ -5,12 +5,14 @@ import json
 import logging
 import os
 import platform
+import plistlib
 import re
 import shutil
 import subprocess
 import time
 from collections import Counter, deque
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -1016,14 +1018,43 @@ def find_ltspice_executable(explicit: str | Path | None = None) -> Path | None:
     return None
 
 
+def _ltspice_info_plist_path(executable: Path) -> Path | None:
+    try:
+        resolved = executable.expanduser().resolve()
+    except Exception:  # noqa: BLE001
+        return None
+    parts = resolved.parts
+    try:
+        app_index = next(index for index, part in enumerate(parts) if part.endswith(".app"))
+    except StopIteration:
+        return None
+    return Path(*parts[: app_index + 1]) / "Contents" / "Info.plist"
+
+
+@lru_cache(maxsize=32)
 def get_ltspice_version(executable: Path) -> str | None:
+    plist_path = _ltspice_info_plist_path(executable)
+    if plist_path and plist_path.exists():
+        try:
+            payload = plistlib.loads(plist_path.read_bytes())
+        except Exception:  # noqa: BLE001
+            payload = {}
+        short_version = str(payload.get("CFBundleShortVersionString", "")).strip()
+        bundle_version = str(payload.get("CFBundleVersion", "")).strip()
+        if short_version and bundle_version and bundle_version not in short_version:
+            return f"{short_version} ({bundle_version})"
+        if short_version:
+            return short_version
+        if bundle_version:
+            return bundle_version
+
     for flag in ("-version", "-v"):
         try:
             proc = subprocess.run(
                 [str(executable), flag],
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=0.8,
                 check=False,
             )
         except Exception:
@@ -1075,6 +1106,59 @@ def analyze_log(log_path: Path | None) -> tuple[list[str], list[str], list[Simul
             break
 
     return issues, warnings, diagnostics
+
+
+def _collect_related_artifacts(netlist_path: Path) -> list[Path]:
+    return sorted(path for path in netlist_path.parent.glob(f"{netlist_path.stem}*") if path.is_file())
+
+
+def _is_simulation_output_artifact(netlist_path: Path, candidate: Path) -> bool:
+    if candidate == netlist_path:
+        return False
+    if not candidate.name.startswith(netlist_path.stem):
+        return False
+    lower_name = candidate.name.lower()
+    return (
+        lower_name.endswith(".raw")
+        or lower_name.endswith(".log")
+        or lower_name.endswith(".log.utf8.txt")
+    )
+
+
+def _collect_simulation_output_artifacts(netlist_path: Path) -> list[Path]:
+    return [
+        path
+        for path in _collect_related_artifacts(netlist_path)
+        if _is_simulation_output_artifact(netlist_path, path)
+    ]
+
+
+def _purge_previous_simulation_outputs(netlist_path: Path) -> list[Path]:
+    removed: list[Path] = []
+    for path in _collect_simulation_output_artifacts(netlist_path):
+        try:
+            path.unlink()
+            removed.append(path)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            _LOGGER.warning("Failed to remove stale LTspice artifact '%s': %s", path, exc)
+    return removed
+
+
+def _is_recent_artifact(path: Path, *, started_ts: float, grace_seconds: float = 1.0) -> bool:
+    try:
+        return path.stat().st_mtime >= (started_ts - max(0.0, grace_seconds))
+    except OSError:
+        return False
+
+
+def _resolve_log_path(netlist_path: Path) -> Path | None:
+    primary = netlist_path.with_suffix(".log")
+    if primary.exists():
+        return primary
+    candidates = sorted(netlist_path.parent.glob(f"{netlist_path.stem}*.log"))
+    return candidates[0] if candidates else None
 
 
 def tail_text_file(path: Path | None, max_lines: int = 120) -> str:
@@ -2107,10 +2191,10 @@ class LTspiceRunner:
 
         executable = self.ensure_executable()
         timeout = timeout_seconds or self.default_timeout_seconds
-        command = [str(executable), "-b"]
+        _purge_previous_simulation_outputs(netlist)
+        command = [str(executable), "-b", str(netlist)]
         if ascii_raw:
             command.append("-ascii")
-        command.append(str(netlist))
 
         started_at = datetime.now().astimezone().isoformat()
         start_ts = time.time()
@@ -2133,13 +2217,16 @@ class LTspiceRunner:
             stderr = (exc.stderr or "") + f"\nLTspice timed out after {timeout} seconds."
 
         duration = time.time() - start_ts
-        artifacts = sorted(path for path in netlist.parent.glob(f"{netlist.stem}*") if path.is_file())
-        raw_files = [path for path in artifacts if path.suffix.lower() == ".raw"]
+        artifacts = _collect_related_artifacts(netlist)
+        output_artifacts = [path for path in artifacts if _is_simulation_output_artifact(netlist, path)]
+        fresh_output_artifacts = [
+            path for path in output_artifacts if _is_recent_artifact(path, started_ts=start_ts)
+        ]
+        raw_files = [path for path in fresh_output_artifacts if path.suffix.lower() == ".raw"]
 
-        log_path = netlist.with_suffix(".log")
-        if not log_path.exists():
-            candidates = sorted(netlist.parent.glob(f"{netlist.stem}*.log"))
-            log_path = candidates[0] if candidates else None
+        log_path = _resolve_log_path(netlist)
+        if log_path is not None and not _is_recent_artifact(log_path, started_ts=start_ts):
+            log_path = None
         log_utf8_path = _write_utf8_log_sidecar(log_path)
         if log_utf8_path is not None:
             artifacts = sorted({*artifacts, log_utf8_path})
@@ -2155,6 +2242,34 @@ class LTspiceRunner:
                     suggestion="Check stderr output and LTspice log details for the underlying simulation failure.",
                 )
             )
+            if not fresh_output_artifacts:
+                stale_message = (
+                    "Simulation artifacts were not regenerated for this run; refusing to reuse stale .log/.raw files."
+                )
+                issues.append(stale_message)
+                diagnostics.append(
+                    SimulationDiagnostic(
+                        category="artifact_stale_or_missing",
+                        severity="error",
+                        message=stale_message,
+                        suggestion=(
+                            "Check LTspice command-line arguments and verify the netlist path is valid. "
+                            "No fresh .log/.raw outputs were detected."
+                        ),
+                    )
+                )
+            if ascii_raw and log_path is None:
+                issues.append(
+                    "No .log file was generated in -ascii mode; retry with ascii_raw=false to obtain diagnostics."
+                )
+                diagnostics.append(
+                    SimulationDiagnostic(
+                        category="ascii_raw_mode",
+                        severity="warning",
+                        message="Simulation failed in -ascii mode without a log file.",
+                        suggestion="Retry with ascii_raw=false. Some LTspice/macOS runs fail early in -ascii mode.",
+                    )
+                )
         if not raw_files and return_code == 0:
             warnings.append("No .raw output file was generated.")
             diagnostics.append(

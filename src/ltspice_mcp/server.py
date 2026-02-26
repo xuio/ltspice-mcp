@@ -44,6 +44,11 @@ from .analysis import (
 )
 from .ltspice import (
     LTspiceRunner,
+    _collect_related_artifacts,
+    _is_recent_artifact,
+    _is_simulation_output_artifact,
+    _purge_previous_simulation_outputs,
+    _resolve_log_path,
     analyze_log,
     capture_ltspice_window_screenshot,
     close_ltspice_window,
@@ -2363,10 +2368,10 @@ def _run_process_simulation_with_cancel(
 ) -> tuple[SimulationRun, bool]:
     executable = _runner.ensure_executable()
     timeout = timeout_seconds or _runner.default_timeout_seconds
-    command = [str(executable), "-b"]
+    _purge_previous_simulation_outputs(netlist_path)
+    command = [str(executable), "-b", str(netlist_path)]
     if ascii_raw:
         command.append("-ascii")
-    command.append(str(netlist_path))
 
     started_at = _now_iso()
     start_ts = time.time()
@@ -2403,12 +2408,15 @@ def _run_process_simulation_with_cancel(
     return_code = proc.returncode if proc.returncode is not None else -1
     duration = time.time() - start_ts
 
-    artifacts = sorted(path for path in netlist_path.parent.glob(f"{netlist_path.stem}*") if path.is_file())
-    raw_files = [path for path in artifacts if path.suffix.lower() == ".raw"]
-    log_path = netlist_path.with_suffix(".log")
-    if not log_path.exists():
-        candidates = sorted(netlist_path.parent.glob(f"{netlist_path.stem}*.log"))
-        log_path = candidates[0] if candidates else None
+    artifacts = _collect_related_artifacts(netlist_path)
+    output_artifacts = [path for path in artifacts if _is_simulation_output_artifact(netlist_path, path)]
+    fresh_output_artifacts = [
+        path for path in output_artifacts if _is_recent_artifact(path, started_ts=start_ts)
+    ]
+    raw_files = [path for path in fresh_output_artifacts if path.suffix.lower() == ".raw"]
+    log_path = _resolve_log_path(netlist_path)
+    if log_path is not None and not _is_recent_artifact(log_path, started_ts=start_ts):
+        log_path = None
 
     issues, warnings, diagnostics = analyze_log(log_path)
     if canceled:
@@ -2441,6 +2449,22 @@ def _run_process_simulation_with_cancel(
                 suggestion="Inspect stdout/stderr and LTspice log details for root cause.",
             )
         )
+        if not fresh_output_artifacts:
+            stale_message = (
+                "Simulation artifacts were not regenerated for this run; refusing to reuse stale .log/.raw files."
+            )
+            issues.append(stale_message)
+            diagnostics.append(
+                SimulationDiagnostic(
+                    category="artifact_stale_or_missing",
+                    severity="error",
+                    message=stale_message,
+                    suggestion=(
+                        "Check LTspice command-line arguments and verify the netlist path is valid. "
+                        "No fresh .log/.raw outputs were detected."
+                    ),
+                )
+            )
     if not raw_files and return_code == 0 and not canceled and not timed_out:
         warnings.append("No .raw output file was generated.")
 
