@@ -22,6 +22,7 @@ import uuid
 import zlib
 from collections import deque
 from contextlib import contextmanager
+from decimal import Decimal, InvalidOperation
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -103,6 +104,8 @@ _DEFAULT_WORKDIR = Path(os.getenv("LTSPICE_MCP_WORKDIR", os.getcwd()))
 _DEFAULT_TIMEOUT = int(os.getenv("LTSPICE_MCP_TIMEOUT", "120"))
 _DEFAULT_BINARY = os.getenv("LTSPICE_BINARY")
 _DEFAULT_UI_ENABLED = _read_env_bool("LTSPICE_MCP_UI_ENABLED", default=False)
+_DEFAULT_JSON_RESPONSE = _read_env_bool("LTSPICE_MCP_JSON_RESPONSE", default=True)
+_DEFAULT_STATELESS_HTTP = _read_env_bool("LTSPICE_MCP_STATELESS_HTTP", default=True)
 _DEFAULT_SCHEMATIC_SINGLE_WINDOW = _read_env_bool(
     "LTSPICE_MCP_SCHEMATIC_SINGLE_WINDOW",
     default=True,
@@ -134,6 +137,7 @@ _render_sessions: dict[str, dict[str, Any]] = {}
 _TOOL_TELEMETRY_WINDOW = max(10, int(os.getenv("LTSPICE_MCP_TELEMETRY_WINDOW", "200")))
 _tool_telemetry: dict[str, dict[str, Any]] = {}
 _uvicorn_noise_filters_installed = False
+_root_noise_filter_installed = False
 _job_lock = threading.RLock()
 _jobs: dict[str, dict[str, Any]] = {}
 _job_order: list[str] = []
@@ -174,6 +178,7 @@ def _configure_logging(log_level: str | None = None) -> str:
         root_logger.setLevel(level)
 
     logging.getLogger("ltspice_mcp").setLevel(level)
+    _install_root_noise_filter()
     return level_name
 
 
@@ -206,6 +211,8 @@ class _UvicornAccessNoiseFilter(logging.Filter):
             return False
         if method == "GET" and status_code == 400 and path == self._streamable_http_path:
             return False
+        if method == "DELETE" and status_code == 405 and path == self._streamable_http_path:
+            return False
         return True
 
 
@@ -215,6 +222,22 @@ class _UvicornErrorNoiseFilter(logging.Filter):
         if "ASGI callable returned without completing response" in message:
             return False
         return True
+
+
+class _RootNoiseFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage().strip()
+        if message == "Terminating session: None":
+            return False
+        return True
+
+
+def _install_root_noise_filter() -> None:
+    global _root_noise_filter_installed
+    if _root_noise_filter_installed:
+        return
+    logging.getLogger().addFilter(_RootNoiseFilter())
+    _root_noise_filter_installed = True
 
 
 def _install_uvicorn_noise_filters(streamable_http_path: str) -> None:
@@ -1739,20 +1762,118 @@ def _resolve_run_target_for_input(
     }
 
 
+_MEAS_NUMBER_PATTERN = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?(?:[A-Za-z]+)?"
 _MEAS_VALUE_RE = re.compile(
-    r"^\s*(?P<name>[A-Za-z_][\w.$-]*)\s*[:=]\s*(?P<value>[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)"
+    rf"^\s*(?P<name>[A-Za-z_][\w.$-]*)\s*[:=]\s*(?P<value>{_MEAS_NUMBER_PATTERN})"
 )
+_MEAS_COLON_LINE_RE = re.compile(r"^\s*(?P<name>[A-Za-z_][\w.$-]*)\s*:\s*(?P<rhs>.+?)\s*$")
 _MEAS_MEASUREMENT_RE = re.compile(
     r"^\s*Measurement:\s*(?P<name>[A-Za-z_][\w.$-]*)",
     re.IGNORECASE,
 )
+_MEAS_NUMERIC_TOKEN_RE = re.compile(_MEAS_NUMBER_PATTERN)
+_MEAS_AT_VALUE_RE = re.compile(rf"\bAT\s+(?P<value>{_MEAS_NUMBER_PATTERN})\b")
+_MEAS_HEADER_TOKEN_RE = re.compile(r"^\s*[A-Za-z_][\w()*/+.-]*\s*$")
+_MEAS_AUX_HEADER_TOKENS = {
+    "step",
+    "from",
+    "to",
+    "at",
+    "when",
+    "time",
+    "freq",
+    "frequency",
+    "param",
+}
+_SPICE_SUFFIX_SCALE: dict[str, float] = {
+    "t": 1e12,
+    "g": 1e9,
+    "meg": 1e6,
+    "k": 1e3,
+    "m": 1e-3,
+    "u": 1e-6,
+    "n": 1e-9,
+    "p": 1e-12,
+    "f": 1e-15,
+    "mil": 25.4e-6,
+}
+
+
+def _parse_spice_number_token(token: str) -> float | None:
+    raw = token.strip()
+    if not raw:
+        return None
+    match = re.fullmatch(
+        r"(?P<number>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][+-]?\d+)?)(?P<suffix>[A-Za-z]+)?",
+        raw,
+    )
+    if not match:
+        return None
+    number = match.group("number")
+    suffix = (match.group("suffix") or "").strip().lower()
+    try:
+        value = Decimal(number.replace("D", "e").replace("d", "e"))
+    except InvalidOperation:
+        return None
+    if suffix:
+        value *= Decimal(str(_SPICE_SUFFIX_SCALE.get(suffix, 1.0)))
+    return float(value)
+
+
+def _extract_meas_numeric_from_rhs(rhs: str) -> tuple[float, str] | None:
+    # For WHEN-style results LTspice emits:
+    #   expr=const AT <time_or_freq>
+    # Use the AT value (the measured crossing point), not the condition constant.
+    at_match = _MEAS_AT_VALUE_RE.search(rhs)
+    if at_match:
+        at_token = at_match.group("value")
+        parsed_at = _parse_spice_number_token(at_token)
+        if parsed_at is not None:
+            return parsed_at, at_token
+
+    # Try the value segment after '=' first for lines like:
+    #   vpp: PP(v(out))=0.731107 FROM 0 TO 0.008
+    #   mag_1k: mag(v(out))=(-1.44507dB,0°) at 1000
+    candidate_text = rhs
+    if "=" in rhs:
+        candidate_text = rhs.split("=", 1)[1]
+    for token in _MEAS_NUMERIC_TOKEN_RE.findall(candidate_text):
+        parsed = _parse_spice_number_token(token)
+        if parsed is not None:
+            return parsed, token
+    return None
+
+
+def _select_meas_table_columns(
+    *,
+    pending_name: str,
+    headers: list[str],
+) -> tuple[int | None, int]:
+    lowered = [token.strip().lower() for token in headers]
+    step_column = lowered.index("step") if "step" in lowered else None
+    target = pending_name.strip().lower()
+    if target in lowered:
+        return step_column, lowered.index(target)
+
+    candidate_indexes = [
+        idx for idx, token in enumerate(lowered) if token not in _MEAS_AUX_HEADER_TOKENS
+    ]
+    if candidate_indexes:
+        return step_column, candidate_indexes[-1]
+    return step_column, max(0, len(headers) - 1)
 
 
 def _parse_meas_results_from_text(text: str) -> dict[str, Any]:
     measurements: dict[str, float] = {}
+    measurement_text: dict[str, str] = {}
+    measurement_display: dict[str, str] = {}
+    measurement_steps: dict[str, list[dict[str, Any]]] = {}
     raw_lines = text.splitlines()
     measurement_order: list[str] = []
     pending_name: str | None = None
+    pending_value_column = 0
+    pending_step_column: int | None = None
+    pending_header_seen = False
 
     for line in raw_lines:
         match_measure = _MEAS_MEASUREMENT_RE.match(line)
@@ -1760,32 +1881,113 @@ def _parse_meas_results_from_text(text: str) -> dict[str, Any]:
             pending_name = match_measure.group("name").strip()
             if pending_name and pending_name not in measurement_order:
                 measurement_order.append(pending_name)
+            if pending_name:
+                measurement_steps.setdefault(pending_name, [])
+            pending_value_column = 0
+            pending_step_column = None
+            pending_header_seen = False
             continue
 
         match_value = _MEAS_VALUE_RE.match(line)
         if match_value:
             name = match_value.group("name").strip()
-            value = float(match_value.group("value"))
+            raw_value = match_value.group("value").strip()
+            parsed_value = _parse_spice_number_token(raw_value)
+            if parsed_value is None:
+                continue
+            value = parsed_value
             measurements[name] = value
+            measurement_text[name] = raw_value
+            measurement_display[name] = raw_value
             if name not in measurement_order:
                 measurement_order.append(name)
             pending_name = None
             continue
 
-        if pending_name:
-            raw_match = re.search(r"([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)", line)
-            if raw_match:
-                measurements[pending_name] = float(raw_match.group(1))
+        match_colon_line = _MEAS_COLON_LINE_RE.match(line)
+        if match_colon_line:
+            name = match_colon_line.group("name").strip()
+            rhs = match_colon_line.group("rhs").strip()
+            extracted = _extract_meas_numeric_from_rhs(rhs)
+            if extracted is not None:
+                value, raw_value = extracted
+                measurements[name] = value
+                measurement_text[name] = raw_value
+                measurement_display[name] = rhs
+                if name not in measurement_order:
+                    measurement_order.append(name)
                 pending_name = None
+                continue
+
+        if pending_name:
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            tokens = [token for token in re.split(r"\s+", stripped) if token]
+            if (
+                not pending_header_seen
+                and tokens
+                and all(_MEAS_HEADER_TOKEN_RE.match(token) for token in tokens)
+            ):
+                pending_header_seen = True
+                pending_step_column, pending_value_column = _select_meas_table_columns(
+                    pending_name=pending_name,
+                    headers=tokens,
+                )
+                continue
+
+            if pending_header_seen:
+                step_token = (
+                    tokens[pending_step_column]
+                    if pending_step_column is not None and len(tokens) > pending_step_column
+                    else None
+                )
+                if step_token is not None and _parse_spice_number_token(step_token) is None:
+                    # End of this stepped measurement table; avoid leaking into
+                    # unrelated numeric lines such as "Total elapsed time: ...".
+                    pending_name = None
+                    pending_header_seen = False
+                    pending_value_column = 0
+                    pending_step_column = None
+                    continue
+
+            raw_value = (
+                tokens[pending_value_column] if len(tokens) > pending_value_column else None
+            )
+            parsed_value = _parse_spice_number_token(raw_value or "")
+            if parsed_value is None:
+                extracted = _extract_meas_numeric_from_rhs(stripped)
+                if extracted is not None:
+                    parsed_value, raw_value = extracted
+            if parsed_value is None or raw_value is None:
+                continue
+            measurements[pending_name] = parsed_value
+            measurement_text[pending_name] = raw_value
+            measurement_display[pending_name] = stripped
+            entry: dict[str, Any] = {"value": parsed_value, "value_text": raw_value}
+            if pending_step_column is not None and len(tokens) > pending_step_column:
+                step_value = _parse_spice_number_token(tokens[pending_step_column])
+                if step_value is not None:
+                    entry["step"] = int(step_value)
+            measurement_steps.setdefault(pending_name, []).append(entry)
 
     items = [
-        {"name": name, "value": measurements[name]}
+        {
+            "name": name,
+            "value": measurements[name],
+            "value_text": measurement_text.get(name),
+            "steps": measurement_steps.get(name, []),
+        }
         for name in measurement_order
         if name in measurements
     ]
     return {
         "count": len(items),
         "measurements": measurements,
+        "measurements_text": measurement_text,
+        "measurements_display": measurement_display,
+        "measurement_steps": measurement_steps,
         "items": items,
     }
 
@@ -7085,6 +7287,38 @@ def main() -> None:
         default=os.getenv("LTSPICE_MCP_STREAMABLE_HTTP_PATH", "/mcp"),
         help="Streamable HTTP endpoint path when --transport streamable-http is used.",
     )
+    parser.add_argument(
+        "--json-response",
+        dest="json_response",
+        action="store_true",
+        help=(
+            "Enable JSON responses for Streamable HTTP tool calls "
+            "(compatibility mode for clients that do not consume SSE responses)."
+        ),
+    )
+    parser.add_argument(
+        "--sse-response",
+        dest="json_response",
+        action="store_false",
+        help="Use SSE responses for Streamable HTTP tool calls.",
+    )
+    parser.set_defaults(json_response=None)
+    parser.add_argument(
+        "--stateless-http",
+        dest="stateless_http",
+        action="store_true",
+        help=(
+            "Disable sticky MCP session requirement for Streamable HTTP "
+            "(creates a fresh transport per request)."
+        ),
+    )
+    parser.add_argument(
+        "--stateful-http",
+        dest="stateless_http",
+        action="store_false",
+        help="Require sticky MCP session IDs for Streamable HTTP.",
+    )
+    parser.set_defaults(stateless_http=None)
     args = parser.parse_args()
     configured_log_level = _configure_logging(args.log_level)
 
@@ -7106,6 +7340,8 @@ def main() -> None:
     sse_path = _normalize_http_path(args.sse_path)
     message_path = _normalize_http_path(args.message_path, trailing_slash=True)
     streamable_http_path = _normalize_http_path(args.streamable_http_path)
+    json_response = _DEFAULT_JSON_RESPONSE if args.json_response is None else bool(args.json_response)
+    stateless_http = _DEFAULT_STATELESS_HTTP if args.stateless_http is None else bool(args.stateless_http)
 
     _LOGGER.info(
         "ltspice_mcp_server_start %s",
@@ -7116,6 +7352,8 @@ def main() -> None:
                 "port": args.port,
                 "mount_path": mount_path,
                 "streamable_http_path": streamable_http_path,
+                "json_response": json_response,
+                "stateless_http": stateless_http,
                 "workdir": str(Path(args.workdir).expanduser().resolve()),
                 "log_level": configured_log_level,
                 "tool_logging_enabled": _TOOL_LOGGING_ENABLED,
@@ -7139,6 +7377,8 @@ def main() -> None:
     mcp.settings.sse_path = sse_path
     mcp.settings.message_path = message_path
     mcp.settings.streamable_http_path = streamable_http_path
+    mcp.settings.json_response = json_response
+    mcp.settings.stateless_http = stateless_http
 
     if transport == "sse":
         mcp.run(transport=transport, mount_path=mount_path)

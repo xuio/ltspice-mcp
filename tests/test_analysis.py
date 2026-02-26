@@ -78,6 +78,27 @@ class TestAnalysis(unittest.TestCase):
         result = compute_settling_time(t, y, tolerance_percent=2.0, target_value=1.0)
         self.assertIsNotNone(result["settling_time_s"])
         self.assertGreaterEqual(result["settling_time_s"], 0.0)
+        self.assertIsNotNone(result["first_entry_time_s"])
+        self.assertIsNotNone(result["last_exit_time_s"])
+
+    def test_compute_settling_time_interpolates_crossing(self) -> None:
+        t = [0.0, 1.0, 2.0]
+        y = [complex(1.1), complex(1.03), complex(1.01)]
+        result = compute_settling_time(t, y, tolerance_percent=2.0, target_value=1.0)
+        self.assertAlmostEqual(result["settling_time_s"], 1.5, places=9)
+        self.assertAlmostEqual(result["first_entry_time_s"], 1.5, places=9)
+
+    def test_compute_rise_fall_time_rejects_non_monotonic_time(self) -> None:
+        t = [0.0, 1.0, -0.5, 2.0]
+        y = [complex(0.0), complex(0.2), complex(0.8), complex(1.0)]
+        with self.assertRaises(ValueError):
+            compute_rise_fall_time(t, y)
+
+    def test_compute_settling_time_rejects_non_monotonic_time(self) -> None:
+        t = [0.0, 1.0, -0.5, 2.0]
+        y = [complex(1.0), complex(0.9), complex(0.3), complex(0.1)]
+        with self.assertRaises(ValueError):
+            compute_settling_time(t, y)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,23 @@ from math import atan2, degrees, log10
 from typing import Any
 
 
+def _is_non_decreasing(values: list[float]) -> bool:
+    if len(values) < 2:
+        return True
+    for idx in range(1, len(values)):
+        prev = values[idx - 1]
+        curr = values[idx]
+        tol = max(1e-30, abs(prev) * 1e-12, abs(curr) * 1e-12)
+        if curr < prev - tol:
+            return False
+    return True
+
+
+def _ensure_non_decreasing(values: list[float], *, name: str) -> None:
+    if not _is_non_decreasing(values):
+        raise ValueError(f"{name} must be non-decreasing")
+
+
 def sample_indices(total_points: int, max_points: int) -> list[int]:
     if total_points <= 0:
         return []
@@ -229,6 +246,7 @@ def compute_bandwidth(
         raise ValueError("frequency_hz and response lengths must match")
     if len(frequency_hz) < 2:
         raise ValueError("Need at least 2 points to compute bandwidth")
+    _ensure_non_decreasing(frequency_hz, name="frequency_hz")
     if reference not in {"first", "max"}:
         raise ValueError("reference must be 'first' or 'max'")
     if drop_db <= 0:
@@ -271,6 +289,7 @@ def compute_gain_phase_margin(
         raise ValueError("frequency_hz and response lengths must match")
     if len(frequency_hz) < 2:
         raise ValueError("Need at least 2 points to compute margins")
+    _ensure_non_decreasing(frequency_hz, name="frequency_hz")
 
     magnitudes = [abs(value) for value in response]
     magnitude_db = [20.0 * log10(max(mag, 1e-300)) for mag in magnitudes]
@@ -340,6 +359,7 @@ def compute_rise_fall_time(
         raise ValueError("time_s and signal lengths must match")
     if len(time_s) < 2:
         raise ValueError("Need at least 2 points to compute rise/fall times")
+    _ensure_non_decreasing(time_s, name="time_s")
     if not (0.0 <= low_threshold_pct < high_threshold_pct <= 100.0):
         raise ValueError("thresholds must satisfy 0 <= low < high <= 100")
 
@@ -396,6 +416,7 @@ def compute_settling_time(
         raise ValueError("time_s and signal lengths must match")
     if len(time_s) < 2:
         raise ValueError("Need at least 2 points to compute settling time")
+    _ensure_non_decreasing(time_s, name="time_s")
     if tolerance_percent <= 0:
         raise ValueError("tolerance_percent must be > 0")
 
@@ -404,21 +425,57 @@ def compute_settling_time(
     full_scale = max(max(values) - min(values), abs(final_value), 1e-15)
     band = full_scale * (tolerance_percent / 100.0)
 
+    band_error = [abs(value - final_value) - band for value in values]
+    outside = [error > 0.0 for error in band_error]
     last_outside_idx = None
-    for idx, value in enumerate(values):
-        if abs(value - final_value) > band:
+    for idx, is_outside in enumerate(outside):
+        if is_outside:
             last_outside_idx = idx
+
+    first_inside_idx = next((idx for idx, is_outside in enumerate(outside) if not is_outside), None)
 
     settling_time = None
     if last_outside_idx is None:
         settling_time = time_s[0]
     elif last_outside_idx + 1 < len(time_s):
-        settling_time = time_s[last_outside_idx + 1]
+        left = last_outside_idx
+        right = last_outside_idx + 1
+        if outside[left] and not outside[right]:
+            settling_time = _interpolate_x_at_y(
+                time_s[left],
+                band_error[left],
+                time_s[right],
+                band_error[right],
+                0.0,
+            )
+        else:
+            settling_time = time_s[right]
+
+    first_entry_time = None
+    if first_inside_idx is not None:
+        if first_inside_idx == 0:
+            first_entry_time = time_s[0]
+        else:
+            left = first_inside_idx - 1
+            right = first_inside_idx
+            if outside[left] and not outside[right]:
+                first_entry_time = _interpolate_x_at_y(
+                    time_s[left],
+                    band_error[left],
+                    time_s[right],
+                    band_error[right],
+                    0.0,
+                )
+            else:
+                first_entry_time = time_s[first_inside_idx]
+    last_exit_time = time_s[last_outside_idx] if last_outside_idx is not None else None
 
     return {
         "tolerance_percent": tolerance_percent,
         "target_value": final_value,
         "tolerance_band": band,
         "settling_time_s": settling_time,
+        "first_entry_time_s": first_entry_time,
+        "last_exit_time_s": last_exit_time,
         "final_value": values[-1],
     }

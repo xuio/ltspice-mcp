@@ -62,6 +62,136 @@ class TestVerificationAndQueueTools(unittest.TestCase):
         self.assertEqual(payload["count"], 2)
         self.assertAlmostEqual(payload["measurements"]["gain"], 2.5)
         self.assertAlmostEqual(payload["measurements"]["phase"], -42.0)
+        self.assertEqual(payload["measurements_text"]["gain"], "2.500000e+00")
+
+    def test_parse_meas_results_uses_value_column_for_step_tables(self) -> None:
+        log_path = self.temp_dir / "meas_step_table.log"
+        log_path.write_text(
+            "\n".join(
+                [
+                    "Measurement: ipeak",
+                    "  step\tMAX(i(lprobe))\tFROM\tTO",
+                    "     1\t58.3693\t0.0006\t0.0007",
+                    "     2\t68.6942\t0.0006\t0.0007",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        payload = server.parseMeasResults(log_path=str(log_path))
+        self.assertEqual(payload["count"], 1)
+        self.assertAlmostEqual(payload["measurements"]["ipeak"], 68.6942, places=6)
+        self.assertEqual(payload["measurement_steps"]["ipeak"][0]["step"], 1)
+        self.assertAlmostEqual(payload["measurement_steps"]["ipeak"][0]["value"], 58.3693, places=6)
+        self.assertEqual(payload["measurement_steps"]["ipeak"][1]["step"], 2)
+        self.assertAlmostEqual(payload["measurement_steps"]["ipeak"][1]["value"], 68.6942, places=6)
+
+    def test_parse_meas_results_preserves_high_precision_text(self) -> None:
+        log_path = self.temp_dir / "meas_precision.log"
+        raw_value = "1.234567890123456e-12"
+        log_path.write_text(
+            "\n".join(
+                [
+                    "Measurement: gain",
+                    f"gain: {raw_value}",
+                    "phase: -3.125m",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        payload = server.parseMeasResults(log_path=str(log_path))
+        self.assertEqual(payload["measurements_text"]["gain"], raw_value)
+        self.assertAlmostEqual(payload["measurements"]["gain"], 1.234567890123456e-12, places=24)
+        self.assertAlmostEqual(payload["measurements"]["phase"], -0.003125, places=12)
+
+    def test_parse_meas_results_ignores_total_elapsed_after_step_table(self) -> None:
+        log_path = self.temp_dir / "meas_elapsed_tail.log"
+        log_path.write_text(
+            "\n".join(
+                [
+                    "Measurement: vout_pp",
+                    "  step\tPP(v(out))\tFROM\tTO",
+                    "     1\t1.70893\t0\t0.005",
+                    "     2\t1.70893\t0\t0.005",
+                    "",
+                    "Total elapsed time: 0.006 seconds.",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        payload = server.parseMeasResults(log_path=str(log_path))
+        self.assertEqual(payload["count"], 1)
+        self.assertAlmostEqual(payload["measurements"]["vout_pp"], 1.70893, places=6)
+        rows = payload["measurement_steps"]["vout_pp"]
+        self.assertEqual(len(rows), 2)
+        self.assertAlmostEqual(rows[0]["value"], 1.70893, places=6)
+        self.assertAlmostEqual(rows[1]["value"], 1.70893, places=6)
+
+    def test_parse_meas_results_step_table_with_axis_column(self) -> None:
+        log_path = self.temp_dir / "meas_step_axis.log"
+        log_path.write_text(
+            "\n".join(
+                [
+                    "Measurement: phase",
+                    "  step\tfreq\tphase",
+                    "     1\t1.00000e+03\t-3.125m",
+                    "     2\t2.00000e+03\t6.250m",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        payload = server.parseMeasResults(log_path=str(log_path))
+        self.assertEqual(payload["count"], 1)
+        self.assertAlmostEqual(payload["measurements"]["phase"], 0.00625, places=12)
+        self.assertEqual(payload["measurements_text"]["phase"], "6.250m")
+        rows = payload["measurement_steps"]["phase"]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["step"], 1)
+        self.assertAlmostEqual(rows[0]["value"], -0.003125, places=12)
+        self.assertEqual(rows[1]["step"], 2)
+        self.assertAlmostEqual(rows[1]["value"], 0.00625, places=12)
+
+    def test_parse_meas_results_inline_expression_value(self) -> None:
+        log_path = self.temp_dir / "meas_inline_expr.log"
+        log_path.write_text(
+            "\n".join(
+                [
+                    "vpp: PP(v(out))=0.731107 FROM 0 TO 0.008",
+                    "mag_1k: mag(v(out))=(-1.44507dB,0deg) at 1000",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        payload = server.parseMeasResults(log_path=str(log_path))
+        self.assertEqual(payload["count"], 2)
+        self.assertAlmostEqual(payload["measurements"]["vpp"], 0.731107, places=6)
+        self.assertAlmostEqual(payload["measurements"]["mag_1k"], -1.44507, places=6)
+        self.assertEqual(payload["measurements_text"]["vpp"], "0.731107")
+        self.assertEqual(payload["measurements_text"]["mag_1k"], "-1.44507dB")
+        self.assertIn("PP(v(out))=0.731107", payload["measurements_display"]["vpp"])
+
+    def test_parse_meas_results_when_expression_uses_at_value(self) -> None:
+        log_path = self.temp_dir / "meas_when_at.log"
+        log_path.write_text(
+            "\n".join(
+                [
+                    "tsettle_up: abs(v(out)-1)-0.02=0 AT 0.00406703",
+                    "tsettle_dn: abs(v(out)-0)-0.02=0 AT 0.00407218",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        payload = server.parseMeasResults(log_path=str(log_path))
+        self.assertEqual(payload["count"], 2)
+        self.assertAlmostEqual(payload["measurements"]["tsettle_up"], 0.00406703, places=9)
+        self.assertAlmostEqual(payload["measurements"]["tsettle_dn"], 0.00407218, places=9)
+        self.assertEqual(payload["measurements_text"]["tsettle_up"], "0.00406703")
+        self.assertEqual(payload["measurements_text"]["tsettle_dn"], "0.00407218")
 
     def test_run_meas_automation_injects_meas_netlist(self) -> None:
         netlist = self.temp_dir / "base.cir"

@@ -26,6 +26,33 @@ _SCALAR_COMPLEX_RE = re.compile(r"^\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)$")
 _STEP_LINE_RE = re.compile(r"^\s*\.step\s+(.+?)\s*$", re.IGNORECASE)
 
 
+def _is_monotonic_non_decreasing(values: list[float]) -> bool:
+    if len(values) < 2:
+        return True
+    for idx in range(1, len(values)):
+        prev = values[idx - 1]
+        curr = values[idx]
+        tol = max(1e-30, abs(prev) * 1e-12, abs(curr) * 1e-12)
+        if curr < prev - tol:
+            return False
+    return True
+
+
+def _normalize_sign_encoded_time_axis(values: list[list[complex]], variables: list[RawVariable]) -> None:
+    if not values or not variables:
+        return
+    first_var = variables[0]
+    if first_var.kind.strip().lower() != "time":
+        return
+    raw_scale = [value.real for value in values[0]]
+    if _is_monotonic_non_decreasing(raw_scale):
+        return
+    abs_scale = [abs(value) for value in raw_scale]
+    if not _is_monotonic_non_decreasing(abs_scale):
+        return
+    values[0] = [complex(value, 0.0) for value in abs_scale]
+
+
 def _find_section_marker(blob: bytes) -> _SectionMarker:
     candidates: list[_SectionMarker] = []
     for label, kind in (("Binary", "binary"), ("Values", "values")):
@@ -290,6 +317,8 @@ def parse_raw_file(path: str | Path) -> RawDataset:
     else:
         section_text = payload.decode(marker.encoding, errors="replace")
         values = _parse_values_section(section_text, num_vars=num_vars, num_points=num_points)
+
+    _normalize_sign_encoded_time_axis(values, variables)
 
     plot_name = metadata.get("Plotname", "Unknown Plot")
     steps = _build_steps(

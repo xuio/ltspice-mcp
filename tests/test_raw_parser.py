@@ -72,6 +72,41 @@ class TestRawParser(unittest.TestCase):
         self.assertAlmostEqual(data.get_vector("time")[1].real, 1.0)
         self.assertAlmostEqual(data.get_vector("V(out)")[1].real, 1.5, places=6)
         self.assertAlmostEqual(data.get_vector("I(R1)")[0].real, -1.0, places=6)
+        self.assertAlmostEqual(data.get_vector("v(out)")[1].real, 1.5, places=6)
+        self.assertAlmostEqual(data.get_vector(" i(r1) ")[0].real, -1.0, places=6)
+
+    def test_parse_binary_real_normalizes_sign_encoded_time_axis(self) -> None:
+        variables = [("time", "time"), ("V(out)", "voltage")]
+        points = [
+            (0.0, 0.0),
+            (1e-9, 0.1),
+            (-0.001, 0.2),
+            (0.002, 0.3),
+            (-0.003, 0.4),
+            (0.004, 0.5),
+        ]
+        payload = bytearray()
+        for row in points:
+            payload.extend(struct.pack("<d", row[0]))
+            payload.extend(struct.pack("<f", row[1]))
+
+        blob = (
+            _build_header(
+                plot="Transient Analysis",
+                flags="real forward",
+                variables=variables,
+                points=len(points),
+                encoding="utf-16le",
+            )
+            + "Binary:\n".encode("utf-16le")
+            + bytes(payload)
+        )
+        path = _write_blob(blob)
+        data = parse_raw_file(path)
+
+        time_values = [value.real for value in data.get_vector("time")]
+        self.assertEqual(time_values, [0.0, 1e-9, 0.001, 0.002, 0.003, 0.004])
+        self.assertTrue(all(time_values[idx] >= time_values[idx - 1] for idx in range(1, len(time_values))))
 
     def test_parse_binary_complex(self) -> None:
         variables = [("frequency", "frequency"), ("V(out)", "voltage")]
