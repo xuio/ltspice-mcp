@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import plistlib
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,7 @@ from unittest.mock import patch
 
 from ltspice_mcp.ltspice import (
     LTspiceRunner,
+    _collect_related_artifacts,
     _write_utf8_log_sidecar,
     analyze_log,
     get_ltspice_version,
@@ -135,6 +137,47 @@ class TestLtspiceLogDiagnostics(unittest.TestCase):
         )
         categories = {item.category for item in run.diagnostics}
         self.assertIn("artifact_stale_or_missing", categories)
+
+    def test_collect_related_artifacts_is_exact_not_prefix_based(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_artifacts_exact_test_"))
+        netlist = temp_dir / "mcp_rc_smoke.cir"
+        netlist.write_text("* test\n.end\n", encoding="utf-8")
+        related_log = temp_dir / "mcp_rc_smoke.log"
+        related_log.write_text("ok\n", encoding="utf-8")
+        unrelated = temp_dir / "mcp_rc_smoke_meas.cir"
+        unrelated.write_text("* unrelated\n.end\n", encoding="utf-8")
+
+        artifacts = _collect_related_artifacts(netlist)
+        artifact_paths = {str(path) for path in artifacts}
+        self.assertIn(str(netlist.resolve()), artifact_paths)
+        self.assertIn(str(related_log.resolve()), artifact_paths)
+        self.assertNotIn(str(unrelated.resolve()), artifact_paths)
+
+    def test_run_file_timeout_is_reported_as_timeout_not_process_error(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_timeout_diag_test_"))
+        executable = temp_dir / "LTspice"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        netlist = temp_dir / "timeout_case.cir"
+        netlist.write_text("* test\n.end\n", encoding="utf-8")
+
+        runner = LTspiceRunner(workdir=temp_dir, executable=executable, default_timeout_seconds=5)
+        with patch(
+            "ltspice_mcp.ltspice.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(
+                cmd=[str(executable), "-b", str(netlist)],
+                timeout=5,
+                output="",
+                stderr="",
+            ),
+        ):
+            run = runner.run_file(netlist, ascii_raw=True, timeout_seconds=5)
+
+        self.assertEqual(run.return_code, -1)
+        self.assertIn("LTspice timed out after 5 seconds.", run.issues)
+        categories = {item.category for item in run.diagnostics}
+        self.assertIn("timeout", categories)
+        self.assertNotIn("process_error", categories)
 
     def test_read_ltspice_window_text_parses_helper_payload(self) -> None:
         with (

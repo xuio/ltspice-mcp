@@ -180,6 +180,19 @@ class TestPlotRenderBackendSelection(unittest.TestCase):
                     settle_seconds=0.0,
                 )
 
+    def test_render_plot_invalid_vector_fails_before_capture(self) -> None:
+        dataset = self._dataset()
+        with (
+            patch("ltspice_mcp.server._resolve_dataset", return_value=dataset),
+            patch("ltspice_mcp.server.capture_ltspice_window_screenshot") as capture_mock,
+        ):
+            with self.assertRaises(ValueError):
+                server.renderLtspicePlotImage(
+                    vectors=["V(nope)"],
+                    settle_seconds=0.0,
+                )
+        capture_mock.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

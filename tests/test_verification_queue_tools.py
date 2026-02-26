@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import json
 import tempfile
 import time
 import unittest
@@ -299,14 +300,126 @@ class TestVerificationAndQueueTools(unittest.TestCase):
         self.assertEqual(payload["count"], 0)
         self.assertEqual(payload["measurements"], {})
 
+    def test_register_run_snapshots_artifacts_for_immutable_history(self) -> None:
+        netlist = self.temp_dir / "mutable.cir"
+        netlist.write_text(
+            "\n".join(
+                [
+                    "* mutable run test",
+                    ".meas tran vout_max max V(out)",
+                    ".end",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        log_path = self.temp_dir / "mutable.log"
+        log_path.write_text("vout_max: MAX(v(out))=3.09171\n", encoding="utf-8")
+        raw_path = self.temp_dir / "mutable.raw"
+        raw_path.write_text("raw-a\n", encoding="utf-8")
+        run = SimulationRun(
+            run_id="immutable-a",
+            netlist_path=netlist,
+            command=["LTspice", "-b", str(netlist)],
+            ltspice_executable=Path("/Applications/LTspice.app/Contents/MacOS/LTspice"),
+            started_at=datetime.now().astimezone().isoformat(),
+            duration_seconds=0.1,
+            return_code=0,
+            stdout="",
+            stderr="",
+            log_path=log_path,
+            log_utf8_path=None,
+            raw_files=[raw_path],
+            artifacts=[netlist, log_path, raw_path],
+            issues=[],
+            warnings=[],
+            diagnostics=[],
+        )
+        server._register_run(run)
+
+        # Simulate a later run mutating basename artifacts in-place.
+        log_path.write_text("vout_max: MAX(v(out))=1.00845\n", encoding="utf-8")
+        raw_path.write_text("raw-b\n", encoding="utf-8")
+
+        payload = server.parseMeasResults(run_id="immutable-a")
+        self.assertEqual(payload["count"], 1)
+        self.assertAlmostEqual(payload["measurements"]["vout_max"], 3.09171, places=6)
+        snap_run = server._resolve_run("immutable-a")
+        self.assertIn("run_artifacts/immutable-a", str(snap_run.log_path))
+        self.assertIn("run_artifacts/immutable-a", str(snap_run.netlist_path))
+        details = server.getRunDetails(run_id="immutable-a", include_output=False)
+        self.assertIn("3.09171", details["log_tail"])
+        self.assertNotIn("1.00845", details["log_tail"])
+
+    def test_load_run_state_migrates_legacy_paths_to_snapshots(self) -> None:
+        netlist = self.temp_dir / "legacy.cir"
+        netlist.write_text(
+            "\n".join(
+                [
+                    "* legacy run",
+                    ".meas tran vout_max max V(out)",
+                    ".end",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        log_path = self.temp_dir / "legacy.log"
+        log_path.write_text("vout_max: MAX(v(out))=2.5\n", encoding="utf-8")
+        raw_path = self.temp_dir / "legacy.raw"
+        raw_path.write_text("legacy-raw-a\n", encoding="utf-8")
+        legacy_run = SimulationRun(
+            run_id="legacy-run",
+            netlist_path=netlist,
+            command=["LTspice", "-b", str(netlist)],
+            ltspice_executable=Path("/Applications/LTspice.app/Contents/MacOS/LTspice"),
+            started_at=datetime.now().astimezone().isoformat(),
+            duration_seconds=0.1,
+            return_code=0,
+            stdout="",
+            stderr="",
+            log_path=log_path,
+            log_utf8_path=None,
+            raw_files=[raw_path],
+            artifacts=[netlist, log_path, raw_path],
+            issues=[],
+            warnings=[],
+            diagnostics=[],
+        )
+        state_path = self.temp_dir / ".ltspice_mcp_runs.json"
+        state_path.write_text(
+            json.dumps({"version": 1, "runs": [legacy_run.to_storage_dict()]}, indent=2),
+            encoding="utf-8",
+        )
+
+        server._configure_runner(workdir=self.temp_dir, ltspice_binary=None, timeout=10)
+        loaded = server._resolve_run("legacy-run")
+        self.assertIn("run_artifacts/legacy-run", str(loaded.netlist_path))
+        self.assertIn("run_artifacts/legacy-run", str(loaded.log_path))
+
+        # Mutate original basename artifacts; loaded run must remain immutable.
+        log_path.write_text("vout_max: MAX(v(out))=9.9\n", encoding="utf-8")
+        raw_path.write_text("legacy-raw-b\n", encoding="utf-8")
+        parsed = server.parseMeasResults(run_id="legacy-run")
+        self.assertEqual(parsed["count"], 1)
+        self.assertAlmostEqual(parsed["measurements"]["vout_max"], 2.5, places=6)
+
+        persisted = json.loads(state_path.read_text(encoding="utf-8"))
+        run_entry = persisted["runs"][0]
+        self.assertIn("run_artifacts/legacy-run", run_entry["netlist_path"])
+        self.assertIn("run_artifacts/legacy-run", run_entry["log_path"])
+
     def test_run_process_simulation_with_cancel_uses_subprocess_module(self) -> None:
         class _FakeProc:
-            def __init__(self) -> None:
+            def __init__(self, *, log_target: Path) -> None:
                 self._poll_calls = 0
                 self.returncode = 0
+                self._log_target = log_target
 
             def poll(self):  # noqa: ANN001
                 self._poll_calls += 1
+                if self._poll_calls == 2:
+                    self._log_target.write_text("ok\n", encoding="utf-8")
                 return None if self._poll_calls == 1 else self.returncode
 
             def communicate(self):  # noqa: ANN001
@@ -323,7 +436,7 @@ class TestVerificationAndQueueTools(unittest.TestCase):
 
         netlist = self.temp_dir / "queue_subprocess.cir"
         netlist.write_text("* queue subprocess\n.end\n", encoding="utf-8")
-        fake_proc = _FakeProc()
+        fake_proc = _FakeProc(log_target=netlist.with_suffix(".log"))
         with (
             patch.object(
                 server._runner,
@@ -344,6 +457,9 @@ class TestVerificationAndQueueTools(unittest.TestCase):
         self.assertEqual(run.command[0], "/Applications/LTspice.app/Contents/MacOS/LTspice")
         self.assertEqual(run.command[1], "-b")
         self.assertEqual(Path(run.command[2]).resolve(), netlist.resolve())
+        self.assertIsNotNone(run.log_utf8_path)
+        self.assertTrue(run.log_utf8_path is not None and run.log_utf8_path.exists())
+        self.assertIn(run.log_utf8_path, run.artifacts)
         popen_mock.assert_called_once()
 
     def test_run_simulation_with_ui_applies_timeout_margin(self) -> None:
@@ -374,9 +490,11 @@ class TestVerificationAndQueueTools(unittest.TestCase):
     def test_run_meas_automation_injects_meas_netlist(self) -> None:
         netlist = self.temp_dir / "base.cir"
         netlist.write_text("* base\nR1 in out 1k\n.end\n", encoding="utf-8")
+        resolved_run = _make_run(self.temp_dir, run_id="run-meas")
         with (
             patch("ltspice_mcp.server.simulateNetlistFile") as simulate_mock,
             patch("ltspice_mcp.server.parseMeasResults") as parse_mock,
+            patch("ltspice_mcp.server._resolve_run", return_value=resolved_run),
         ):
             simulate_mock.return_value = {"run_id": "run-meas", "succeeded": True}
             parse_mock.return_value = {
@@ -400,6 +518,74 @@ class TestVerificationAndQueueTools(unittest.TestCase):
         self.assertEqual(payload["measurements"]["measurements"]["gain"], 1.23)
         simulate_mock.assert_called_once()
         parse_mock.assert_called_once()
+
+    def test_run_meas_automation_reports_failed_requested_measurements(self) -> None:
+        netlist = self.temp_dir / "meas_fail_base.cir"
+        netlist.write_text(
+            "\n".join(
+                [
+                    "* meas fail base",
+                    ".meas tran good FIND V(out) AT=5u",
+                    ".meas tran bad FIND V(nope) AT=5u",
+                    ".end",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        run = _make_run(self.temp_dir, run_id="run-meas-fail")
+        run.netlist_path.write_text(
+            "\n".join(
+                [
+                    "* synthetic run netlist",
+                    ".meas tran good FIND V(out) AT=5u",
+                    ".meas tran bad FIND V(nope) AT=5u",
+                    ".end",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        assert run.log_path is not None
+        run.log_path.write_text(
+            "\n".join(
+                [
+                    'Measurement "bad" FAIL\'ed: no such vector',
+                    "Measurement: good",
+                    "good: 1.234",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        server._register_run(run)
+        with patch(
+            "ltspice_mcp.server.simulateNetlistFile",
+            return_value={
+                "run_id": run.run_id,
+                "succeeded": True,
+                "issues": [],
+                "warnings": [],
+            },
+        ):
+            payload = server.runMeasAutomation(
+                measurements=[
+                    ".meas tran bad FIND V(nope) AT=5u",
+                    ".meas tran good FIND V(out) AT=5u",
+                ],
+                netlist_path=str(netlist),
+            )
+
+        self.assertFalse(payload["requested_measurements_succeeded"])
+        self.assertFalse(payload["run"]["requested_measurements_succeeded"])
+        self.assertTrue(payload["run"]["simulation_succeeded"])
+        self.assertFalse(payload["run"]["succeeded"])
+        failed = payload["failed_measurements"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["name"], "bad")
+        self.assertIn("no such vector", str(failed[0].get("reason", "")))
+        self.assertEqual(payload["missing_requested_measurements"], [])
+        self.assertIn("bad", " ".join(payload["run"]["issues"]).lower())
 
     def test_run_verification_plan_supports_vector_and_meas_checks(self) -> None:
         run = _make_run(self.temp_dir, run_id="verify-run")
@@ -715,6 +901,153 @@ class TestVerificationAndQueueTools(unittest.TestCase):
         self.assertEqual([row["metric_value"] for row in payload["records"]], [2.0, 4.0])
         self.assertAlmostEqual(payload["aggregate"]["mean"], 3.0)
 
+    def test_run_sweep_study_step_mode_operating_point_fallback_aligns_points(self) -> None:
+        netlist = self.temp_dir / "step_study_op.cir"
+        netlist.write_text("* step study op\nR1 in out 1k\n.end\n", encoding="utf-8")
+        run = _make_run(self.temp_dir, run_id="step-op-run")
+        dataset = RawDataset(
+            path=self.temp_dir / "step_op.raw",
+            plot_name="Operating Point",
+            flags={"stepped"},
+            metadata={},
+            variables=[
+                RawVariable(index=0, name="rval", kind="param"),
+                RawVariable(index=1, name="V(out)", kind="voltage"),
+            ],
+            values=[
+                [1000.0 + 0j, 2000.0 + 0j, 4000.0 + 0j],
+                [5.0 + 0j, 3.333333333333 + 0j, 2.0 + 0j],
+            ],
+            steps=[RawStep(index=0, start=0, end=3, label=None)],
+        )
+        with (
+            patch(
+                "ltspice_mcp.server.simulateNetlistFile",
+                return_value={"run_id": run.run_id, "succeeded": True},
+            ),
+            patch("ltspice_mcp.server._resolve_run", return_value=run),
+            patch("ltspice_mcp.server._resolve_dataset", return_value=dataset),
+        ):
+            payload = server.runSweepStudy(
+                parameter="RVAL",
+                mode="step",
+                netlist_path=str(netlist),
+                values=["1k", "2k", "4k"],
+                metric_vector="V(out)",
+                metric_statistic="final",
+            )
+
+        self.assertEqual(payload["record_count"], 3)
+        self.assertEqual([row["parameter_value"] for row in payload["records"]], [1000.0, 2000.0, 4000.0])
+        self.assertAlmostEqual(payload["records"][0]["metric_value"], 5.0, places=6)
+        self.assertAlmostEqual(payload["records"][1]["metric_value"], 3.333333333333, places=6)
+        self.assertAlmostEqual(payload["records"][2]["metric_value"], 2.0, places=6)
+        self.assertEqual(
+            [row["step_label"] for row in payload["records"]],
+            ["RVAL=1000", "RVAL=2000", "RVAL=4000"],
+        )
+
+    def test_run_sweep_study_step_mode_accepts_engineering_range_tokens(self) -> None:
+        netlist = self.temp_dir / "step_study_eng_range.cir"
+        netlist.write_text("* step study\nR1 in out 1k\n.end\n", encoding="utf-8")
+        run = _make_run(self.temp_dir, run_id="step-eng-range")
+        dataset = RawDataset(
+            path=self.temp_dir / "step_eng_range.raw",
+            plot_name="Transient Analysis",
+            flags={"stepped"},
+            metadata={},
+            variables=[
+                RawVariable(index=0, name="time", kind="time"),
+                RawVariable(index=1, name="V(out)", kind="voltage"),
+            ],
+            values=[
+                [0.0 + 0j, 1.0 + 0j, 0.0 + 0j, 1.0 + 0j],
+                [1.0 + 0j, 2.0 + 0j, 3.0 + 0j, 4.0 + 0j],
+            ],
+            steps=[
+                RawStep(index=0, start=0, end=2, label="R=1k"),
+                RawStep(index=1, start=2, end=4, label="R=2k"),
+            ],
+        )
+        captured_step_netlist: list[Path] = []
+        with (
+            patch(
+                "ltspice_mcp.server.simulateNetlistFile",
+                side_effect=lambda netlist_path, **kwargs: (
+                    captured_step_netlist.append(Path(str(netlist_path)).expanduser().resolve()),
+                    {"run_id": run.run_id, "succeeded": True},
+                )[1],
+            ),
+            patch("ltspice_mcp.server._resolve_run", return_value=run),
+            patch("ltspice_mcp.server._resolve_dataset", return_value=dataset),
+        ):
+            payload = server.runSweepStudy(
+                parameter="RVAL",
+                mode="step",
+                netlist_path=str(netlist),
+                start="1k",
+                stop="2k",
+                step="1k",
+                metric_vector="V(out)",
+                metric_statistic="final",
+            )
+
+        self.assertEqual(payload["record_count"], 2)
+        self.assertEqual([row["parameter_value"] for row in payload["records"]], [1000.0, 2000.0])
+        self.assertEqual(len(captured_step_netlist), 1)
+        stepped_text = captured_step_netlist[0].read_text(encoding="utf-8").lower()
+        self.assertIn(".step param rval list 1000 2000", stepped_text)
+
+    def test_run_sweep_study_step_mode_accepts_scalar_values_string(self) -> None:
+        netlist = self.temp_dir / "step_study_eng_values.cir"
+        netlist.write_text("* step study\nR1 in out 1k\n.end\n", encoding="utf-8")
+        run = _make_run(self.temp_dir, run_id="step-eng-values")
+        dataset = RawDataset(
+            path=self.temp_dir / "step_eng_values.raw",
+            plot_name="Transient Analysis",
+            flags={"stepped"},
+            metadata={},
+            variables=[
+                RawVariable(index=0, name="time", kind="time"),
+                RawVariable(index=1, name="V(out)", kind="voltage"),
+            ],
+            values=[
+                [0.0 + 0j, 1.0 + 0j, 0.0 + 0j, 1.0 + 0j, 0.0 + 0j, 1.0 + 0j],
+                [1.0 + 0j, 2.0 + 0j, 3.0 + 0j, 4.0 + 0j, 5.0 + 0j, 6.0 + 0j],
+            ],
+            steps=[
+                RawStep(index=0, start=0, end=2, label="R=1k"),
+                RawStep(index=1, start=2, end=4, label="R=2k"),
+                RawStep(index=2, start=4, end=6, label="R=4k"),
+            ],
+        )
+        captured_step_netlist: list[Path] = []
+        with (
+            patch(
+                "ltspice_mcp.server.simulateNetlistFile",
+                side_effect=lambda netlist_path, **kwargs: (
+                    captured_step_netlist.append(Path(str(netlist_path)).expanduser().resolve()),
+                    {"run_id": run.run_id, "succeeded": True},
+                )[1],
+            ),
+            patch("ltspice_mcp.server._resolve_run", return_value=run),
+            patch("ltspice_mcp.server._resolve_dataset", return_value=dataset),
+        ):
+            payload = server.runSweepStudy(
+                parameter="RVAL",
+                mode="step",
+                netlist_path=str(netlist),
+                values="1k,2k,4k",
+                metric_vector="V(out)",
+                metric_statistic="final",
+            )
+
+        self.assertEqual(payload["record_count"], 3)
+        self.assertEqual([row["parameter_value"] for row in payload["records"]], [1000.0, 2000.0, 4000.0])
+        self.assertEqual(len(captured_step_netlist), 1)
+        stepped_text = captured_step_netlist[0].read_text(encoding="utf-8").lower()
+        self.assertIn(".step param rval list 1000 2000 4000", stepped_text)
+
     def test_run_sweep_study_monte_carlo_mode(self) -> None:
         netlist = self.temp_dir / "mc_study.cir"
         netlist.write_text("* mc study\nR1 in out {RVAL}\n.end\n", encoding="utf-8")
@@ -757,6 +1090,51 @@ class TestVerificationAndQueueTools(unittest.TestCase):
         self.assertEqual(payload["record_count"], 3)
         self.assertTrue(all(item["metric_value"] == 1.1 for item in payload["records"]))
         self.assertAlmostEqual(payload["aggregate"]["mean"], 1.1)
+
+    def test_run_sweep_study_monte_carlo_replaces_existing_param(self) -> None:
+        netlist = self.temp_dir / "mc_param_replace.cir"
+        netlist.write_text(
+            "\n".join(
+                [
+                    "* mc replace test",
+                    ".param RVAL=1000",
+                    "V1 in 0 1",
+                    "R1 in out {RVAL}",
+                    ".tran 0 1m",
+                    ".end",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        captured_paths: list[Path] = []
+        with (
+            patch(
+                "ltspice_mcp.server.simulateNetlistFile",
+                side_effect=lambda netlist_path, **kwargs: (
+                    captured_paths.append(Path(str(netlist_path)).expanduser().resolve()),
+                    {"run_id": f"mc-replace-{len(captured_paths)}", "succeeded": False, "issues": []},
+                )[1],
+            ),
+            patch(
+                "ltspice_mcp.server._resolve_run",
+                return_value=_make_run(self.temp_dir, run_id="mc-replace"),
+            ),
+        ):
+            payload = server.runSweepStudy(
+                parameter="RVAL",
+                mode="monte_carlo",
+                netlist_path=str(netlist),
+                samples=3,
+                nominal=1000.0,
+                sigma_pct=5.0,
+            )
+
+        self.assertEqual(payload["record_count"], 3)
+        self.assertEqual(len(captured_paths), 3)
+        for candidate in captured_paths:
+            text = candidate.read_text(encoding="utf-8")
+            self.assertEqual(text.lower().count(".param rval="), 1)
 
     def test_auto_clean_and_visual_inspection_tools(self) -> None:
         asc = self.temp_dir / "messy.asc"
@@ -867,6 +1245,73 @@ class TestVerificationAndQueueTools(unittest.TestCase):
 
         canceled = server.cancelJob(job_id=job_id)
         self.assertEqual(canceled["status"], "canceled")
+
+    def test_queue_job_uses_submission_snapshot_even_if_source_changes(self) -> None:
+        netlist = self.temp_dir / "queued_snapshot_clean.cir"
+        netlist.write_text(
+            "\n".join(
+                [
+                    "* queued snapshot clean VERSION_A",
+                    "V1 in 0 10",
+                    "R1 in out 1k",
+                    "R2 out 0 1k",
+                    ".op",
+                    ".end",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with patch("ltspice_mcp.server._ensure_job_worker", return_value=None):
+            queued = server.queueSimulationJob(netlist_path=str(netlist), priority=10, max_retries=0)
+
+        run_path = Path(str(queued["run_path"])).expanduser().resolve()
+        self.assertTrue(run_path.exists())
+        self.assertNotEqual(run_path, netlist.resolve())
+        self.assertIn("VERSION_A", run_path.read_text(encoding="utf-8"))
+
+        # Mutate the original source after queue submission; the queued run must
+        # continue to use the immutable snapshot captured at submission time.
+        netlist.write_text(
+            "\n".join(
+                [
+                    "* queued snapshot clean VERSION_B",
+                    "V1 in 0 10",
+                    "R1 in out 2k",
+                    "R2 out 0 1k",
+                    ".op",
+                    ".end",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        observed: dict[str, str] = {}
+
+        def fake_run(*, netlist_path: Path, ascii_raw: bool, timeout_seconds: int | None, cancel_requested):
+            observed["path"] = str(netlist_path)
+            observed["text"] = netlist_path.read_text(encoding="utf-8")
+            run = _make_run(self.temp_dir, run_id="queued-snapshot-run")
+            run.netlist_path = netlist_path
+            run.command = ["/Applications/LTspice.app/Contents/MacOS/LTspice", "-b", str(netlist_path)]
+            return run, False
+
+        with patch("ltspice_mcp.server._run_process_simulation_with_cancel", side_effect=fake_run):
+            server._ensure_job_worker()
+            deadline = time.time() + 8.0
+            while time.time() < deadline:
+                status = server.jobStatus(queued["job_id"], include_run=False)
+                if status["status"] in {"succeeded", "failed", "canceled"}:
+                    break
+                time.sleep(0.05)
+
+        final_status = server.jobStatus(queued["job_id"], include_run=False)
+        self.assertEqual(final_status["status"], "succeeded")
+        self.assertEqual(Path(observed["path"]).expanduser().resolve(), run_path)
+        self.assertIn("VERSION_A", observed["text"])
+        self.assertNotIn("VERSION_B", observed["text"])
 
     def test_queue_priority_controls_dispatch_order(self) -> None:
         low_path = self.temp_dir / "low_priority.cir"

@@ -235,6 +235,52 @@ class TestRawParser(unittest.TestCase):
         self.assertEqual(len(data.scale_values(step_index=0)), 3)
         self.assertAlmostEqual(data.get_vector("V(out)", step_index=1)[0].real, 10.0, places=6)
 
+    def test_parse_stepped_operating_point_with_log_fallback(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_raw_test_op_step_"))
+        path = temp_dir / "op_step_case.op.raw"
+        variables = [("rval", "param"), ("V(out)", "voltage")]
+        points = [
+            (1000.0, 5.0),
+            (2000.0, 3.333333333333),
+            (4000.0, 2.0),
+        ]
+        payload = bytearray()
+        for row in points:
+            payload.extend(struct.pack("<d", row[0]))
+            payload.extend(struct.pack("<f", row[1]))
+
+        blob = (
+            _build_header(
+                plot="Operating Point",
+                flags="real forward stepped",
+                variables=variables,
+                points=len(points),
+                encoding="utf-16le",
+            )
+            + "Binary:\n".encode("utf-16le")
+            + bytes(payload)
+        )
+        path.write_bytes(blob)
+        # .op.raw datasets often keep the simulation log as "<stem>.log".
+        (temp_dir / "op_step_case.log").write_text(
+            "\n".join(
+                [
+                    "Step Information: RVAL=1000 (Run: 1/3)",
+                    "Step Information: RVAL=2000 (Run: 2/3)",
+                    "Step Information: RVAL=4000 (Run: 3/3)",
+                ]
+            )
+            + "\n",
+            encoding="utf-16le",
+        )
+
+        data = parse_raw_file(path)
+        self.assertEqual(data.step_count, 3)
+        self.assertEqual([step.label for step in data.steps], ["RVAL=1000", "RVAL=2000", "RVAL=4000"])
+        self.assertAlmostEqual(data.get_vector("V(out)", step_index=0)[0].real, 5.0, places=6)
+        self.assertAlmostEqual(data.get_vector("V(out)", step_index=1)[0].real, 3.3333333, places=5)
+        self.assertAlmostEqual(data.get_vector("V(out)", step_index=2)[0].real, 2.0, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

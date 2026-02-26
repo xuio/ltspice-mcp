@@ -50,6 +50,7 @@ from .ltspice import (
     _is_simulation_output_artifact,
     _purge_previous_simulation_outputs,
     _resolve_log_path,
+    _write_utf8_log_sidecar,
     analyze_log,
     capture_ltspice_window_screenshot,
     close_ltspice_window,
@@ -645,6 +646,250 @@ def _save_run_state() -> None:
     tmp_path.replace(_state_path)
 
 
+def _snapshot_run_artifacts(run: SimulationRun) -> SimulationRun:
+    snapshot_root = (_runner.workdir / "run_artifacts" / run.run_id).resolve()
+    snapshot_root.mkdir(parents=True, exist_ok=True)
+
+    source_order: list[Path] = []
+
+    def _enqueue(path: Path | None) -> None:
+        if path is None:
+            return
+        resolved = Path(path).expanduser().resolve()
+        if not resolved.exists() or not resolved.is_file():
+            return
+        source_order.append(resolved)
+
+    _enqueue(run.netlist_path)
+    _enqueue(run.log_path)
+    _enqueue(run.log_utf8_path)
+    for raw_path in run.raw_files:
+        _enqueue(raw_path)
+    for artifact_path in run.artifacts:
+        _enqueue(artifact_path)
+
+    copied_map: dict[Path, Path] = {}
+    copy_failures: list[str] = []
+    seen_sources: set[Path] = set()
+    for source in source_order:
+        if source in seen_sources:
+            continue
+        seen_sources.add(source)
+        destination = snapshot_root / source.name
+        if destination.exists():
+            if destination.resolve() != source:
+                destination = snapshot_root / f"{source.stem}_{len(copied_map) + 1}{source.suffix}"
+            else:
+                copied_map[source] = destination
+                continue
+        try:
+            shutil.copy2(source, destination)
+            copied_map[source] = destination.resolve()
+        except Exception as exc:  # noqa: BLE001
+            copy_failures.append(f"{source}: {exc}")
+
+    def _map(path: Path | None) -> Path | None:
+        if path is None:
+            return None
+        resolved = Path(path).expanduser().resolve()
+        return copied_map.get(resolved, resolved if resolved.exists() else None)
+
+    mapped_netlist = _map(run.netlist_path)
+    if mapped_netlist is not None:
+        run.netlist_path = mapped_netlist
+    run.log_path = _map(run.log_path)
+    run.log_utf8_path = _map(run.log_utf8_path)
+    run.raw_files = [mapped for path in run.raw_files if (mapped := _map(path)) is not None]
+
+    merged_artifacts: list[Path] = []
+    seen_artifacts: set[Path] = set()
+    for candidate in [
+        run.netlist_path,
+        run.log_path,
+        run.log_utf8_path,
+        *run.raw_files,
+        *run.artifacts,
+    ]:
+        mapped = _map(candidate) if isinstance(candidate, Path) else None
+        if mapped is None:
+            continue
+        if mapped in seen_artifacts:
+            continue
+        seen_artifacts.add(mapped)
+        merged_artifacts.append(mapped)
+    run.artifacts = merged_artifacts
+
+    if copy_failures:
+        run.warnings.append(
+            "Failed to snapshot some run artifacts for immutable history: " + "; ".join(copy_failures[:3])
+        )
+    return run
+
+
+def _run_uses_snapshot_paths(run: SimulationRun) -> bool:
+    snapshot_root = (_runner.workdir / "run_artifacts" / run.run_id).resolve()
+    tracked_paths: list[Path] = [run.netlist_path, *run.raw_files, *run.artifacts]
+    if run.log_path is not None:
+        tracked_paths.append(run.log_path)
+    if run.log_utf8_path is not None:
+        tracked_paths.append(run.log_utf8_path)
+    existing: list[Path] = []
+    for path in tracked_paths:
+        try:
+            resolved = Path(path).expanduser().resolve()
+        except Exception:  # noqa: BLE001
+            continue
+        if resolved.exists():
+            existing.append(resolved)
+    if not existing:
+        return False
+    return all(candidate == snapshot_root or snapshot_root in candidate.parents for candidate in existing)
+
+
+_NETLIST_INCLUDE_DIRECTIVE_RE = re.compile(
+    r"^(?P<prefix>\s*\.(?:include|inc|lib)\s+)"
+    r"(?P<path>\"[^\"]+\"|'[^']+'|[^\s;]+)"
+    r"(?P<suffix>.*)$",
+    re.IGNORECASE,
+)
+
+
+def _parse_netlist_include_directive(line: str) -> tuple[str, str, str] | None:
+    stripped = line.lstrip()
+    if not stripped or stripped.startswith("*") or stripped.startswith(";"):
+        return None
+    match = _NETLIST_INCLUDE_DIRECTIVE_RE.match(line)
+    if not match:
+        return None
+    token = match.group("path").strip()
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in {'"', "'"}:
+        token = token[1:-1]
+    if not token:
+        return None
+    return match.group("prefix"), token, match.group("suffix")
+
+
+def _resolve_include_token_path(*, owner_path: Path, token: str) -> Path:
+    include_path = Path(token).expanduser()
+    if include_path.is_absolute():
+        return include_path.resolve()
+    return (owner_path.parent / include_path).resolve()
+
+
+def _collect_netlist_dependency_files(entry_path: Path) -> tuple[list[Path], list[str]]:
+    warnings: list[str] = []
+    discovered: list[Path] = []
+    visited: set[Path] = set()
+    queue_paths: deque[Path] = deque([entry_path.expanduser().resolve()])
+    max_files = 512
+
+    while queue_paths:
+        current = queue_paths.popleft().resolve()
+        if current in visited:
+            continue
+        visited.add(current)
+        if len(visited) > max_files:
+            warnings.append(
+                f"Dependency scan exceeded {max_files} files; additional .include/.lib files were skipped."
+            )
+            break
+        if not current.exists():
+            warnings.append(f"Missing dependency file: {current}")
+            continue
+        if not current.is_file():
+            warnings.append(f"Dependency is not a file: {current}")
+            continue
+        discovered.append(current)
+        try:
+            text = read_text_auto(current)
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"Could not read dependency file {current}: {exc}")
+            continue
+        for raw_line in text.splitlines():
+            parsed = _parse_netlist_include_directive(raw_line)
+            if parsed is None:
+                continue
+            _prefix, token, _suffix = parsed
+            resolved = _resolve_include_token_path(owner_path=current, token=token)
+            if not resolved.exists():
+                warnings.append(
+                    f"Unresolved include in {current.name}: {token} -> {resolved}"
+                )
+                continue
+            if resolved not in visited:
+                queue_paths.append(resolved)
+    return discovered, warnings
+
+
+def _snapshot_job_source_netlist(*, source_path: Path, job_id: str) -> dict[str, Any]:
+    source = source_path.expanduser().resolve()
+    if not source.exists():
+        raise FileNotFoundError(f"Netlist file not found: {source}")
+    if not source.is_file():
+        raise ValueError(f"Netlist source is not a file: {source}")
+
+    files, warnings = _collect_netlist_dependency_files(source)
+    if source not in files:
+        files.insert(0, source)
+    parent_paths = [str(path.parent) for path in files]
+    anchor = Path(os.path.commonpath(parent_paths)).resolve() if parent_paths else source.parent.resolve()
+
+    snapshot_root = (_runner.workdir / "queued_sources" / job_id).resolve()
+    input_root = (snapshot_root / "input").resolve()
+    if snapshot_root.exists():
+        shutil.rmtree(snapshot_root, ignore_errors=True)
+    input_root.mkdir(parents=True, exist_ok=True)
+
+    mapped_paths: dict[Path, Path] = {}
+    for original in files:
+        relative = original.relative_to(anchor)
+        destination = (input_root / relative).resolve()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(original, destination)
+        mapped_paths[original] = destination
+
+    rewritten_lines = 0
+    for original, copied in mapped_paths.items():
+        try:
+            source_text = read_text_auto(original)
+        except Exception:  # noqa: BLE001
+            continue
+        has_trailing_newline = source_text.endswith("\n")
+        changed = False
+        updated: list[str] = []
+        for raw_line in source_text.splitlines():
+            parsed = _parse_netlist_include_directive(raw_line)
+            if parsed is None:
+                updated.append(raw_line)
+                continue
+            prefix, token, suffix = parsed
+            resolved = _resolve_include_token_path(owner_path=original, token=token)
+            mapped = mapped_paths.get(resolved)
+            if mapped is None:
+                updated.append(raw_line)
+                continue
+            rewritten = f'{prefix}"{mapped}"{suffix}'
+            if rewritten != raw_line:
+                changed = True
+                rewritten_lines += 1
+            updated.append(rewritten)
+        if changed:
+            output = "\n".join(updated)
+            if has_trailing_newline:
+                output += "\n"
+            copied.write_text(output, encoding="utf-8")
+
+    run_path = mapped_paths[source]
+    return {
+        "source_path": str(source),
+        "run_path": str(run_path),
+        "snapshot_root": str(snapshot_root),
+        "file_count": len(mapped_paths),
+        "rewritten_include_lines": rewritten_lines,
+        "warnings": warnings,
+    }
+
+
 def _next_job_seq() -> int:
     global _job_seq
     _job_seq += 1
@@ -709,6 +954,7 @@ def _load_job_state() -> None:
         ordered_ids = [str(item) for item in payload["job_order"] if isinstance(item, str)]
 
     loaded: dict[str, dict[str, Any]] = {}
+    migrated = False
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -723,6 +969,14 @@ def _load_job_state() -> None:
         job["max_retries"] = max(0, int(job.get("max_retries", 0)))
         job["retry_count"] = max(0, int(job.get("retry_count", 0)))
         job["created_at"] = str(job.get("created_at") or _now_iso())
+        run_path_raw = str(job.get("run_path", "")).strip()
+        if run_path_raw:
+            try:
+                job["run_path"] = str(Path(run_path_raw).expanduser().resolve())
+            except Exception:
+                job["run_path"] = ""
+        else:
+            job["run_path"] = ""
         if job["status"] not in _JOB_TERMINAL_STATUSES:
             # Jobs that were queued/running before daemon restart resume from queue.
             job["status"] = "queued"
@@ -730,6 +984,26 @@ def _load_job_state() -> None:
             job["finished_at"] = None
             if not job["cancel_requested"]:
                 job["summary"] = "Resumed from persisted queue state."
+            if str(job.get("kind", "")).lower() == "netlist":
+                run_path = Path(str(job.get("run_path", ""))).expanduser().resolve() if job.get("run_path") else None
+                if run_path is None or not run_path.exists():
+                    source_path = Path(str(job.get("source_path", ""))).expanduser().resolve()
+                    if source_path.exists():
+                        try:
+                            snapshot = _snapshot_job_source_netlist(source_path=source_path, job_id=job_id)
+                            job["run_path"] = str(snapshot["run_path"])
+                            job["source_snapshot_root"] = snapshot["snapshot_root"]
+                            job["source_snapshot_file_count"] = int(snapshot["file_count"])
+                            job["source_snapshot_rewritten_include_lines"] = int(
+                                snapshot["rewritten_include_lines"]
+                            )
+                            job["source_snapshot_warnings"] = list(snapshot["warnings"])
+                            migrated = True
+                        except Exception as exc:  # noqa: BLE001
+                            job["source_snapshot_warnings"] = [
+                                *list(job.get("source_snapshot_warnings") or []),
+                                f"Could not rebuild queued snapshot on restart: {exc}",
+                            ]
         loaded[job_id] = job
 
     for job_id in ordered_ids:
@@ -750,6 +1024,8 @@ def _load_job_state() -> None:
                 continue
             if str(job.get("status", "")).lower() == "queued":
                 _enqueue_job_locked(job_id)
+    if migrated:
+        _save_job_state()
 
 
 def _trim_job_history_locked() -> None:
@@ -835,6 +1111,7 @@ def _load_run_state() -> None:
     if not isinstance(entries, list):
         return
 
+    migrated = False
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -842,11 +1119,17 @@ def _load_run_state() -> None:
             run = SimulationRun.from_storage_dict(entry)
         except Exception:
             continue
+        if not _run_uses_snapshot_paths(run):
+            run = _snapshot_run_artifacts(run)
+            migrated = True
         _runs[run.run_id] = run
         _run_order.append(run.run_id)
+    if migrated:
+        _save_run_state()
 
 
 def _register_run(run: SimulationRun) -> SimulationRun:
+    run = _snapshot_run_artifacts(run)
     _runs[run.run_id] = run
     _run_order.append(run.run_id)
     _save_run_state()
@@ -1671,6 +1954,29 @@ def _step_payload(dataset: RawDataset, step_index: int | None) -> dict[str, Any]
     }
 
 
+def _validate_vectors_exist(
+    *,
+    dataset: RawDataset,
+    vectors: list[str],
+    step_index: int | None,
+) -> None:
+    missing: list[str] = []
+    for vector in vectors:
+        try:
+            dataset.get_vector(vector, step_index=step_index)
+        except KeyError:
+            missing.append(vector)
+    if not missing:
+        return
+    available = sorted(variable.name for variable in dataset.variables)
+    preview = ", ".join(available[:10]) + (" ..." if len(available) > 10 else "")
+    raise ValueError(
+        "Unknown vector(s): "
+        + ", ".join(missing)
+        + (f". Available vectors: {preview}" if preview else ".")
+    )
+
+
 def _run_payload(run: SimulationRun, *, include_output: bool, log_tail_lines: int) -> dict[str, Any]:
     payload = run.as_dict(include_output=include_output)
     payload["log_tail"] = tail_text_file(run.log_path, max_lines=log_tail_lines)
@@ -1725,6 +2031,40 @@ def _append_unique_lines_before_end(text: str, lines_to_add: list[str]) -> str:
         lines[end_index:end_index] = additions
     out = "\n".join(lines).rstrip() + "\n"
     return out
+
+
+def _inject_or_replace_param_line(
+    *,
+    netlist_text: str,
+    param_name: str,
+    param_value: float,
+) -> tuple[str, bool]:
+    safe_name = param_name.strip()
+    if not safe_name:
+        raise ValueError("param_name must not be empty")
+    assignment_value = f"{float(param_value):.12g}"
+    assignment_pattern = re.compile(
+        rf"(?i)(\b{re.escape(safe_name)}\s*=\s*)([^\s]+)"
+    )
+    lines = netlist_text.splitlines()
+    replaced_any = False
+    updated_lines: list[str] = []
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.lower().startswith(".param") and assignment_pattern.search(line):
+            line = assignment_pattern.sub(rf"\g<1>{assignment_value}", line, count=1)
+            replaced_any = True
+        updated_lines.append(line)
+    updated_text = "\n".join(updated_lines).rstrip() + "\n"
+    if replaced_any:
+        return updated_text, True
+    return (
+        _append_unique_lines_before_end(
+            updated_text,
+            [f".param {safe_name}={assignment_value}"],
+        ),
+        False,
+    )
 
 
 def _resolve_run_target_for_input(
@@ -1794,6 +2134,10 @@ _MEAS_VALUE_RE = re.compile(
 _MEAS_COLON_LINE_RE = re.compile(r"^\s*(?P<name>[A-Za-z_][\w.$-]*)\s*:\s*(?P<rhs>.+?)\s*$")
 _MEAS_MEASUREMENT_RE = re.compile(
     r"^\s*Measurement:\s*(?P<name>[A-Za-z_][\w.$-]*)",
+    re.IGNORECASE,
+)
+_MEAS_FAILURE_RE = re.compile(
+    r'^\s*Measurement\s+"?(?P<name>[A-Za-z_][\w.$-]*)"?\s+FAIL(?:\'ed|ed|ED)?\b(?:\s*[:\-]\s*(?P<reason>.+))?\s*$',
     re.IGNORECASE,
 )
 _MEAS_NUMERIC_TOKEN_RE = re.compile(_MEAS_NUMBER_PATTERN)
@@ -2211,6 +2555,85 @@ def _build_meas_statements(measurements: list[dict[str, Any] | str]) -> list[str
     return statements
 
 
+def _extract_meas_statement_name(statement: str) -> str | None:
+    match = _MEAS_STATEMENT_RE.match(statement.strip())
+    if not match:
+        return None
+    return match.group("name").strip()
+
+
+def _parse_meas_failures_from_text(text: str) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        match = _MEAS_FAILURE_RE.match(line)
+        if not match:
+            continue
+        name = match.group("name").strip()
+        normalized = name.lower()
+        if not normalized:
+            continue
+        reason = (match.group("reason") or "").strip() or None
+        if reason is None and index + 1 < len(lines):
+            next_line = lines[index + 1]
+            next_match = _MEAS_COLON_LINE_RE.match(next_line)
+            if next_match and next_match.group("name").strip().lower() == normalized:
+                reason = next_match.group("rhs").strip() or None
+        key = (normalized, index + 1)
+        if key in seen:
+            continue
+        seen.add(key)
+        failures.append(
+            {
+                "name": name,
+                "reason": reason,
+                "line_number": index + 1,
+                "line": line.strip(),
+            }
+        )
+    return failures
+
+
+def _coerce_spice_number(value: Any, *, field_name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be numeric, got boolean value {value!r}.")
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        token = value.strip()
+        if not token:
+            raise ValueError(f"{field_name} must not be empty.")
+        parsed = _parse_spice_number_token(token)
+        if parsed is None:
+            raise ValueError(
+                f"{field_name} must be a numeric value or SPICE number token (for example: 1k, 4.7u, 10m). "
+                f"Received: {value!r}"
+            )
+        return float(parsed)
+    raise ValueError(
+        f"{field_name} must be a numeric value or SPICE number token string; received type {type(value).__name__}."
+    )
+
+
+def _coerce_spice_number_list(
+    values: list[float | int | str] | tuple[float | int | str, ...] | str | None,
+    *,
+    field_name: str,
+) -> list[float]:
+    if values is None:
+        return []
+    if isinstance(values, str):
+        tokens = [token for token in re.split(r"[\s,]+", values.strip()) if token]
+        return [_coerce_spice_number(token, field_name=field_name) for token in tokens]
+    if isinstance(values, (list, tuple)):
+        return [_coerce_spice_number(item, field_name=field_name) for item in values]
+    raise ValueError(
+        f"{field_name} must be a list/tuple or comma-separated string of numeric values; "
+        f"received type {type(values).__name__}."
+    )
+
+
 def _write_meas_netlist(
     *,
     base_netlist_path: Path,
@@ -2567,6 +2990,11 @@ def _run_process_simulation_with_cancel(
     log_path = _resolve_log_path(netlist_path)
     if log_path is not None and not _is_recent_artifact(log_path, started_ts=start_ts):
         log_path = None
+    log_utf8_path = _write_utf8_log_sidecar(log_path)
+    if log_utf8_path is not None:
+        artifacts = sorted({*artifacts, log_utf8_path})
+        if _is_recent_artifact(log_utf8_path, started_ts=start_ts):
+            fresh_output_artifacts = sorted({*fresh_output_artifacts, log_utf8_path})
 
     issues, warnings, diagnostics = analyze_log(log_path)
     if canceled:
@@ -2629,6 +3057,7 @@ def _run_process_simulation_with_cancel(
         stdout=stdout or "",
         stderr=stderr or "",
         log_path=log_path,
+        log_utf8_path=log_utf8_path,
         raw_files=raw_files,
         artifacts=artifacts,
         issues=issues,
@@ -2649,6 +3078,11 @@ def _job_public_payload(job: dict[str, Any]) -> dict[str, Any]:
         "cancel_requested": bool(job.get("cancel_requested", False)),
         "kind": job.get("kind"),
         "source_path": job.get("source_path"),
+        "run_path": job.get("run_path"),
+        "source_snapshot_root": job.get("source_snapshot_root"),
+        "source_snapshot_file_count": job.get("source_snapshot_file_count"),
+        "source_snapshot_rewritten_include_lines": job.get("source_snapshot_rewritten_include_lines"),
+        "source_snapshot_warnings": list(job.get("source_snapshot_warnings") or []),
         "priority": int(job.get("priority", 50)),
         "max_retries": int(job.get("max_retries", 0)),
         "retry_count": int(job.get("retry_count", 0)),
@@ -2700,8 +3134,11 @@ def _ensure_job_worker() -> None:
                     job["summary"] = "Running simulation."
                     _save_job_state()
                 try:
+                    run_source = Path(
+                        str(job.get("run_path") or job.get("source_path") or "")
+                    ).expanduser().resolve()
                     run, canceled = _run_process_simulation_with_cancel(
-                        netlist_path=Path(str(job["source_path"])).expanduser().resolve(),
+                        netlist_path=run_source,
                         ascii_raw=bool(job.get("ascii_raw", False)),
                         timeout_seconds=job.get("timeout_seconds"),
                         cancel_requested=lambda: bool(_jobs.get(job_id, {}).get("cancel_requested", False)),
@@ -2783,6 +3220,7 @@ def _queue_simulation_job(
 ) -> dict[str, Any]:
     _ensure_job_worker()
     job_id = uuid.uuid4().hex[:12]
+    snapshot = _snapshot_job_source_netlist(source_path=source_path, job_id=job_id)
     job = {
         "job_id": job_id,
         "status": "queued",
@@ -2794,13 +3232,22 @@ def _queue_simulation_job(
         "timeout_seconds": timeout_seconds,
         "kind": kind,
         "source_path": str(source_path),
+        "run_path": str(snapshot["run_path"]),
+        "source_snapshot_root": snapshot["snapshot_root"],
+        "source_snapshot_file_count": int(snapshot["file_count"]),
+        "source_snapshot_rewritten_include_lines": int(snapshot["rewritten_include_lines"]),
+        "source_snapshot_warnings": list(snapshot["warnings"]),
         "priority": int(priority),
         "max_retries": max(0, int(max_retries)),
         "retry_count": 0,
         "queue_seq": None,
         "run_id": None,
         "error": None,
-        "summary": "Queued",
+        "summary": (
+            "Queued"
+            if not snapshot["warnings"]
+            else "Queued (snapshot created with warnings; see source_snapshot_warnings)."
+        ),
     }
     with _job_lock:
         _jobs[job_id] = job
@@ -4577,12 +5024,99 @@ def runMeasAutomation(
         open_raw_after_run=open_raw_after_run,
     )
     meas_payload = parseMeasResults(run_id=str(run_payload["run_id"]))
+    run_payload_with_meas = dict(run_payload)
+
+    requested_names: list[str] = []
+    requested_seen: set[str] = set()
+    for statement in statements:
+        parsed_name = _extract_meas_statement_name(statement)
+        if not parsed_name:
+            continue
+        normalized = parsed_name.lower()
+        if normalized in requested_seen:
+            continue
+        requested_seen.add(normalized)
+        requested_names.append(parsed_name)
+
+    resolved_run = _resolve_run(str(run_payload["run_id"]))
+    log_target = resolved_run.log_utf8_path or resolved_run.log_path
+    failed_measurements: list[dict[str, Any]] = []
+    if log_target is not None and log_target.exists():
+        try:
+            failed_measurements = _parse_meas_failures_from_text(read_text_auto(log_target))
+        except Exception:  # noqa: BLE001
+            failed_measurements = []
+    failed_requested: list[dict[str, Any]] = []
+    if requested_names:
+        requested_lookup = {name.lower() for name in requested_names}
+        failed_requested = [
+            failure for failure in failed_measurements if str(failure.get("name", "")).lower() in requested_lookup
+        ]
+    observed_lookup = {
+        str(name).strip().lower()
+        for name in (meas_payload.get("measurements") or {}).keys()
+        if str(name).strip()
+    }
+    failed_lookup = {
+        str(entry.get("name", "")).strip().lower()
+        for entry in failed_requested
+        if str(entry.get("name", "")).strip()
+    }
+    missing_requested = [
+        name
+        for name in requested_names
+        if name.lower() not in observed_lookup and name.lower() not in failed_lookup
+    ]
+    requested_measurements_succeeded = not failed_requested and not missing_requested
+    simulation_succeeded = bool(run_payload_with_meas.get("succeeded", False))
+
+    if not requested_measurements_succeeded:
+        issue_parts: list[str] = []
+        if failed_requested:
+            issue_parts.append(
+                "failed: "
+                + ", ".join(
+                    (
+                        f"{item['name']} ({item.get('reason')})"
+                        if item.get("reason")
+                        else str(item["name"])
+                    )
+                    for item in failed_requested
+                )
+            )
+        if missing_requested:
+            issue_parts.append("missing: " + ", ".join(missing_requested))
+        message = "Requested measurements were not fully produced (" + "; ".join(issue_parts) + ")."
+        issues = list(run_payload_with_meas.get("issues") or [])
+        if message not in issues:
+            issues.append(message)
+        run_payload_with_meas["issues"] = issues
+        warnings = list(run_payload_with_meas.get("warnings") or [])
+        warnings.append(
+            "One or more requested .meas directives did not produce a numeric result. "
+            "Inspect failed_measurements/missing_requested_measurements for details."
+        )
+        run_payload_with_meas["warnings"] = warnings
+    run_payload_with_meas["simulation_succeeded"] = simulation_succeeded
+    run_payload_with_meas["requested_measurements_succeeded"] = requested_measurements_succeeded
+    run_payload_with_meas["succeeded"] = simulation_succeeded and requested_measurements_succeeded
+
+    meas_payload = dict(meas_payload)
+    meas_payload["requested_measurements"] = requested_names
+    meas_payload["failed_measurements"] = failed_requested
+    meas_payload["missing_requested_measurements"] = missing_requested
+    meas_payload["requested_measurements_succeeded"] = requested_measurements_succeeded
+
     return {
         "source_netlist_path": str(source_netlist),
         "meas_netlist_path": str(meas_netlist),
         "meas_statements": statements,
-        "run": run_payload,
+        "run": run_payload_with_meas,
         "measurements": meas_payload,
+        "requested_measurements": requested_names,
+        "failed_measurements": failed_requested,
+        "missing_requested_measurements": missing_requested,
+        "requested_measurements_succeeded": requested_measurements_succeeded,
     }
 
 
@@ -4736,13 +5270,13 @@ def runSweepStudy(
     netlist_path: str | None = None,
     netlist_content: str | None = None,
     circuit_name: str = "sweep_study",
-    values: list[float] | None = None,
-    start: float | None = None,
-    stop: float | None = None,
-    step: float | None = None,
+    values: list[float | int | str] | str | None = None,
+    start: float | int | str | None = None,
+    stop: float | int | str | None = None,
+    step: float | int | str | None = None,
     samples: int = 8,
-    nominal: float | None = None,
-    sigma_pct: float = 5.0,
+    nominal: float | int | str | None = None,
+    sigma_pct: float | int | str = 5.0,
     distribution: Literal["gaussian", "uniform"] = "gaussian",
     metric_vector: str = "V(out)",
     metric_statistic: Literal["min", "max", "avg", "rms", "pp", "final", "abs_max"] = "final",
@@ -4767,15 +5301,32 @@ def runSweepStudy(
     records: list[dict[str, Any]] = []
 
     if mode_norm == "step":
-        sweep_values = values[:] if values else []
+        sweep_values = _coerce_spice_number_list(values, field_name="values")
         if not sweep_values:
             if start is None or stop is None or step is None or step == 0:
                 raise ValueError("For mode='step', provide values or (start, stop, step).")
-            current = float(start)
-            direction = 1.0 if step > 0 else -1.0
-            while (direction > 0 and current <= float(stop)) or (direction < 0 and current >= float(stop)):
+            start_value = _coerce_spice_number(start, field_name="start")
+            stop_value = _coerce_spice_number(stop, field_name="stop")
+            step_value = _coerce_spice_number(step, field_name="step")
+            if step_value == 0:
+                raise ValueError("step must not be zero.")
+            current = start_value
+            direction = 1.0 if step_value > 0 else -1.0
+            max_points = 200000
+            points_generated = 0
+            epsilon = max(abs(step_value), 1.0) * 1e-12
+            while (
+                (direction > 0 and current <= stop_value + epsilon)
+                or (direction < 0 and current >= stop_value - epsilon)
+            ):
                 sweep_values.append(current)
-                current += float(step)
+                current += step_value
+                points_generated += 1
+                if points_generated > max_points:
+                    raise ValueError(
+                        "Generated too many sweep points from start/stop/step. "
+                        "Check step direction and bounds."
+                    )
         step_line = ".step param " + param_name + " list " + " ".join(f"{float(value):.12g}" for value in sweep_values)
         text = _read_netlist_text(base_path)
         stepped_text = _append_unique_lines_before_end(text, [step_line])
@@ -4791,28 +5342,58 @@ def runSweepStudy(
         )
         run = _resolve_run(str(run_payload["run_id"]))
         dataset = _resolve_dataset(plot=None, run_id=run.run_id, raw_path=None)
-        step_indices = list(range(dataset.step_count))
         metric_values: list[float] = []
-        for idx in step_indices:
-            selected = _resolve_step_index(dataset, idx)
-            series = dataset.get_vector(metric_vector, step_index=selected)
-            value = _metric_from_series(series, metric_statistic)
-            metric_values.append(value)
-            label = dataset.steps[idx].label if dataset.steps and idx < len(dataset.steps) else None
-            records.append(
-                {
-                    "index": idx,
-                    "parameter_value": sweep_values[idx] if idx < len(sweep_values) else None,
-                    "step_label": label,
-                    "metric_value": value,
-                    "run_id": run.run_id,
-                }
-            )
+        plot_name_lower = dataset.plot_name.strip().lower()
+        is_operating_point_plot = (
+            "operating point" in plot_name_lower
+            or plot_name_lower.startswith("op point")
+            or plot_name_lower.startswith(".op")
+        )
+        use_point_aligned_fallback = (
+            dataset.step_count <= 1
+            and "stepped" in dataset.flags
+            and dataset.points > 1
+            and is_operating_point_plot
+            and len(sweep_values) == dataset.points
+        )
+        if use_point_aligned_fallback:
+            full_series = dataset.get_vector(metric_vector, step_index=None)
+            for idx, sample in enumerate(full_series[: len(sweep_values)]):
+                value = _metric_from_series([sample], metric_statistic)
+                metric_values.append(value)
+                records.append(
+                    {
+                        "index": idx,
+                        "parameter_value": sweep_values[idx] if idx < len(sweep_values) else None,
+                        "step_label": f"{param_name}={float(sweep_values[idx]):.12g}",
+                        "metric_value": value,
+                        "run_id": run.run_id,
+                    }
+                )
+        else:
+            step_indices = list(range(dataset.step_count))
+            for idx in step_indices:
+                selected = _resolve_step_index(dataset, idx)
+                series = dataset.get_vector(metric_vector, step_index=selected)
+                value = _metric_from_series(series, metric_statistic)
+                metric_values.append(value)
+                label = dataset.steps[idx].label if dataset.steps and idx < len(dataset.steps) else None
+                records.append(
+                    {
+                        "index": idx,
+                        "parameter_value": sweep_values[idx] if idx < len(sweep_values) else None,
+                        "step_label": label,
+                        "metric_value": value,
+                        "run_id": run.run_id,
+                    }
+                )
     else:
         if nominal is None:
             raise ValueError("For mode='monte_carlo', nominal is required.")
         sample_count = max(1, min(500, int(samples)))
-        spread = abs(float(nominal)) * (abs(float(sigma_pct)) / 100.0)
+        nominal_value = _coerce_spice_number(nominal, field_name="nominal")
+        sigma_pct_value = _coerce_spice_number(sigma_pct, field_name="sigma_pct")
+        spread = abs(float(nominal_value)) * (abs(float(sigma_pct_value)) / 100.0)
         base_text = _read_netlist_text(base_path)
         metric_values: list[float] = []
         for idx in range(sample_count):
@@ -4820,9 +5401,12 @@ def runSweepStudy(
                 delta = random.uniform(-spread, spread)
             else:
                 delta = random.gauss(0.0, spread)
-            sample_value = float(nominal) + delta
-            line = f".param {param_name}={sample_value:.12g}"
-            candidate_text = _append_unique_lines_before_end(base_text, [line])
+            sample_value = float(nominal_value) + delta
+            candidate_text, _replaced_existing_param = _inject_or_replace_param_line(
+                netlist_text=base_text,
+                param_name=param_name,
+                param_value=sample_value,
+            )
             candidate_path = base_path.with_name(f"{base_path.stem}_mc_{idx + 1}{base_path.suffix}")
             candidate_path.write_text(candidate_text, encoding="utf-8")
             run_payload = simulateNetlistFile(
@@ -5621,6 +6205,7 @@ def renderLtspicePlotImage(
         raise ValueError("vectors must contain at least one vector name")
     dataset = _resolve_dataset(plot=plot, run_id=run_id, raw_path=raw_path)
     selected_step = _resolve_step_index(dataset, step_index)
+    _validate_vectors_exist(dataset=dataset, vectors=vectors, step_index=selected_step)
     normalized_mode = _normalize_plot_mode(mode)
     normalized_y_mode = _normalize_plot_y_mode(y_mode)
     normalized_pane_layout = _normalize_pane_layout(pane_layout)
@@ -5750,6 +6335,7 @@ def generatePlotSettings(
         raise ValueError("vectors must contain at least one vector name")
     dataset = _resolve_dataset(plot=plot, run_id=run_id, raw_path=raw_path)
     selected_step = _resolve_step_index(dataset, step_index)
+    _validate_vectors_exist(dataset=dataset, vectors=vectors, step_index=selected_step)
     normalized_mode = _normalize_plot_mode(mode)
     normalized_layout = _normalize_pane_layout(pane_layout)
     render_dataset, step_rendering = _materialize_plot_step_dataset(

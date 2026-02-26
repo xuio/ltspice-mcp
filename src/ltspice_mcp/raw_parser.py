@@ -24,6 +24,10 @@ class _SectionMarker:
 _INT_RE = re.compile(r"-?\d+")
 _SCALAR_COMPLEX_RE = re.compile(r"^\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)$")
 _STEP_LINE_RE = re.compile(r"^\s*\.step\s+(.+?)\s*$", re.IGNORECASE)
+_STEP_INFO_RE = re.compile(
+    r"^\s*Step Information:\s*(?P<label>.+?)(?:\s+\(Run:.*\))?\s*$",
+    re.IGNORECASE,
+)
 
 
 def _is_monotonic_non_decreasing(values: list[float]) -> bool:
@@ -213,16 +217,30 @@ def _parse_values_section(section_text: str, num_vars: int, num_points: int) -> 
 
 
 def _parse_step_labels_from_log(raw_path: Path) -> list[str]:
-    log_path = raw_path.with_suffix(".log")
-    if not log_path.exists():
+    candidates: list[Path] = [raw_path.with_suffix(".log")]
+    # LTspice can emit stepped operating-point data as *.op.raw while the log
+    # remains *.log (without the ".op" stem segment).
+    if raw_path.name.lower().endswith(".op.raw"):
+        stem_without_op = raw_path.stem[:-3] if raw_path.stem.lower().endswith(".op") else raw_path.stem
+        candidates.append(raw_path.with_name(f"{stem_without_op}.log"))
+
+    log_path: Path | None = None
+    for candidate in candidates:
+        if candidate.exists():
+            log_path = candidate
+            break
+    if log_path is None:
         return []
 
     labels: list[str] = []
     for raw_line in read_text_auto(log_path).splitlines():
         match = _STEP_LINE_RE.match(raw_line)
-        if not match:
+        if match:
+            labels.append(match.group(1).strip())
             continue
-        labels.append(match.group(1).strip())
+        info_match = _STEP_INFO_RE.match(raw_line)
+        if info_match:
+            labels.append(info_match.group("label").strip())
     return labels
 
 
@@ -243,6 +261,7 @@ def _build_steps(
     *,
     raw_path: Path,
     flags: set[str],
+    plot_name: str,
     values: list[list[complex]],
 ) -> list[RawStep]:
     total_points = len(values[0]) if values else 0
@@ -254,12 +273,22 @@ def _build_steps(
         return [RawStep(index=0, start=0, end=total_points, label=labels[0] if labels else None)]
 
     starts = _detect_step_starts([value.real for value in values[0]])
+    plot_name_lower = plot_name.strip().lower()
+    is_operating_point_plot = (
+        "operating point" in plot_name_lower
+        or plot_name_lower.startswith("op point")
+        or plot_name_lower.startswith(".op")
+    )
     if len(starts) == 1 and labels:
         if total_points == len(labels):
             starts = list(range(total_points))
         elif total_points % len(labels) == 0:
             points_per_step = total_points // len(labels)
             starts = [step_idx * points_per_step for step_idx in range(len(labels))]
+    elif len(starts) == 1 and total_points > 1 and is_operating_point_plot:
+        # Stepped .op datasets often encode one point per step with no monotonic
+        # reset in the scale vector; when that happens, derive one-point steps.
+        starts = list(range(total_points))
 
     starts = sorted(set(starts))
     if starts[0] != 0:
@@ -324,6 +353,7 @@ def parse_raw_file(path: str | Path) -> RawDataset:
     steps = _build_steps(
         raw_path=raw_path,
         flags=flags,
+        plot_name=plot_name,
         values=values,
     )
     return RawDataset(

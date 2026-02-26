@@ -1692,21 +1692,36 @@ def analyze_log(log_path: Path | None) -> tuple[list[str], list[str], list[Simul
     return issues, warnings, diagnostics
 
 
+def _expected_simulation_output_paths(netlist_path: Path) -> list[Path]:
+    stem = netlist_path.stem
+    parent = netlist_path.parent
+    return [
+        parent / f"{stem}.log",
+        parent / f"{stem}.log.utf8.txt",
+        parent / f"{stem}.raw",
+        parent / f"{stem}.op.raw",
+    ]
+
+
 def _collect_related_artifacts(netlist_path: Path) -> list[Path]:
-    return sorted(path for path in netlist_path.parent.glob(f"{netlist_path.stem}*") if path.is_file())
+    candidates: list[Path] = []
+    if netlist_path.exists() and netlist_path.is_file():
+        candidates.append(netlist_path)
+    for candidate in _expected_simulation_output_paths(netlist_path):
+        if candidate.exists() and candidate.is_file():
+            candidates.append(candidate)
+    return sorted({path.resolve() for path in candidates})
 
 
 def _is_simulation_output_artifact(netlist_path: Path, candidate: Path) -> bool:
     if candidate == netlist_path:
         return False
-    if not candidate.name.startswith(netlist_path.stem):
+    expected = {path.resolve() for path in _expected_simulation_output_paths(netlist_path)}
+    try:
+        resolved = candidate.resolve()
+    except Exception:  # noqa: BLE001
         return False
-    lower_name = candidate.name.lower()
-    return (
-        lower_name.endswith(".raw")
-        or lower_name.endswith(".log")
-        or lower_name.endswith(".log.utf8.txt")
-    )
+    return resolved in expected
 
 
 def _collect_simulation_output_artifacts(netlist_path: Path) -> list[Path]:
@@ -1741,8 +1756,7 @@ def _resolve_log_path(netlist_path: Path) -> Path | None:
     primary = netlist_path.with_suffix(".log")
     if primary.exists():
         return primary
-    candidates = sorted(netlist_path.parent.glob(f"{netlist_path.stem}*.log"))
-    return candidates[0] if candidates else None
+    return None
 
 
 def tail_text_file(path: Path | None, max_lines: int = 120) -> str:
@@ -2868,6 +2882,7 @@ class LTspiceRunner:
 
         started_at = datetime.now().astimezone().isoformat()
         start_ts = time.time()
+        timed_out = False
 
         try:
             proc = subprocess.run(
@@ -2882,6 +2897,7 @@ class LTspiceRunner:
             stdout = proc.stdout
             stderr = proc.stderr
         except subprocess.TimeoutExpired as exc:
+            timed_out = True
             return_code = -1
             stdout = exc.stdout or ""
             stderr = (exc.stderr or "") + f"\nLTspice timed out after {timeout} seconds."
@@ -2902,7 +2918,17 @@ class LTspiceRunner:
             artifacts = sorted({*artifacts, log_utf8_path})
 
         issues, warnings, diagnostics = analyze_log(log_path)
-        if return_code != 0:
+        if timed_out:
+            issues.append(f"LTspice timed out after {timeout} seconds.")
+            diagnostics.append(
+                SimulationDiagnostic(
+                    category="timeout",
+                    severity="error",
+                    message=f"LTspice timed out after {timeout} seconds.",
+                    suggestion="Increase timeout_seconds or simplify the simulation setup.",
+                )
+            )
+        elif return_code != 0:
             issues.append(f"LTspice exited with return code {return_code}.")
             diagnostics.append(
                 SimulationDiagnostic(
