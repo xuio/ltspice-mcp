@@ -3382,7 +3382,12 @@ def _metric_from_series(series: list[complex], statistic: str) -> float:
     raise ValueError("statistic must be one of: min, max, avg, rms, pp, final, abs_max")
 
 
-def _select_metric_vector(dataset: RawDataset, requested: str) -> tuple[str, str | None]:
+def _select_metric_vector(
+    dataset: RawDataset,
+    requested: str,
+    *,
+    allow_fallback: bool = False,
+) -> tuple[str, str | None]:
     requested_name = requested.strip()
     available = [variable.name for variable in dataset.variables]
     if requested_name in available:
@@ -3396,14 +3401,20 @@ def _select_metric_vector(dataset: RawDataset, requested: str) -> tuple[str, str
         for variable in dataset.variables
         if not (dataset.has_natural_scale() and variable.index == 0)
     ]
-    if non_scale:
+    if allow_fallback and non_scale:
         fallback = non_scale[0]
         warning = (
             f"Requested metric_vector '{requested_name}' was not found. "
             f"Using '{fallback}' instead."
         )
         return fallback, warning
-    raise ValueError("No non-scale vectors are available for metric extraction.")
+    available_vectors = non_scale or available
+    if available_vectors:
+        raise ValueError(
+            f"Unknown vector '{requested_name}'. Available vectors: "
+            + ", ".join(available_vectors)
+        )
+    raise ValueError("No vectors are available for metric extraction.")
 
 
 def _evaluate_limits(
@@ -6689,7 +6700,11 @@ def runSweepStudy(
         )
         run = _resolve_run(str(run_payload["run_id"]))
         dataset = _resolve_dataset(plot=None, run_id=run.run_id, raw_path=None)
-        selected_metric_vector, metric_warning = _select_metric_vector(dataset, metric_vector)
+        selected_metric_vector, metric_warning = _select_metric_vector(
+            dataset,
+            metric_vector,
+            allow_fallback=metric_vector.strip().lower() in {"", "v(out)"},
+        )
         if metric_warning:
             warnings.append(metric_warning)
         metric_values: list[float] = []
@@ -6812,7 +6827,11 @@ def runSweepStudy(
                         "Use a source netlist without existing .step directives."
                     )
                 selected = _resolve_step_index(dataset, 0)
-                selected_metric_vector, metric_warning = _select_metric_vector(dataset, metric_vector)
+                selected_metric_vector, metric_warning = _select_metric_vector(
+                    dataset,
+                    metric_vector,
+                    allow_fallback=metric_vector.strip().lower() in {"", "v(out)"},
+                )
                 if metric_warning:
                     warnings.append(metric_warning)
                 series = dataset.get_vector(selected_metric_vector, step_index=selected)

@@ -1076,6 +1076,46 @@ class TestVerificationAndQueueTools(unittest.TestCase):
         self.assertTrue(payload["warnings"])
         self.assertIn("does not appear to be referenced", payload["warnings"][0])
 
+    def test_run_sweep_study_rejects_unknown_metric_vector_with_value_error(self) -> None:
+        netlist = self.temp_dir / "step_metric_vector_validation.cir"
+        netlist.write_text("* step study\nR1 in out 1k\n.end\n", encoding="utf-8")
+        run = _make_run(self.temp_dir, run_id="step-metric-vector")
+        dataset = RawDataset(
+            path=self.temp_dir / "step_metric_vector.raw",
+            plot_name="Transient Analysis",
+            flags={"stepped"},
+            metadata={},
+            variables=[
+                RawVariable(index=0, name="time", kind="time"),
+                RawVariable(index=1, name="V(in)", kind="voltage"),
+            ],
+            values=[
+                [0.0 + 0j, 1.0 + 0j, 0.0 + 0j, 1.0 + 0j],
+                [1.0 + 0j, 2.0 + 0j, 3.0 + 0j, 4.0 + 0j],
+            ],
+            steps=[
+                RawStep(index=0, start=0, end=2, label="R=1k"),
+                RawStep(index=1, start=2, end=4, label="R=2k"),
+            ],
+        )
+        with (
+            patch(
+                "ltspice_mcp.server.simulateNetlistFile",
+                return_value={"run_id": run.run_id, "succeeded": True},
+            ),
+            patch("ltspice_mcp.server._resolve_run", return_value=run),
+            patch("ltspice_mcp.server._resolve_dataset", return_value=dataset),
+        ):
+            with self.assertRaisesRegex(ValueError, "Unknown vector 'db\\(V\\(out\\)\\)'"):
+                server.runSweepStudy(
+                    parameter="RVAL",
+                    mode="step",
+                    netlist_path=str(netlist),
+                    values=["1k", "2k"],
+                    metric_vector="db(V(out))",
+                    metric_statistic="final",
+                )
+
     def test_run_sweep_study_step_mode_operating_point_fallback_aligns_points(self) -> None:
         netlist = self.temp_dir / "step_study_op.cir"
         netlist.write_text("* step study op\nR1 in out 1k\n.end\n", encoding="utf-8")
