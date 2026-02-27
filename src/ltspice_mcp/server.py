@@ -1104,15 +1104,16 @@ def _resolve_run(run_id: str | None = None) -> SimulationRun:
 
 
 def _select_primary_raw(run: SimulationRun) -> Path | None:
-    if not run.raw_files:
+    available = [path for path in run.raw_files if path.exists() and path.is_file()]
+    if not available:
         return None
     preferred = run.netlist_path.with_suffix(".raw")
-    if preferred.exists():
+    if preferred.exists() and preferred.is_file():
         return preferred
-    non_op = [path for path in run.raw_files if not path.name.endswith(".op.raw")]
+    non_op = [path for path in available if not path.name.endswith(".op.raw")]
     if non_op:
         return max(non_op, key=lambda path: path.stat().st_size)
-    return max(run.raw_files, key=lambda path: path.stat().st_size)
+    return max(available, key=lambda path: path.stat().st_size)
 
 
 def _target_path_from_run(run: SimulationRun, target: str) -> Path:
@@ -1121,12 +1122,16 @@ def _target_path_from_run(run: SimulationRun, target: str) -> Path:
     if target == "raw":
         selected = _select_primary_raw(run)
         if not selected:
-            raise ValueError(f"Run '{run.run_id}' does not have a RAW file to open.")
+            raise ValueError(
+                f"Run '{run.run_id}' does not have an available RAW file to open."
+            )
         return selected
     if target == "log":
-        if run.log_path is None:
-            raise ValueError(f"Run '{run.run_id}' does not have a log file.")
-        return run.log_path
+        if run.log_path is not None and run.log_path.exists() and run.log_path.is_file():
+            return run.log_path
+        if run.log_utf8_path is not None and run.log_utf8_path.exists() and run.log_utf8_path.is_file():
+            return run.log_utf8_path
+        raise ValueError(f"Run '{run.run_id}' does not have an available log artifact.")
     raise ValueError("target must be one of: netlist, raw, log")
 
 
@@ -1266,9 +1271,11 @@ def _resolve_axis_range(
 ) -> tuple[float, float, float]:
     lo, hi = _safe_axis_range(values, fallback_span=fallback_span)
     if lower_override is not None:
-        lo = float(lower_override)
+        lo = _require_float("axis min", lower_override)
     if upper_override is not None:
-        hi = float(upper_override)
+        hi = _require_float("axis max", upper_override)
+    if not math.isfinite(lo) or not math.isfinite(hi):
+        raise ValueError("axis range must use finite numeric bounds")
     if hi <= lo:
         raise ValueError("axis max must be greater than axis min")
     step = max((hi - lo) / 10.0, 1e-12)
@@ -1847,16 +1854,17 @@ def _resolve_raw_path(raw_path: str | None, run_id: str | None) -> Path:
     normalized_raw_path = _normalize_optional_selector("raw_path", raw_path)
     normalized_run_id = _normalize_optional_selector("run_id", run_id)
     if normalized_raw_path:
-        path = Path(normalized_raw_path).expanduser().resolve()
-        if not path.exists():
-            raise FileNotFoundError(f"RAW file not found: {path}")
-        return path
+        return _validate_raw_file_path(normalized_raw_path, field_name="raw_path")
 
     run = _resolve_run(normalized_run_id)
     selected = _select_primary_raw(run)
     if not selected:
         raise ValueError(
             f"Run '{run.run_id}' has no RAW files. Check the log or LTspice output."
+        )
+    if selected is None:
+        raise ValueError(
+            f"Run '{run.run_id}' has no available RAW files. Check the log or LTspice output."
         )
     return selected
 
@@ -1877,7 +1885,7 @@ def _resolve_dataset(plot: str | None, run_id: str | None, raw_path: str | None)
     normalized_run_id = _normalize_optional_selector("run_id", run_id)
     normalized_raw_path = _normalize_optional_selector("raw_path", raw_path)
     _ensure_mutually_exclusive_selectors(
-        context="_resolve_dataset",
+        context="dataset selection",
         values={"run_id": normalized_run_id, "raw_path": normalized_raw_path},
     )
 
@@ -1956,7 +1964,20 @@ def _validate_vectors_exist(
     )
 
 
+def _sanitize_tail_text(text: str, *, max_chars: int = 12000) -> str:
+    if not text:
+        return text
+    cleaned = "".join(
+        ch if (ch in {"\n", "\r", "\t"} or 32 <= ord(ch) <= 126) else "�"
+        for ch in text
+    )
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[:max_chars] + "\n...[truncated]..."
+
+
 def _run_payload(run: SimulationRun, *, include_output: bool, log_tail_lines: int) -> dict[str, Any]:
+    safe_tail_lines = _require_int("log_tail_lines", log_tail_lines, minimum=1, maximum=5000)
     payload = run.as_dict(include_output=include_output)
     executed_netlist_path: str | None = None
     command = payload.get("command")
@@ -1969,9 +1990,19 @@ def _run_payload(run: SimulationRun, *, include_output: bool, log_tail_lines: in
             executed_netlist_path = token
             break
     payload["executed_netlist_path"] = executed_netlist_path
-    payload["log_tail"] = tail_text_file(run.log_path, max_lines=log_tail_lines)
+    tail_from_log = _sanitize_tail_text(tail_text_file(run.log_path, max_lines=safe_tail_lines))
+    tail_from_utf8 = (
+        _sanitize_tail_text(tail_text_file(run.log_utf8_path, max_lines=safe_tail_lines))
+        if run.log_utf8_path is not None
+        else ""
+    )
+    payload["log_tail"] = tail_from_log or tail_from_utf8
     if run.log_utf8_path is not None:
-        payload["log_tail_utf8"] = tail_text_file(run.log_utf8_path, max_lines=log_tail_lines)
+        payload["log_tail_utf8"] = tail_from_utf8
+    if run.log_path is not None and not run.log_path.exists() and run.log_utf8_path is not None and run.log_utf8_path.exists():
+        payload.setdefault("warnings", []).append(
+            "Primary .log artifact is missing; log_tail was populated from log_utf8_path."
+        )
     return payload
 
 
@@ -2051,6 +2082,7 @@ def _require_float(
     *,
     minimum: float | None = None,
     maximum: float | None = None,
+    finite: bool = True,
 ) -> float:
     if isinstance(value, bool):
         raise ValueError(f"{name} must be numeric, not boolean {value!r}.")
@@ -2058,11 +2090,202 @@ def _require_float(
         number = float(value)
     except Exception as exc:  # noqa: BLE001
         raise ValueError(f"{name} must be numeric.") from exc
+    if finite and not math.isfinite(number):
+        raise ValueError(f"{name} must be a finite numeric value.")
     if minimum is not None and number < minimum:
         raise ValueError(f"{name} must be >= {minimum}.")
     if maximum is not None and number > maximum:
         raise ValueError(f"{name} must be <= {maximum}.")
     return number
+
+
+_NETLIST_SUFFIX_BLACKLIST = {".asc"}
+_LTSPICE_ANALYSIS_DIRECTIVE_PREFIXES = (
+    ".op",
+    ".ac",
+    ".dc",
+    ".tran",
+    ".tf",
+    ".noise",
+    ".four",
+    ".pz",
+)
+_LTSPICE_NETLIST_SUFFIXES = {".cir", ".net", ".sp", ".spi", ".sub", ".lib", ".txt"}
+_LTSPICE_LOG_SUFFIXES = {".log", ".txt"}
+_LTSPICE_RAW_SUFFIXES = {".raw"}
+_LTSPICE_SCHEMATIC_SUFFIXES = {".asc"}
+
+
+def _ensure_file_readable(path: Path, *, field_name: str) -> None:
+    try:
+        with path.open("rb") as handle:
+            handle.read(1)
+    except PermissionError as exc:
+        raise ValueError(f"{field_name} is not readable: {path}") from exc
+    except OSError as exc:
+        raise ValueError(f"{field_name} could not be accessed: {path}") from exc
+
+
+def _resolve_existing_file_path(
+    value: str | Path,
+    *,
+    field_name: str,
+    allowed_suffixes: set[str] | None = None,
+    disallowed_suffixes: set[str] | None = None,
+    require_readable: bool = True,
+) -> Path:
+    path = Path(value).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"{field_name} not found: {path}")
+    if not path.is_file():
+        raise ValueError(f"{field_name} must be a file: {path}")
+    suffix = path.suffix.lower()
+    if allowed_suffixes is not None and suffix not in allowed_suffixes:
+        expected = ", ".join(sorted(allowed_suffixes))
+        raise ValueError(f"{field_name} must use one of these extensions: {expected}. Received: {path}")
+    if disallowed_suffixes is not None and suffix in disallowed_suffixes:
+        banned = ", ".join(sorted(disallowed_suffixes))
+        raise ValueError(f"{field_name} does not accept extension(s): {banned}. Received: {path}")
+    if require_readable:
+        _ensure_file_readable(path, field_name=field_name)
+    return path
+
+
+def _looks_binary(path: Path, *, probe_bytes: int = 4096) -> bool:
+    try:
+        blob = path.read_bytes()[:probe_bytes]
+    except PermissionError as exc:
+        raise ValueError(f"{path} is not readable.") from exc
+    except OSError as exc:
+        raise ValueError(f"{path} could not be read.") from exc
+    if not blob:
+        return False
+    if b"\x00" in blob:
+        return True
+    allowed_controls = {9, 10, 13}
+    non_text = 0
+    for item in blob:
+        if item in allowed_controls:
+            continue
+        if 32 <= item <= 126:
+            continue
+        non_text += 1
+    return (non_text / max(1, len(blob))) > 0.20
+
+
+def _validate_netlist_text(
+    text: str,
+    *,
+    field_name: str,
+    require_end: bool = True,
+    require_elements: bool = False,
+    require_analysis: bool = False,
+) -> None:
+    lines = [line.strip() for line in text.splitlines()]
+    active = [line for line in lines if line and not line.startswith(("*", ";"))]
+    if not active:
+        raise ValueError(f"{field_name} is empty or contains only comments.")
+    if require_end:
+        has_end = any(line.lower() == ".end" for line in active)
+        if not has_end:
+            raise ValueError(f"{field_name} must include a .end directive.")
+    if require_elements:
+        element_lines = [line for line in active if not line.startswith(".")]
+        if not element_lines:
+            raise ValueError(f"{field_name} must include at least one circuit element line.")
+    if require_analysis:
+        has_analysis = any(line.lower().startswith(_LTSPICE_ANALYSIS_DIRECTIVE_PREFIXES) for line in active)
+        if not has_analysis:
+            raise ValueError(
+                f"{field_name} must include at least one analysis directive "
+                "(.op, .ac, .dc, .tran, .tf, .noise, .four, .pz)."
+            )
+
+
+def _load_validated_netlist_file(
+    value: str | Path,
+    *,
+    field_name: str,
+    allow_asc: bool = False,
+    require_end: bool = True,
+    require_elements: bool = False,
+    require_analysis: bool = False,
+) -> tuple[Path, str]:
+    path = _resolve_existing_file_path(
+        value,
+        field_name=field_name,
+        allowed_suffixes=None if allow_asc else _LTSPICE_NETLIST_SUFFIXES,
+        disallowed_suffixes=None if allow_asc else _NETLIST_SUFFIX_BLACKLIST,
+        require_readable=True,
+    )
+    if _looks_binary(path):
+        raise ValueError(f"{field_name} appears to be binary and is not a valid LTspice netlist: {path}")
+    text = read_text_auto(path)
+    _validate_netlist_text(
+        text,
+        field_name=field_name,
+        require_end=require_end,
+        require_elements=require_elements,
+        require_analysis=require_analysis,
+    )
+    return path, text
+
+
+def _validate_raw_file_path(value: str | Path, *, field_name: str) -> Path:
+    return _resolve_existing_file_path(
+        value,
+        field_name=field_name,
+        allowed_suffixes=_LTSPICE_RAW_SUFFIXES,
+        require_readable=True,
+    )
+
+
+def _validate_log_file_path(value: str | Path, *, field_name: str) -> Path:
+    path = _resolve_existing_file_path(
+        value,
+        field_name=field_name,
+        allowed_suffixes=_LTSPICE_LOG_SUFFIXES,
+        require_readable=True,
+    )
+    lower_name = path.name.lower()
+    if ".log" not in lower_name:
+        raise ValueError(f"{field_name} must reference an LTspice log file (.log or .log.utf8.txt): {path}")
+    return path
+
+
+def _validate_schematic_path(
+    value: str | Path,
+    *,
+    field_name: str,
+    require_readable: bool = True,
+) -> Path:
+    return _resolve_existing_file_path(
+        value,
+        field_name=field_name,
+        allowed_suffixes=_LTSPICE_SCHEMATIC_SUFFIXES,
+        require_readable=require_readable,
+    )
+
+
+def _validate_output_file_destination(
+    value: str | Path,
+    *,
+    field_name: str,
+    required_suffixes: set[str] | None = None,
+) -> Path:
+    path = Path(value).expanduser().resolve()
+    if path.exists() and not path.is_file():
+        raise ValueError(f"{field_name} must be a file path, not a directory: {path}")
+    if required_suffixes is not None and path.suffix.lower() not in required_suffixes:
+        expected = ", ".join(sorted(required_suffixes))
+        raise ValueError(f"{field_name} must use one of these extensions: {expected}. Received: {path}")
+    parent = path.parent
+    if parent.exists():
+        if not parent.is_dir():
+            raise ValueError(f"{field_name} parent path is not a directory: {parent}")
+        if not os.access(parent, os.W_OK):
+            raise ValueError(f"{field_name} parent directory is not writable: {parent}")
+    return path
 
 
 def _staged_source_root(prefix: str) -> Path:
@@ -2244,9 +2467,11 @@ def _resolve_run_target_for_input(
     normalized_run_id = _normalize_optional_selector("run_id", run_id)
     normalized_netlist_path = _normalize_optional_selector("netlist_path", netlist_path)
     normalized_asc_path = _normalize_optional_selector("asc_path", asc_path)
+    # Validate timeout consistently even when an existing run is reused.
+    _require_optional_positive_int("timeout_seconds", timeout_seconds)
     if normalized_run_id is not None:
         _ensure_mutually_exclusive_selectors(
-            context="_resolve_run_target_for_input",
+            context="run target selection",
             values={
                 "run_id": normalized_run_id,
                 "netlist_path": normalized_netlist_path,
@@ -2318,6 +2543,10 @@ _MEAS_DUPLICATE_RESULT_RE = re.compile(
     r"^\s*Multiply\s+defined\s+\.measure\s+result:\s*(?P<name>[A-Za-z_][\w.$-]*)\s*$",
     re.IGNORECASE,
 )
+_MEAS_GENERIC_ERROR_RE = re.compile(
+    r"^\s*Error:\s*(?P<reason>.+?)\s*$",
+    re.IGNORECASE,
+)
 _MEAS_NUMERIC_TOKEN_RE = re.compile(_MEAS_NUMBER_PATTERN)
 _MEAS_AT_VALUE_RE = re.compile(
     rf"\bAT\s*=?\s*(?P<value>{_MEAS_NUMBER_PATTERN})\b",
@@ -2348,6 +2577,11 @@ _MEAS_IGNORED_KEYS = {
     "plotname",
     "title",
     "version",
+    "warning",
+    "warnings",
+    "error",
+    "fatal",
+    "note",
 }
 _MEAS_RAW_HEADER_RE = re.compile(
     r"^\s*(?:"
@@ -2738,6 +2972,60 @@ def _build_meas_statement(entry: dict[str, Any]) -> str:
     return " ".join(tokens)
 
 
+_MEAS_BODY_OPERATORS = {
+    "avg",
+    "max",
+    "min",
+    "pp",
+    "rms",
+    "find",
+    "when",
+    "param",
+    "deriv",
+    "integ",
+    "trig",
+    "targ",
+}
+
+
+def _canonicalize_meas_statement(raw: str) -> str:
+    statement = raw.strip()
+    if not statement:
+        raise ValueError("measurement statement must not be empty")
+    if not statement.lower().startswith((".meas", ".measure")):
+        # Support short form `.meas <name> ...` by allowing bare statements that
+        # begin with a valid measurement name and known operator keyword.
+        tokens = statement.split()
+        if len(tokens) < 2:
+            raise ValueError(f"Invalid measurement statement: {raw!r}")
+        if not re.fullmatch(r"[A-Za-z_][\w.$-]*", tokens[0]):
+            raise ValueError(f"Invalid measurement name in statement: {raw!r}")
+        if tokens[1].lower() not in _MEAS_BODY_OPERATORS:
+            raise ValueError(
+                "Measurement shorthand must use a supported operator keyword "
+                f"after the measurement name. Received: {raw!r}"
+            )
+        statement = f".meas {statement}"
+    parsed = _parse_meas_statement_tokens(statement)
+    if not parsed:
+        raise ValueError(f"Invalid measurement statement: {raw!r}")
+    body = parsed["body"].strip()
+    if not body:
+        raise ValueError(f"Incomplete measurement statement (missing body): {raw!r}")
+    body_tokens = body.split()
+    operator = body_tokens[0].lower()
+    if operator not in _MEAS_BODY_OPERATORS:
+        raise ValueError(
+            "Unsupported measurement operation in statement. "
+            f"Received: {raw!r}"
+        )
+    if operator == "param" and len(body_tokens) < 2:
+        raise ValueError(f"Incomplete PARAM measurement statement: {raw!r}")
+    if operator in {"find", "avg", "max", "min", "pp", "rms", "deriv", "integ"} and len(body_tokens) < 2:
+        raise ValueError(f"Incomplete measurement statement: {raw!r}")
+    return statement
+
+
 def _build_meas_statements(measurements: list[dict[str, Any] | str]) -> list[str]:
     statements: list[str] = []
     for item in measurements:
@@ -2745,11 +3033,11 @@ def _build_meas_statements(measurements: list[dict[str, Any] | str]) -> list[str
             raw = item.strip()
             if not raw:
                 continue
-            statements.append(raw if raw.lower().startswith(".meas") else f".meas {raw}")
+            statements.append(_canonicalize_meas_statement(raw))
             continue
         if not isinstance(item, dict):
             raise ValueError("measurement entries must be dicts or strings")
-        statements.append(_build_meas_statement(item))
+        statements.append(_canonicalize_meas_statement(_build_meas_statement(item)))
     if not statements:
         raise ValueError("No valid measurement statements were produced.")
     return statements
@@ -2766,15 +3054,24 @@ def _parse_meas_failures_from_text(text: str) -> list[dict[str, Any]]:
     failures: list[dict[str, Any]] = []
     seen: set[tuple[str, int]] = set()
     lines = text.splitlines()
+    active_measurement: str | None = None
     for index, line in enumerate(lines):
+        match_header = _MEAS_MEASUREMENT_RE.match(line)
+        if match_header:
+            active_measurement = match_header.group("name").strip() or None
+            continue
         match = _MEAS_FAILURE_RE.match(line)
         duplicate_match = _MEAS_DUPLICATE_RESULT_RE.match(line) if match is None else None
+        generic_error_match = _MEAS_GENERIC_ERROR_RE.match(line) if match is None and duplicate_match is None else None
         if match:
             name = match.group("name").strip()
             reason = (match.group("reason") or "").strip() or None
         elif duplicate_match:
             name = duplicate_match.group("name").strip()
             reason = "Multiply defined .measure result."
+        elif generic_error_match and active_measurement:
+            name = active_measurement
+            reason = generic_error_match.group("reason").strip()
         else:
             continue
         normalized = name.lower()
@@ -2804,7 +3101,10 @@ def _coerce_spice_number(value: Any, *, field_name: str) -> float:
     if isinstance(value, bool):
         raise ValueError(f"{field_name} must be numeric, got boolean value {value!r}.")
     if isinstance(value, (int, float)):
-        return float(value)
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise ValueError(f"{field_name} must be a finite numeric value.")
+        return numeric
     if isinstance(value, str):
         token = value.strip()
         if not token:
@@ -2815,7 +3115,10 @@ def _coerce_spice_number(value: Any, *, field_name: str) -> float:
                 f"{field_name} must be a numeric value or SPICE number token (for example: 1k, 4.7u, 10m). "
                 f"Received: {value!r}"
             )
-        return float(parsed)
+        numeric = float(parsed)
+        if not math.isfinite(numeric):
+            raise ValueError(f"{field_name} must be a finite numeric value.")
+        return numeric
     raise ValueError(
         f"{field_name} must be a numeric value or SPICE number token string; received type {type(value).__name__}."
     )
@@ -3025,6 +3328,30 @@ def _metric_from_series(series: list[complex], statistic: str) -> float:
     raise ValueError("statistic must be one of: min, max, avg, rms, pp, final, abs_max")
 
 
+def _select_metric_vector(dataset: RawDataset, requested: str) -> tuple[str, str | None]:
+    requested_name = requested.strip()
+    available = [variable.name for variable in dataset.variables]
+    if requested_name in available:
+        return requested_name, None
+    requested_lower = requested_name.lower()
+    for candidate in available:
+        if candidate.lower() == requested_lower:
+            return candidate, None
+    non_scale = [
+        variable.name
+        for variable in dataset.variables
+        if not (dataset.has_natural_scale() and variable.index == 0)
+    ]
+    if non_scale:
+        fallback = non_scale[0]
+        warning = (
+            f"Requested metric_vector '{requested_name}' was not found. "
+            f"Using '{fallback}' instead."
+        )
+        return fallback, warning
+    raise ValueError("No non-scale vectors are available for metric extraction.")
+
+
 def _evaluate_limits(
     *,
     value: float | None,
@@ -3067,11 +3394,15 @@ def _evaluate_target_tolerance(
     abs_allowed = 0.0
     checks: list[str] = []
     if rel_tol_pct is not None:
-        rel_allowed = abs(float(target)) * (abs(float(rel_tol_pct)) / 100.0)
+        if float(rel_tol_pct) < 0:
+            return False, "rel_tol_pct must be >= 0", None
+        rel_allowed = abs(float(target)) * (float(rel_tol_pct) / 100.0)
         checks.append(f"abs(value-target) <= {rel_allowed} (rel_tol_pct={rel_tol_pct})")
         allowed = max(allowed, rel_allowed)
     if abs_tol is not None:
-        abs_allowed = abs(float(abs_tol))
+        if float(abs_tol) < 0:
+            return False, "abs_tol must be >= 0", None
+        abs_allowed = float(abs_tol)
         checks.append(f"abs(value-target) <= {abs_allowed} (abs_tol)")
         allowed = max(allowed, abs_allowed)
     if not checks:
@@ -3141,14 +3472,48 @@ def _validate_verification_assertion_schema(assertion: dict[str, Any], *, path: 
             f"{path} ({check_type}) must include at least one acceptance criterion: "
             "min, max, target, rel_tol_pct, or abs_tol."
         )
+    minimum = (
+        _require_float(f"{path}.min", assertion.get("min"))
+        if assertion.get("min") is not None
+        else None
+    )
+    maximum = (
+        _require_float(f"{path}.max", assertion.get("max"))
+        if assertion.get("max") is not None
+        else None
+    )
+    target = (
+        _require_float(f"{path}.target", assertion.get("target"))
+        if assertion.get("target") is not None
+        else None
+    )
+    rel_tol_pct = (
+        _require_float(f"{path}.rel_tol_pct", assertion.get("rel_tol_pct"), minimum=0.0)
+        if assertion.get("rel_tol_pct") is not None
+        else None
+    )
+    abs_tol = (
+        _require_float(f"{path}.abs_tol", assertion.get("abs_tol"), minimum=0.0)
+        if assertion.get("abs_tol") is not None
+        else None
+    )
+    if minimum is not None and maximum is not None and minimum > maximum:
+        raise ValueError(f"{path} is invalid: min must be <= max.")
     if (assertion.get("rel_tol_pct") is not None or assertion.get("abs_tol") is not None) and assertion.get("target") is None:
         raise ValueError(f"{path} must include target when rel_tol_pct or abs_tol is provided.")
+    if target is not None:
+        if rel_tol_pct is not None and rel_tol_pct < 0:
+            raise ValueError(f"{path}.rel_tol_pct must be >= 0.")
+        if abs_tol is not None and abs_tol < 0:
+            raise ValueError(f"{path}.abs_tol must be >= 0.")
 
 
-def _dedupe_conditions(*conditions: str) -> str:
+def _dedupe_conditions(*conditions: Any) -> str:
     ordered: list[str] = []
     seen: set[str] = set()
     for condition in conditions:
+        if condition is None:
+            continue
         text = str(condition).strip()
         if not text or text in seen:
             continue
@@ -3163,6 +3528,7 @@ def _evaluate_verification_assertion(
     dataset: RawDataset | None,
     measurement_map: dict[str, float],
     measurement_steps_map: dict[str, list[dict[str, Any]]],
+    measurement_failure_map: dict[str, list[str]],
     default_id: str,
     fail_fast: bool,
 ) -> dict[str, Any]:
@@ -3187,14 +3553,25 @@ def _evaluate_verification_assertion(
                 if fail_fast and check_type == "all_of":
                     break
                 continue
-            child_result = _evaluate_verification_assertion(
-                assertion=child,
-                dataset=dataset,
-                measurement_map=measurement_map,
-                measurement_steps_map=measurement_steps_map,
-                default_id=f"{check_id}.{index}",
-                fail_fast=fail_fast,
-            )
+            try:
+                child_result = _evaluate_verification_assertion(
+                    assertion=child,
+                    dataset=dataset,
+                    measurement_map=measurement_map,
+                    measurement_steps_map=measurement_steps_map,
+                    measurement_failure_map=measurement_failure_map,
+                    default_id=f"{check_id}.{index}",
+                    fail_fast=fail_fast,
+                )
+            except Exception as exc:  # noqa: BLE001
+                child_result = {
+                    "id": f"{check_id}.{index}",
+                    "type": str(child.get("type", "invalid")).strip().lower(),
+                    "passed": False,
+                    "value": None,
+                    "error": str(exc),
+                    "details": {"assertion": child},
+                }
             child_results.append(child_result)
             if fail_fast:
                 if check_type == "all_of" and not bool(child_result.get("passed")):
@@ -3222,11 +3599,15 @@ def _evaluate_verification_assertion(
     target_raw = assertion.get("target")
     rel_tol_raw = assertion.get("rel_tol_pct")
     abs_tol_raw = assertion.get("abs_tol")
-    minimum = float(minimum_raw) if minimum_raw is not None else None
-    maximum = float(maximum_raw) if maximum_raw is not None else None
-    target = float(target_raw) if target_raw is not None else None
-    rel_tol_pct = float(rel_tol_raw) if rel_tol_raw is not None else None
-    abs_tol = float(abs_tol_raw) if abs_tol_raw is not None else None
+    minimum = _require_float("min", minimum_raw) if minimum_raw is not None else None
+    maximum = _require_float("max", maximum_raw) if maximum_raw is not None else None
+    target = _require_float("target", target_raw) if target_raw is not None else None
+    rel_tol_pct = (
+        _require_float("rel_tol_pct", rel_tol_raw, minimum=0.0) if rel_tol_raw is not None else None
+    )
+    abs_tol = _require_float("abs_tol", abs_tol_raw, minimum=0.0) if abs_tol_raw is not None else None
+    if minimum is not None and maximum is not None and minimum > maximum:
+        raise ValueError("min must be <= max.")
     value: float | None = None
     details: dict[str, Any] = {"assertion": assertion}
 
@@ -3281,7 +3662,7 @@ def _evaluate_verification_assertion(
                     "id": check_id,
                     "type": check_type,
                     "passed": passed,
-                    "value": per_step[-1]["value"] if per_step else None,
+                    "value": None,
                     "min": minimum,
                     "max": maximum,
                     "target": target,
@@ -3293,6 +3674,13 @@ def _evaluate_verification_assertion(
                     "details": details,
                 }
             value = measurement_map.get(lookup_key)
+            if value is None:
+                failure_reasons = measurement_failure_map.get(lookup_key, [])
+                if failure_reasons:
+                    details["measurement_failure_reasons"] = failure_reasons
+                    details["measurement_status"] = "evaluation_error"
+                else:
+                    details["measurement_status"] = "missing"
         details["measurement_name"] = meas_name
     else:
         if dataset is None:
@@ -3323,7 +3711,7 @@ def _evaluate_verification_assertion(
                     frequency_hz=dataset.scale_values(step_index=selected),
                     response=dataset.get_vector(vector, step_index=selected),
                     reference=str(assertion.get("reference", "first")),
-                    drop_db=float(assertion.get("drop_db", 3.0)),
+                    drop_db=_require_float("drop_db", assertion.get("drop_db", 3.0), minimum=0.0),
                 )
                 return result.get(metric), {"vector": vector, "metric": metric, "result": result, **_step_payload(dataset, selected)}
             if check_type == "gain_phase_margin":
@@ -3338,8 +3726,8 @@ def _evaluate_verification_assertion(
                 result = compute_rise_fall_time(
                     time_s=dataset.scale_values(step_index=selected),
                     signal=dataset.get_vector(vector, step_index=selected),
-                    low_threshold_pct=float(assertion.get("low_threshold_pct", 10.0)),
-                    high_threshold_pct=float(assertion.get("high_threshold_pct", 90.0)),
+                    low_threshold_pct=_require_float("low_threshold_pct", assertion.get("low_threshold_pct", 10.0)),
+                    high_threshold_pct=_require_float("high_threshold_pct", assertion.get("high_threshold_pct", 90.0)),
                 )
                 return result.get(metric), {"vector": vector, "metric": metric, "result": result, **_step_payload(dataset, selected)}
             if check_type == "settling_time":
@@ -3347,8 +3735,8 @@ def _evaluate_verification_assertion(
                 result = compute_settling_time(
                     time_s=dataset.scale_values(step_index=selected),
                     signal=dataset.get_vector(vector, step_index=selected),
-                    tolerance_percent=float(assertion.get("tolerance_percent", 2.0)),
-                    target_value=float(assertion["target_value"])
+                    tolerance_percent=_require_float("tolerance_percent", assertion.get("tolerance_percent", 2.0), minimum=0.0),
+                    target_value=_require_float("target_value", assertion["target_value"])
                     if "target_value" in assertion and assertion["target_value"] is not None
                     else None,
                 )
@@ -3428,6 +3816,26 @@ def _evaluate_verification_assertion(
         "condition": combined_condition,
         "details": details,
     }
+
+
+def _dedupe_check_ids_recursive(
+    checks: list[dict[str, Any]],
+    *,
+    seen_ids: dict[str, int] | None = None,
+) -> None:
+    if seen_ids is None:
+        seen_ids = {}
+    for item in checks:
+        original = str(item.get("id") or "").strip() or "check"
+        count = seen_ids.get(original, 0) + 1
+        seen_ids[original] = count
+        if count > 1:
+            item["id"] = f"{original}#{count}"
+        else:
+            item["id"] = original
+        children = item.get("children")
+        if isinstance(children, list):
+            _dedupe_check_ids_recursive(children, seen_ids=seen_ids)
 
 
 def _run_process_simulation_with_cancel(
@@ -5502,11 +5910,10 @@ def parseMeasResults(
     )
 
     if normalized_log_path:
-        target = Path(normalized_log_path).expanduser().resolve()
-        if not target.exists():
-            raise FileNotFoundError(f"Log file not found: {target}")
+        target = _validate_log_file_path(normalized_log_path, field_name="log_path")
         text = read_text_auto(target)
         parsed = _parse_meas_results_from_text(text)
+        parsed["failed_measurements"] = _parse_meas_failures_from_text(text)
         return {
             "run_id": None,
             "log_path": str(target),
@@ -5534,6 +5941,7 @@ def parseMeasResults(
         except Exception:
             pass
     parsed = _parse_meas_results_from_text(text)
+    parsed["failed_measurements"] = _parse_meas_failures_from_text(text)
     if statement_kinds:
         _apply_meas_statement_kinds(parsed, statement_kinds=statement_kinds)
     return {
@@ -5569,17 +5977,30 @@ def runMeasAutomation(
     statements = _build_meas_statements(measurements)
     source_netlist: Path
     if netlist_content is not None:
+        normalized_content = netlist_content.rstrip() + "\n"
+        if not any(line.strip().lower() == ".end" for line in normalized_content.splitlines()):
+            normalized_content += ".end\n"
+        _validate_netlist_text(
+            normalized_content,
+            field_name="netlist_content",
+            require_end=True,
+            require_elements=False,
+            require_analysis=False,
+        )
         source_netlist = _runner.write_netlist(netlist_content, circuit_name=circuit_name)
     elif normalized_netlist_path is not None:
-        source_netlist = Path(normalized_netlist_path).expanduser().resolve()
-        if not source_netlist.exists():
-            raise FileNotFoundError(f"Netlist file not found: {source_netlist}")
+        source_netlist, _ = _load_validated_netlist_file(
+            normalized_netlist_path,
+            field_name="netlist_path",
+            allow_asc=False,
+            require_end=True,
+            require_elements=False,
+            require_analysis=False,
+        )
         staged = _stage_sync_source_netlist(source_path=source_netlist, purpose="meas_automation")
         source_netlist = Path(str(staged["run_path"])).expanduser().resolve()
     elif normalized_asc_path is not None:
-        asc_resolved = Path(normalized_asc_path).expanduser().resolve()
-        if not asc_resolved.exists():
-            raise FileNotFoundError(f"Schematic file not found: {asc_resolved}")
+        asc_resolved = _validate_schematic_path(normalized_asc_path, field_name="asc_path")
         target = _resolve_schematic_simulation_target(asc_resolved, require_sidecar_on_macos=True)
         if not bool(target.get("can_batch_simulate")):
             raise ValueError(str(target.get("error")))
@@ -5624,6 +6045,10 @@ def runMeasAutomation(
             failed_measurements = _parse_meas_failures_from_text(read_text_auto(log_target))
         except Exception:  # noqa: BLE001
             failed_measurements = []
+    if not failed_measurements and isinstance(meas_payload.get("failed_measurements"), list):
+        failed_measurements = [
+            entry for entry in meas_payload.get("failed_measurements", []) if isinstance(entry, dict)
+        ]
     failed_requested: list[dict[str, Any]] = []
     if requested_names:
         requested_lookup = {name.lower() for name in requested_names}
@@ -5653,10 +6078,22 @@ def runMeasAutomation(
     run_payload_with_meas["overall_succeeded"] = overall_succeeded
 
     wrapper_warnings: list[str] = []
+    measurement_issue_messages: list[str] = []
     if not requested_measurements_succeeded:
         wrapper_warnings.append(
             "One or more requested .meas directives did not produce a numeric result. "
             "Inspect failed_measurements/missing_requested_measurements for details."
+        )
+    for entry in failed_requested:
+        name = str(entry.get("name", "")).strip() or "unknown"
+        reason = str(entry.get("reason", "")).strip()
+        if reason:
+            measurement_issue_messages.append(f"Measurement '{name}' failed: {reason}")
+        else:
+            measurement_issue_messages.append(f"Measurement '{name}' failed.")
+    if missing_requested:
+        measurement_issue_messages.append(
+            "Requested measurements missing: " + ", ".join(missing_requested)
         )
 
     meas_payload = dict(meas_payload)
@@ -5664,6 +6101,11 @@ def runMeasAutomation(
     meas_payload["failed_measurements"] = failed_requested
     meas_payload["missing_requested_measurements"] = missing_requested
     meas_payload["requested_measurements_succeeded"] = requested_measurements_succeeded
+    if measurement_issue_messages:
+        run_payload_with_meas["issues"] = [
+            *list(run_payload_with_meas.get("issues") or []),
+            *measurement_issue_messages,
+        ]
 
     return {
         "source_netlist_path": str(source_netlist),
@@ -5739,6 +6181,7 @@ def runVerificationPlan(
 
     measurement_map: dict[str, float] = {}
     measurement_steps_map: dict[str, list[dict[str, Any]]] = {}
+    measurement_failure_map: dict[str, list[str]] = {}
     measurement_report: dict[str, Any] | None = None
     if measurements:
         meas_source_netlist = netlist_path
@@ -5781,10 +6224,67 @@ def runVerificationPlan(
             if str(name).strip()
         }
         measurement_report = parsed_meas
+    if isinstance(measurement_report, dict):
+        for failure in measurement_report.get("failed_measurements", []) or []:
+            if not isinstance(failure, dict):
+                continue
+            key = str(failure.get("name", "")).strip().lower()
+            if not key:
+                continue
+            reason = str(failure.get("reason", "")).strip() or "measurement failed"
+            measurement_failure_map.setdefault(key, []).append(reason)
 
     requires_dataset = any(_assertion_requires_dataset(item) for item in assertions if isinstance(item, dict))
-    dataset = _resolve_dataset(plot=None, run_id=run.run_id, raw_path=None) if requires_dataset else None
+    run_succeeded = bool(run_payload.get("succeeded", False))
+    dataset: RawDataset | None = None
+    if run_succeeded and requires_dataset:
+        try:
+            dataset = _resolve_dataset(plot=None, run_id=run.run_id, raw_path=None)
+        except Exception as exc:  # noqa: BLE001
+            issue_excerpt = "; ".join(str(item) for item in list(run_payload.get("issues") or [])[:2])
+            extra = f" Root cause: {issue_excerpt}" if issue_excerpt else ""
+            raise ValueError(f"{exc}{extra}") from exc
     checks: list[dict[str, Any]] = []
+
+    if not run_succeeded:
+        run_issue_excerpt = "; ".join(str(item) for item in list(run_payload.get("issues") or [])[:3]) or "Simulation did not succeed."
+        for index, assertion in enumerate(assertions, start=1):
+            check_id = (
+                str(assertion.get("id") or assertion.get("name") or f"check_{index}")
+                if isinstance(assertion, dict)
+                else f"check_{index}"
+            )
+            check_type = (
+                str(assertion.get("type", "vector_stat")).strip().lower()
+                if isinstance(assertion, dict)
+                else "invalid"
+            )
+            checks.append(
+                {
+                    "id": check_id,
+                    "type": check_type,
+                    "passed": False,
+                    "skipped": True,
+                    "value": None,
+                    "error": f"Verification checks were skipped because run '{run.run_id}' did not succeed.",
+                    "condition": "run must succeed before assertion evaluation",
+                    "details": {
+                        "assertion": assertion,
+                        "run_id": run.run_id,
+                        "run_issue_excerpt": run_issue_excerpt,
+                    },
+                }
+            )
+        _dedupe_check_ids_recursive(checks)
+        return {
+            "overall_passed": False,
+            "passed_count": 0,
+            "failed_count": len(checks),
+            "run_source": context["source"],
+            "run": run_payload,
+            "checks": checks,
+            "measurements": measurement_report,
+        }
 
     for index, assertion in enumerate(assertions, start=1):
         if not isinstance(assertion, dict):
@@ -5807,6 +6307,7 @@ def runVerificationPlan(
                 dataset=dataset,
                 measurement_map=measurement_map,
                 measurement_steps_map=measurement_steps_map,
+                measurement_failure_map=measurement_failure_map,
                 default_id=f"check_{index}",
                 fail_fast=fail_fast,
             )
@@ -5829,16 +6330,7 @@ def runVerificationPlan(
             if fail_fast:
                 break
 
-    # Guarantee unique check ids to avoid collisions in client ID-indexed maps.
-    seen_ids: dict[str, int] = {}
-    for item in checks:
-        original = str(item.get("id") or "").strip() or "check"
-        count = seen_ids.get(original, 0) + 1
-        seen_ids[original] = count
-        if count > 1:
-            item["id"] = f"{original}#{count}"
-        else:
-            item["id"] = original
+    _dedupe_check_ids_recursive(checks)
 
     passed_count = sum(1 for item in checks if item.get("passed"))
     failed_count = len(checks) - passed_count
@@ -5886,11 +6378,26 @@ def runSweepStudy(
     staged_netlist_path: str | None = None
     staging_warnings: list[str] = []
     if netlist_content is not None:
+        normalized_content = netlist_content.rstrip() + "\n"
+        if not any(line.strip().lower() == ".end" for line in normalized_content.splitlines()):
+            normalized_content += ".end\n"
+        _validate_netlist_text(
+            normalized_content,
+            field_name="netlist_content",
+            require_end=True,
+            require_elements=False,
+            require_analysis=False,
+        )
         base_path = _runner.write_netlist(netlist_content, circuit_name=circuit_name)
     elif normalized_netlist_path is not None:
-        source_path = Path(normalized_netlist_path).expanduser().resolve()
-        if not source_path.exists():
-            raise FileNotFoundError(f"Netlist file not found: {source_path}")
+        source_path, _ = _load_validated_netlist_file(
+            normalized_netlist_path,
+            field_name="netlist_path",
+            allow_asc=False,
+            require_end=True,
+            require_elements=False,
+            require_analysis=False,
+        )
         staged = _stage_sync_source_netlist(source_path=source_path, purpose="sweep_study")
         base_path = Path(str(staged["run_path"])).expanduser().resolve()
         source_netlist_path = str(source_path)
@@ -5997,6 +6504,9 @@ def runSweepStudy(
         )
         run = _resolve_run(str(run_payload["run_id"]))
         dataset = _resolve_dataset(plot=None, run_id=run.run_id, raw_path=None)
+        selected_metric_vector, metric_warning = _select_metric_vector(dataset, metric_vector)
+        if metric_warning:
+            warnings.append(metric_warning)
         metric_values: list[float] = []
         plot_name_lower = dataset.plot_name.strip().lower()
         is_operating_point_plot = (
@@ -6012,7 +6522,7 @@ def runSweepStudy(
             and len(sweep_values) == dataset.points
         )
         if use_point_aligned_fallback:
-            full_series = dataset.get_vector(metric_vector, step_index=None)
+            full_series = dataset.get_vector(selected_metric_vector, step_index=None)
             parameter_series: list[complex] | None = None
             for vector_name in _vector_name_candidates(param_name):
                 try:
@@ -6047,6 +6557,7 @@ def runSweepStudy(
             for idx in step_indices:
                 selected = _resolve_step_index(dataset, idx)
                 series = dataset.get_vector(metric_vector, step_index=selected)
+                series = dataset.get_vector(selected_metric_vector, step_index=selected)
                 value = _metric_from_series(series, metric_statistic)
                 metric_values.append(value)
                 parameter_value = _extract_step_parameter_value_from_dataset(
@@ -6117,7 +6628,10 @@ def runSweepStudy(
                         "Use a source netlist without existing .step directives."
                     )
                 selected = _resolve_step_index(dataset, 0)
-                series = dataset.get_vector(metric_vector, step_index=selected)
+                selected_metric_vector, metric_warning = _select_metric_vector(dataset, metric_vector)
+                if metric_warning:
+                    warnings.append(metric_warning)
+                series = dataset.get_vector(selected_metric_vector, step_index=selected)
                 value = _metric_from_series(series, metric_statistic)
                 metric_values.append(value)
                 record["metric_value"] = value
@@ -6473,11 +6987,26 @@ def queueSimulationJob(
     safe_max_retries = _require_int("max_retries", max_retries, minimum=0)
     source: Path
     if netlist_content is not None:
+        normalized_content = netlist_content.rstrip() + "\n"
+        if not any(line.strip().lower() == ".end" for line in normalized_content.splitlines()):
+            normalized_content += ".end\n"
+        _validate_netlist_text(
+            normalized_content,
+            field_name="netlist_content",
+            require_end=True,
+            require_elements=False,
+            require_analysis=False,
+        )
         source = _runner.write_netlist(netlist_content, circuit_name=circuit_name)
     else:
-        source = Path(str(netlist_path)).expanduser().resolve()
-        if not source.exists():
-            raise FileNotFoundError(f"Netlist file not found: {source}")
+        source, _ = _load_validated_netlist_file(
+            str(netlist_path),
+            field_name="netlist_path",
+            allow_asc=False,
+            require_end=True,
+            require_elements=False,
+            require_analysis=False,
+        )
     _loaded_netlist = source
     return _queue_simulation_job(
         source_path=source,
@@ -7680,6 +8209,17 @@ def watchSchematicFromNetlistFile(
 def loadCircuit(netlist: str, circuit_name: str = "circuit") -> dict[str, Any]:
     """Create a netlist file in the MCP workdir and mark it as the currently loaded circuit."""
     global _loaded_netlist
+    _loaded_netlist = None
+    normalized = netlist.rstrip() + "\n"
+    if not any(line.strip().lower() == ".end" for line in normalized.splitlines()):
+        normalized += ".end\n"
+    _validate_netlist_text(
+        normalized,
+        field_name="netlist",
+        require_end=True,
+        require_elements=True,
+        require_analysis=False,
+    )
     path = _runner.write_netlist(netlist, circuit_name=circuit_name)
     _loaded_netlist = path
     response: dict[str, Any] = {"netlist_path": str(path), "loaded": True}
@@ -7696,6 +8236,8 @@ def loadCircuit(netlist: str, circuit_name: str = "circuit") -> dict[str, Any]:
         response["asc_path"] = schematic["asc_path"]
         response["schematic"] = schematic
     except Exception as exc:
+        _loaded_netlist = None
+        response["loaded"] = False
         response["schematic_error"] = str(exc)
     return response
 
@@ -7704,9 +8246,15 @@ def loadCircuit(netlist: str, circuit_name: str = "circuit") -> dict[str, Any]:
 def loadNetlistFromFile(filepath: str) -> dict[str, Any]:
     """Load an existing .cir/.net/.asc file as the current circuit."""
     global _loaded_netlist
-    path = Path(filepath).expanduser().resolve()
-    if not path.exists():
-        raise FileNotFoundError(f"Netlist file not found: {path}")
+    _loaded_netlist = None
+    path, _ = _load_validated_netlist_file(
+        filepath,
+        field_name="filepath",
+        allow_asc=False,
+        require_end=True,
+        require_elements=True,
+        require_analysis=False,
+    )
     _loaded_netlist = path
     return {"netlist_path": str(path), "loaded": True}
 
@@ -7793,9 +8341,14 @@ def simulateNetlistFile(
 ) -> dict[str, Any]:
     """Run LTspice batch simulation for an existing netlist path."""
     global _loaded_netlist
-    path = Path(netlist_path).expanduser().resolve()
-    if not path.exists():
-        raise FileNotFoundError(f"Netlist file not found: {path}")
+    path, _ = _load_validated_netlist_file(
+        netlist_path,
+        field_name="netlist_path",
+        allow_asc=False,
+        require_end=True,
+        require_elements=False,
+        require_analysis=False,
+    )
     _loaded_netlist = path
     staged = _stage_sync_source_netlist(source_path=path, purpose="simulate_netlist_file")
     staged_path = Path(str(staged["run_path"])).expanduser().resolve()
@@ -8607,22 +9160,26 @@ def getVectorData(
     if not vectors:
         raise ValueError("vectors must contain at least one vector name")
     representation = _sanitize_representation(representation)
+    safe_max_points = _require_int("max_points", max_points, minimum=1, maximum=200_000)
 
     dataset = _resolve_dataset(plot=plot, run_id=run_id, raw_path=raw_path)
     selected_step = _resolve_step_index(dataset, step_index)
     scale = dataset.scale_values(step_index=selected_step)
 
     if points is not None:
-        sampled_scale = points
+        sampled_scale = [
+            _require_float("points[]", value)
+            for value in points
+        ]
         sampled_vectors: dict[str, list[complex]] = {}
         for vector_name in vectors:
             sampled_vectors[vector_name] = interpolate_series(
                 scale=scale,
                 series=dataset.get_vector(vector_name, step_index=selected_step),
-                points=points,
+                points=sampled_scale,
             )
     else:
-        idx = sample_indices(len(scale), max_points=max_points)
+        idx = sample_indices(len(scale), max_points=safe_max_points)
         sampled_scale = [scale[i] for i in idx]
         sampled_vectors = {
             vector_name: [dataset.get_vector(vector_name, step_index=selected_step)[i] for i in idx]
@@ -8663,8 +9220,8 @@ def getLocalExtrema(
     options = options or {}
     include_minima = bool(options.get("minima", True))
     include_maxima = bool(options.get("maxima", True))
-    threshold = float(options.get("threshold", 0.0))
-    max_results = int(options.get("max_results", 200))
+    threshold = _require_float("options.threshold", options.get("threshold", 0.0))
+    max_results = _require_int("options.max_results", options.get("max_results", 200), minimum=1, maximum=100_000)
 
     dataset = _resolve_dataset(plot=plot, run_id=run_id, raw_path=raw_path)
     selected_step = _resolve_step_index(dataset, step_index)

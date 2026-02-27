@@ -112,6 +112,77 @@ class TestServerStatePersistence(unittest.TestCase):
         self.assertIn("SYMBOL res", text)
         self.assertIn("SYMBOL cap", text)
 
+    def test_load_netlist_from_file_rejects_directory_and_binary(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_load_netlist_validate_test_"))
+        server._configure_runner(workdir=temp_dir, ltspice_binary=None, timeout=10)
+
+        with self.assertRaisesRegex(ValueError, "filepath must be a file"):
+            server.loadNetlistFromFile(str(temp_dir))
+
+        binary = temp_dir / "bad.cir"
+        binary.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR")
+        with self.assertRaisesRegex(ValueError, "appears to be binary"):
+            server.loadNetlistFromFile(str(binary))
+
+    def test_load_netlist_from_file_rejects_unreadable_file(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_load_netlist_unreadable_test_"))
+        server._configure_runner(workdir=temp_dir, ltspice_binary=None, timeout=10)
+
+        netlist = temp_dir / "unreadable.cir"
+        netlist.write_text("* unreadable\nR1 in 0 1k\n.op\n.end\n", encoding="utf-8")
+        netlist.chmod(0)
+        try:
+            with self.assertRaisesRegex(ValueError, "filepath is not readable"):
+                server.loadNetlistFromFile(str(netlist))
+        finally:
+            netlist.chmod(0o644)
+
+    def test_failed_load_clears_stale_loaded_state(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_load_state_reset_test_"))
+        server._configure_runner(workdir=temp_dir, ltspice_binary=None, timeout=10)
+
+        good = temp_dir / "good.cir"
+        good.write_text("* good\nV1 in 0 1\n.op\n.end\n", encoding="utf-8")
+        loaded = server.loadNetlistFromFile(str(good))
+        self.assertTrue(loaded["loaded"])
+
+        with self.assertRaisesRegex(FileNotFoundError, "filepath not found"):
+            server.loadNetlistFromFile(str(temp_dir / "missing.cir"))
+
+        with self.assertRaisesRegex(ValueError, "No netlist is loaded"):
+            server.runSimulation()
+
+    def test_get_run_details_log_tail_lines_one_returns_last_line(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_run_details_tail_test_"))
+        server._configure_runner(workdir=temp_dir, ltspice_binary=None, timeout=10)
+
+        netlist = temp_dir / "tail.cir"
+        netlist.write_text("* tail\n.end\n", encoding="utf-8")
+        log_path = temp_dir / "tail.log"
+        log_path.write_text("line1\nline2\nline3\n", encoding="utf-8")
+
+        run = SimulationRun(
+            run_id="tail-run",
+            netlist_path=netlist,
+            command=["LTspice", "-b", str(netlist)],
+            ltspice_executable=Path("/Applications/LTspice.app/Contents/MacOS/LTspice"),
+            started_at="2026-02-24T12:00:00+00:00",
+            duration_seconds=0.1,
+            return_code=0,
+            stdout="",
+            stderr="",
+            log_path=log_path,
+            raw_files=[],
+            artifacts=[netlist, log_path],
+            issues=[],
+            warnings=[],
+            diagnostics=[],
+        )
+        server._register_run(run)
+
+        payload = server.getRunDetails(run_id="tail-run", include_output=False, log_tail_lines=1)
+        self.assertEqual(payload["log_tail"].strip(), "line3")
+
 
 if __name__ == "__main__":
     unittest.main()
