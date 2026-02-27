@@ -23,6 +23,7 @@ class _SectionMarker:
 
 _INT_RE = re.compile(r"-?\d+")
 _SCALAR_COMPLEX_RE = re.compile(r"^\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)$")
+_SCALAR_COMPLEX_BARE_RE = re.compile(r"^\s*([^,]+?)\s*,\s*([^,]+?)\s*$")
 _STEP_LINE_RE = re.compile(r"^\s*\.step\s+(.+?)\s*$", re.IGNORECASE)
 _STEP_INFO_RE = re.compile(
     r"^\s*Step Information:\s*(?P<label>.+?)(?:\s+\(Run:.*\))?\s*$",
@@ -120,6 +121,9 @@ def _parse_scalar(token: str) -> complex:
     complex_match = _SCALAR_COMPLEX_RE.match(cleaned)
     if complex_match:
         return complex(float(complex_match.group(1)), float(complex_match.group(2)))
+    bare_complex_match = _SCALAR_COMPLEX_BARE_RE.match(cleaned)
+    if bare_complex_match:
+        return complex(float(bare_complex_match.group(1)), float(bare_complex_match.group(2)))
     return complex(float(cleaned), 0.0)
 
 

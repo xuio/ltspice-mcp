@@ -101,10 +101,13 @@ def get_capture_health_snapshot(limit: int = 400) -> dict[str, Any]:
         "capture_screencapturekit_failed",
         "capture_screencapture_failed",
         "capture_file_missing",
+        "capture_close_verification_mismatch",
     ]
     failures = sum(int(event_counts.get(name, 0)) for name in failure_events)
-    close_incomplete = int(event_counts.get("capture_close_incomplete", 0))
-    success_rate = round(successes / starts, 4) if starts > 0 else None
+    close_incomplete = int(event_counts.get("capture_close_incomplete", 0)) + int(
+        event_counts.get("capture_close_verification_mismatch", 0)
+    )
+    success_rate = round(min(successes, starts) / starts, 4) if starts > 0 else None
     latest_failure = next(
         (
             item
@@ -120,6 +123,7 @@ def get_capture_health_snapshot(limit: int = 400) -> dict[str, Any]:
         "capture_failures": failures,
         "capture_close_incomplete": close_incomplete,
         "success_rate": success_rate,
+        "window_truncated_bias": bool(successes > starts),
         "event_counts": dict(sorted(event_counts.items())),
         "latest_event": events[-1] if events else None,
         "latest_failure": latest_failure,
@@ -2756,6 +2760,13 @@ def capture_ltspice_window_screenshot(
                 _log_capture_event(
                     logging.WARNING,
                     "capture_close_incomplete",
+                    capture_id=capture_id,
+                    close_event=close_event,
+                )
+            if close_event and close_event.get("verification_mismatch"):
+                _log_capture_event(
+                    logging.WARNING,
+                    "capture_close_verification_mismatch",
                     capture_id=capture_id,
                     close_event=close_event,
                 )

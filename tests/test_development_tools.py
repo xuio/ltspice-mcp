@@ -88,6 +88,32 @@ class TestDevelopmentTools(unittest.TestCase):
         self.assertEqual(payload["vectors_selected"], ["V(out)"])
         plt_mock.assert_called_once()
 
+    def test_plot_preset_rejects_empty_vectors(self) -> None:
+        raw_path = self.temp_dir / "preset_empty.raw"
+        raw_path.write_text("raw\n", encoding="utf-8")
+        dataset = RawDataset(
+            path=raw_path.resolve(),
+            plot_name="AC Analysis",
+            flags={"complex"},
+            metadata={},
+            variables=[
+                RawVariable(index=0, name="frequency", kind="frequency"),
+                RawVariable(index=1, name="V(out)", kind="voltage"),
+            ],
+            values=[
+                [10.0 + 0j, 100.0 + 0j],
+                [1.0 + 0j, 0.5 + 0j],
+            ],
+            steps=[],
+        )
+        with patch("ltspice_mcp.server._resolve_dataset", return_value=dataset):
+            with self.assertRaisesRegex(ValueError, "vectors must contain at least one vector name"):
+                server.generatePlotPresetSettings(
+                    preset="bode",
+                    vectors=[],
+                    run_id="run-1",
+                )
+
     def test_render_plot_preset_image_wraps_payload(self) -> None:
         raw_path = self.temp_dir / "preset2.raw"
         raw_path.write_text("raw\n", encoding="utf-8")
@@ -120,6 +146,32 @@ class TestDevelopmentTools(unittest.TestCase):
             )
         self.assertEqual(payload["plot_preset"], "bode")
         self.assertEqual(payload["vectors_selected"], ["V(out)"])
+
+    def test_render_plot_preset_rejects_empty_vectors(self) -> None:
+        raw_path = self.temp_dir / "preset3.raw"
+        raw_path.write_text("raw\n", encoding="utf-8")
+        dataset = RawDataset(
+            path=raw_path.resolve(),
+            plot_name="AC Analysis",
+            flags={"complex"},
+            metadata={},
+            variables=[
+                RawVariable(index=0, name="frequency", kind="frequency"),
+                RawVariable(index=1, name="V(out)", kind="voltage"),
+            ],
+            values=[
+                [10.0 + 0j, 100.0 + 0j],
+                [1.0 + 0j, 0.5 + 0j],
+            ],
+            steps=[],
+        )
+        with patch("ltspice_mcp.server._resolve_dataset", return_value=dataset):
+            with self.assertRaisesRegex(ValueError, "vectors must contain at least one vector name"):
+                server.renderLtspicePlotPresetImage(
+                    preset="bode",
+                    vectors=[],
+                    run_id="run-1",
+                )
 
     def test_scan_model_issues_from_log(self) -> None:
         log_path = self.temp_dir / "model.log"

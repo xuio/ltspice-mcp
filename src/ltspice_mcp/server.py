@@ -163,6 +163,7 @@ _job_history_index: dict[str, int] = {}
 _job_history_retention = max(50, int(os.getenv("LTSPICE_MCP_JOB_HISTORY_RETENTION", "1000")))
 _job_seq = 0
 _JOB_TERMINAL_STATUSES = {"succeeded", "failed", "canceled"}
+_JOB_ALL_STATUSES = {"queued", "running", *_JOB_TERMINAL_STATUSES}
 
 # Visual style defaults calibrated from manually curated fixture schematics.
 _SCHEMATIC_STYLE_PROFILE: dict[str, int] = {
@@ -604,6 +605,18 @@ def _telemetry_payload() -> dict[str, Any]:
         total = int(entry.get("calls_total", 0))
         total_ms = float(entry.get("total_ms", 0.0))
         avg_ms = (total_ms / total) if total > 0 else 0.0
+        last_started_at = entry.get("last_started_at")
+        last_finished_at = entry.get("last_finished_at")
+        timing_adjusted = False
+        if (
+            isinstance(last_started_at, str)
+            and isinstance(last_finished_at, str)
+            and last_finished_at < last_started_at
+        ):
+            # Can occur for self-observing telemetry calls while the current call
+            # is still in-flight; keep ordering monotonic in payload.
+            last_finished_at = last_started_at
+            timing_adjusted = True
         tools_payload.append(
             {
                 "tool": tool_name,
@@ -623,8 +636,9 @@ def _telemetry_payload() -> dict[str, Any]:
                 "last_ms": round(float(entry.get("last_ms", 0.0)), 3),
                 "last_status": str(entry.get("last_status", "ok")),
                 "last_error_type": entry.get("last_error_type"),
-                "last_started_at": entry.get("last_started_at"),
-                "last_finished_at": entry.get("last_finished_at"),
+                "last_started_at": last_started_at,
+                "last_finished_at": last_finished_at,
+                "timing_adjusted": timing_adjusted,
                 "recent_sample_count": len(recent),
             }
         )
@@ -822,72 +836,11 @@ def _collect_netlist_dependency_files(entry_path: Path) -> tuple[list[Path], lis
 
 
 def _snapshot_job_source_netlist(*, source_path: Path, job_id: str) -> dict[str, Any]:
-    source = source_path.expanduser().resolve()
-    if not source.exists():
-        raise FileNotFoundError(f"Netlist file not found: {source}")
-    if not source.is_file():
-        raise ValueError(f"Netlist source is not a file: {source}")
-
-    files, warnings = _collect_netlist_dependency_files(source)
-    if source not in files:
-        files.insert(0, source)
-    parent_paths = [str(path.parent) for path in files]
-    anchor = Path(os.path.commonpath(parent_paths)).resolve() if parent_paths else source.parent.resolve()
-
     snapshot_root = (_runner.workdir / "queued_sources" / job_id).resolve()
-    input_root = (snapshot_root / "input").resolve()
-    if snapshot_root.exists():
-        shutil.rmtree(snapshot_root, ignore_errors=True)
-    input_root.mkdir(parents=True, exist_ok=True)
-
-    mapped_paths: dict[Path, Path] = {}
-    for original in files:
-        relative = original.relative_to(anchor)
-        destination = (input_root / relative).resolve()
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(original, destination)
-        mapped_paths[original] = destination
-
-    rewritten_lines = 0
-    for original, copied in mapped_paths.items():
-        try:
-            source_text = read_text_auto(original)
-        except Exception:  # noqa: BLE001
-            continue
-        has_trailing_newline = source_text.endswith("\n")
-        changed = False
-        updated: list[str] = []
-        for raw_line in source_text.splitlines():
-            parsed = _parse_netlist_include_directive(raw_line)
-            if parsed is None:
-                updated.append(raw_line)
-                continue
-            prefix, token, suffix = parsed
-            resolved = _resolve_include_token_path(owner_path=original, token=token)
-            mapped = mapped_paths.get(resolved)
-            if mapped is None:
-                updated.append(raw_line)
-                continue
-            rewritten = f'{prefix}"{mapped}"{suffix}'
-            if rewritten != raw_line:
-                changed = True
-                rewritten_lines += 1
-            updated.append(rewritten)
-        if changed:
-            output = "\n".join(updated)
-            if has_trailing_newline:
-                output += "\n"
-            copied.write_text(output, encoding="utf-8")
-
-    run_path = mapped_paths[source]
-    return {
-        "source_path": str(source),
-        "run_path": str(run_path),
-        "snapshot_root": str(snapshot_root),
-        "file_count": len(mapped_paths),
-        "rewritten_include_lines": rewritten_lines,
-        "warnings": warnings,
-    }
+    return _snapshot_netlist_source_tree(
+        source_path=source_path,
+        snapshot_root=snapshot_root,
+    )
 
 
 def _next_job_seq() -> int:
@@ -1043,8 +996,10 @@ def _archive_job_locked(job: dict[str, Any]) -> None:
     job_id = str(job.get("job_id", "")).strip()
     if not job_id:
         return
+    archived_at = _now_iso()
+    job["archived_at"] = archived_at
     payload = dict(job)
-    payload["archived_at"] = _now_iso()
+    payload["archived_at"] = archived_at
     existing = _job_history_index.get(job_id)
     if existing is None:
         _job_history.append(payload)
@@ -1137,10 +1092,11 @@ def _register_run(run: SimulationRun) -> SimulationRun:
 
 
 def _resolve_run(run_id: str | None = None) -> SimulationRun:
-    if run_id:
-        run = _runs.get(run_id)
+    normalized_run_id = _normalize_optional_selector("run_id", run_id)
+    if normalized_run_id:
+        run = _runs.get(normalized_run_id)
         if not run:
-            raise ValueError(f"Unknown run_id '{run_id}'")
+            raise ValueError(f"Unknown run_id '{normalized_run_id}'")
         return run
     if not _run_order:
         raise ValueError("No simulation has been run yet.")
@@ -1484,6 +1440,18 @@ def _build_ltspice_plot_settings_text(
         lower_override=x_min,
         upper_override=x_max,
     )
+    if x_log_enabled:
+        if x_min is not None and float(x_min) <= 0:
+            raise ValueError("x_min must be > 0 when x_log is enabled.")
+        if x_lo <= 0:
+            positives = sorted(value for value in x_values if value > 0)
+            if positives:
+                x_lo = positives[0]
+                if x_hi <= x_lo:
+                    x_hi = x_lo * 10.0
+                x_step = max((x_hi - x_lo) / 10.0, 1e-12)
+            else:
+                raise ValueError("x_log is enabled but no positive X values are available for the selected dataset.")
     x_prefix = _axis_prefix_for_range(x_lo, x_hi)
 
     lines: list[str] = [
@@ -1798,9 +1766,11 @@ def _validate_plot_capture(path: Path) -> dict[str, Any]:
     area = max(1, int(metrics["width"]) * int(metrics["height"]))
     min_trace_pixels = max(130, int(area * 0.0018))
     min_green_pixels = max(120, int(area * 0.0008))
+    trace_pixels = int(metrics["trace_pixels"])
+    green_pixels = int(metrics["green_pixels"])
     valid = (
-        int(metrics["trace_pixels"]) >= min_trace_pixels
-        or int(metrics["green_pixels"]) >= min_green_pixels
+        trace_pixels >= min_trace_pixels
+        or (trace_pixels > 0 and green_pixels >= min_green_pixels)
     )
     return {
         **metrics,
@@ -1874,13 +1844,15 @@ def _open_schematic_ui(path: Path) -> dict[str, Any]:
 
 
 def _resolve_raw_path(raw_path: str | None, run_id: str | None) -> Path:
-    if raw_path:
-        path = Path(raw_path).expanduser().resolve()
+    normalized_raw_path = _normalize_optional_selector("raw_path", raw_path)
+    normalized_run_id = _normalize_optional_selector("run_id", run_id)
+    if normalized_raw_path:
+        path = Path(normalized_raw_path).expanduser().resolve()
         if not path.exists():
             raise FileNotFoundError(f"RAW file not found: {path}")
         return path
 
-    run = _resolve_run(run_id)
+    run = _resolve_run(normalized_run_id)
     selected = _select_primary_raw(run)
     if not selected:
         raise ValueError(
@@ -1902,13 +1874,20 @@ def _load_dataset(path: Path) -> RawDataset:
 
 
 def _resolve_dataset(plot: str | None, run_id: str | None, raw_path: str | None) -> RawDataset:
-    if raw_path:
-        dataset = _load_dataset(_resolve_raw_path(raw_path, run_id))
+    normalized_run_id = _normalize_optional_selector("run_id", run_id)
+    normalized_raw_path = _normalize_optional_selector("raw_path", raw_path)
+    _ensure_mutually_exclusive_selectors(
+        context="_resolve_dataset",
+        values={"run_id": normalized_run_id, "raw_path": normalized_raw_path},
+    )
+
+    if normalized_raw_path:
+        dataset = _load_dataset(_resolve_raw_path(normalized_raw_path, None))
         if plot and dataset.plot_name != plot:
             raise ValueError(f"RAW plot '{dataset.plot_name}' does not match requested plot '{plot}'.")
         return dataset
 
-    run = _resolve_run(run_id)
+    run = _resolve_run(normalized_run_id)
     if plot:
         for candidate in run.raw_files:
             try:
@@ -1979,6 +1958,17 @@ def _validate_vectors_exist(
 
 def _run_payload(run: SimulationRun, *, include_output: bool, log_tail_lines: int) -> dict[str, Any]:
     payload = run.as_dict(include_output=include_output)
+    executed_netlist_path: str | None = None
+    command = payload.get("command")
+    if isinstance(command, list):
+        for token in command[2:]:
+            if not isinstance(token, str):
+                continue
+            if token.startswith("-"):
+                continue
+            executed_netlist_path = token
+            break
+    payload["executed_netlist_path"] = executed_netlist_path
     payload["log_tail"] = tail_text_file(run.log_path, max_lines=log_tail_lines)
     if run.log_utf8_path is not None:
         payload["log_tail_utf8"] = tail_text_file(run.log_utf8_path, max_lines=log_tail_lines)
@@ -1992,7 +1982,11 @@ def _now_iso() -> str:
 def _effective_sync_timeout(timeout_seconds: int | None) -> int | None:
     if timeout_seconds is None:
         return None
-    requested = max(1, int(timeout_seconds))
+    if isinstance(timeout_seconds, bool):
+        raise ValueError("timeout_seconds must be a positive integer, not a boolean value.")
+    requested = int(timeout_seconds)
+    if requested <= 0:
+        raise ValueError("timeout_seconds must be > 0.")
     margin = int(_SYNC_TOOL_TIMEOUT_MARGIN_SECONDS)
     if margin <= 0:
         return requested
@@ -2001,6 +1995,174 @@ def _effective_sync_timeout(timeout_seconds: int | None) -> int | None:
     if requested <= margin + 5:
         return requested
     return max(1, requested - margin)
+
+
+def _normalize_optional_selector(name: str, value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    if text == "":
+        raise ValueError(f"{name} must not be an empty string when provided.")
+    normalized = text.strip()
+    if not normalized:
+        raise ValueError(f"{name} must not be blank when provided.")
+    return normalized
+
+
+def _ensure_mutually_exclusive_selectors(*, context: str, values: dict[str, Any]) -> None:
+    provided = [name for name, value in values.items() if value is not None]
+    if len(provided) <= 1:
+        return
+    raise ValueError(
+        f"{context} accepts only one source selector at a time. "
+        f"Received: {', '.join(provided)}."
+    )
+
+
+def _require_int(
+    name: str,
+    value: Any,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer, not boolean {value!r}.")
+    try:
+        number = int(value)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"{name} must be an integer.") from exc
+    if minimum is not None and number < minimum:
+        raise ValueError(f"{name} must be >= {minimum}.")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{name} must be <= {maximum}.")
+    return number
+
+
+def _require_optional_positive_int(name: str, value: int | None) -> int | None:
+    if value is None:
+        return None
+    return _require_int(name, value, minimum=1)
+
+
+def _require_float(
+    name: str,
+    value: Any,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be numeric, not boolean {value!r}.")
+    try:
+        number = float(value)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"{name} must be numeric.") from exc
+    if minimum is not None and number < minimum:
+        raise ValueError(f"{name} must be >= {minimum}.")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{name} must be <= {maximum}.")
+    return number
+
+
+def _staged_source_root(prefix: str) -> Path:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    safe = _safe_name(prefix)
+    return (_runner.workdir / "staged_sources" / f"{stamp}_{safe}_{uuid.uuid4().hex[:8]}").resolve()
+
+
+def _snapshot_netlist_source_tree(
+    *,
+    source_path: Path,
+    snapshot_root: Path,
+) -> dict[str, Any]:
+    source = source_path.expanduser().resolve()
+    if not source.exists():
+        raise FileNotFoundError(f"Netlist file not found: {source}")
+    if not source.is_file():
+        raise ValueError(f"Netlist source is not a file: {source}")
+
+    files, warnings = _collect_netlist_dependency_files(source)
+    if source not in files:
+        files.insert(0, source)
+    parent_paths = [str(path.parent) for path in files]
+    anchor = Path(os.path.commonpath(parent_paths)).resolve() if parent_paths else source.parent.resolve()
+
+    input_root = (snapshot_root / "input").resolve()
+    if snapshot_root.exists():
+        shutil.rmtree(snapshot_root, ignore_errors=True)
+    input_root.mkdir(parents=True, exist_ok=True)
+
+    mapped_paths: dict[Path, Path] = {}
+    for original in files:
+        relative = original.relative_to(anchor)
+        destination = (input_root / relative).resolve()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(original, destination)
+        mapped_paths[original] = destination
+
+    rewritten_lines = 0
+    for original, copied in mapped_paths.items():
+        try:
+            source_text = read_text_auto(original)
+        except Exception:  # noqa: BLE001
+            continue
+        has_trailing_newline = source_text.endswith("\n")
+        changed = False
+        updated: list[str] = []
+        for raw_line in source_text.splitlines():
+            parsed = _parse_netlist_include_directive(raw_line)
+            if parsed is None:
+                updated.append(raw_line)
+                continue
+            prefix, token, suffix = parsed
+            resolved = _resolve_include_token_path(owner_path=original, token=token)
+            mapped = mapped_paths.get(resolved)
+            if mapped is None:
+                updated.append(raw_line)
+                continue
+            rewritten = f'{prefix}"{mapped}"{suffix}'
+            if rewritten != raw_line:
+                changed = True
+                rewritten_lines += 1
+            updated.append(rewritten)
+        if changed:
+            output = "\n".join(updated)
+            if has_trailing_newline:
+                output += "\n"
+            copied.write_text(output, encoding="utf-8")
+
+    run_path = mapped_paths[source]
+    return {
+        "source_path": str(source),
+        "run_path": str(run_path),
+        "snapshot_root": str(snapshot_root),
+        "file_count": len(mapped_paths),
+        "rewritten_include_lines": rewritten_lines,
+        "warnings": warnings,
+    }
+
+
+def _stage_sync_source_netlist(*, source_path: Path, purpose: str) -> dict[str, Any]:
+    snapshot_root = _staged_source_root(purpose)
+    return _snapshot_netlist_source_tree(source_path=source_path, snapshot_root=snapshot_root)
+
+
+def _cleanup_staged_runtime_outputs(*, run_path: Path) -> list[str]:
+    cleaned: list[str] = []
+    try:
+        artifacts = _collect_related_artifacts(run_path)
+    except Exception:  # noqa: BLE001
+        return cleaned
+    for artifact in artifacts:
+        if not _is_simulation_output_artifact(run_path, artifact):
+            continue
+        try:
+            artifact.unlink()
+            cleaned.append(str(artifact))
+        except Exception:  # noqa: BLE001
+            continue
+    return cleaned
 
 
 def _read_netlist_text(path: Path) -> str:
@@ -2079,8 +2241,20 @@ def _resolve_run_target_for_input(
     show_ui: bool | None,
     open_raw_after_run: bool,
 ) -> dict[str, Any]:
-    if run_id:
-        run = _resolve_run(run_id)
+    normalized_run_id = _normalize_optional_selector("run_id", run_id)
+    normalized_netlist_path = _normalize_optional_selector("netlist_path", netlist_path)
+    normalized_asc_path = _normalize_optional_selector("asc_path", asc_path)
+    if normalized_run_id is not None:
+        _ensure_mutually_exclusive_selectors(
+            context="_resolve_run_target_for_input",
+            values={
+                "run_id": normalized_run_id,
+                "netlist_path": normalized_netlist_path,
+                "netlist_content": netlist_content,
+                "asc_path": normalized_asc_path,
+            },
+        )
+        run = _resolve_run(normalized_run_id)
         return {
             "source": "existing_run",
             "run": run,
@@ -2097,9 +2271,9 @@ def _resolve_run_target_for_input(
         )
         run = _resolve_run(str(run_payload["run_id"]))
         return {"source": "simulated_netlist_content", "run": run, "run_payload": run_payload}
-    if netlist_path is not None:
+    if normalized_netlist_path is not None:
         run_payload = simulateNetlistFile(
-            netlist_path=netlist_path,
+            netlist_path=normalized_netlist_path,
             ascii_raw=ascii_raw,
             timeout_seconds=timeout_seconds,
             show_ui=show_ui,
@@ -2107,9 +2281,9 @@ def _resolve_run_target_for_input(
         )
         run = _resolve_run(str(run_payload["run_id"]))
         return {"source": "simulated_netlist_path", "run": run, "run_payload": run_payload}
-    if asc_path is not None:
+    if normalized_asc_path is not None:
         run_payload = simulateSchematicFile(
-            asc_path=asc_path,
+            asc_path=normalized_asc_path,
             ascii_raw=ascii_raw,
             timeout_seconds=timeout_seconds,
             show_ui=show_ui,
@@ -2140,15 +2314,16 @@ _MEAS_FAILURE_RE = re.compile(
     r'^\s*Measurement\s+"?(?P<name>[A-Za-z_][\w.$-]*)"?\s+FAIL(?:\'ed|ed|ED)?\b(?:\s*[:\-]\s*(?P<reason>.+))?\s*$',
     re.IGNORECASE,
 )
+_MEAS_DUPLICATE_RESULT_RE = re.compile(
+    r"^\s*Multiply\s+defined\s+\.measure\s+result:\s*(?P<name>[A-Za-z_][\w.$-]*)\s*$",
+    re.IGNORECASE,
+)
 _MEAS_NUMERIC_TOKEN_RE = re.compile(_MEAS_NUMBER_PATTERN)
 _MEAS_AT_VALUE_RE = re.compile(
     rf"\bAT\s*=?\s*(?P<value>{_MEAS_NUMBER_PATTERN})\b",
     re.IGNORECASE,
 )
-_MEAS_STATEMENT_RE = re.compile(
-    r"^\s*\.meas(?:ure)?\s+\S+\s+(?P<name>[A-Za-z_][\w.$-]*)\s+(?P<body>.+?)\s*$",
-    re.IGNORECASE,
-)
+_MEAS_ANALYSIS_KEYWORDS = {"ac", "dc", "op", "tf", "noise", "tran"}
 _MEAS_HEADER_TOKEN_RE = re.compile(r"^\s*[A-Za-z_][\w()*/+.,:<>=-]*\s*$")
 _MEAS_AUX_HEADER_TOKENS = {
     "step",
@@ -2255,17 +2430,42 @@ def _extract_meas_numeric_from_rhs(
     return None
 
 
+def _parse_meas_statement_tokens(statement: str) -> dict[str, str] | None:
+    line = statement.strip()
+    if not line:
+        return None
+    tokens = line.split()
+    if len(tokens) < 3:
+        return None
+    if tokens[0].lower() not in {".meas", ".measure"}:
+        return None
+
+    idx = 1
+    analysis = ""
+    if tokens[idx].lower() in _MEAS_ANALYSIS_KEYWORDS:
+        analysis = tokens[idx]
+        idx += 1
+    if idx >= len(tokens):
+        return None
+    name = tokens[idx].strip()
+    idx += 1
+    body = " ".join(tokens[idx:]).strip()
+    if not name or not re.fullmatch(r"[A-Za-z_][\w.$-]*", name):
+        return None
+    return {"analysis": analysis, "name": name, "body": body}
+
+
 def _parse_meas_statement_kinds(netlist_text: str) -> dict[str, str]:
     kinds: dict[str, str] = {}
     for raw_line in netlist_text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith(("*", ";")):
             continue
-        match = _MEAS_STATEMENT_RE.match(line)
-        if not match:
+        parsed = _parse_meas_statement_tokens(line)
+        if not parsed:
             continue
-        name = match.group("name").strip()
-        body = match.group("body").strip().lower()
+        name = parsed["name"].strip()
+        body = parsed["body"].strip().lower()
         kind = "other"
         if body.startswith("when ") or " when " in body:
             kind = "when"
@@ -2556,10 +2756,10 @@ def _build_meas_statements(measurements: list[dict[str, Any] | str]) -> list[str
 
 
 def _extract_meas_statement_name(statement: str) -> str | None:
-    match = _MEAS_STATEMENT_RE.match(statement.strip())
-    if not match:
+    parsed = _parse_meas_statement_tokens(statement)
+    if not parsed:
         return None
-    return match.group("name").strip()
+    return parsed["name"].strip()
 
 
 def _parse_meas_failures_from_text(text: str) -> list[dict[str, Any]]:
@@ -2568,13 +2768,18 @@ def _parse_meas_failures_from_text(text: str) -> list[dict[str, Any]]:
     lines = text.splitlines()
     for index, line in enumerate(lines):
         match = _MEAS_FAILURE_RE.match(line)
-        if not match:
+        duplicate_match = _MEAS_DUPLICATE_RESULT_RE.match(line) if match is None else None
+        if match:
+            name = match.group("name").strip()
+            reason = (match.group("reason") or "").strip() or None
+        elif duplicate_match:
+            name = duplicate_match.group("name").strip()
+            reason = "Multiply defined .measure result."
+        else:
             continue
-        name = match.group("name").strip()
         normalized = name.lower()
         if not normalized:
             continue
-        reason = (match.group("reason") or "").strip() or None
         if reason is None and index + 1 < len(lines):
             next_line = lines[index + 1]
             next_match = _MEAS_COLON_LINE_RE.match(next_line)
@@ -2624,7 +2829,19 @@ def _coerce_spice_number_list(
     if values is None:
         return []
     if isinstance(values, str):
-        tokens = [token for token in re.split(r"[\s,]+", values.strip()) if token]
+        raw = values.strip()
+        if not raw:
+            return []
+        if "," in raw:
+            split_tokens = [token.strip() for token in raw.split(",")]
+            if any(token == "" for token in split_tokens):
+                raise ValueError(
+                    f"{field_name} contains empty entries. "
+                    "Use a comma-separated list without empty tokens."
+                )
+            tokens = split_tokens
+        else:
+            tokens = [token for token in re.split(r"\s+", raw) if token]
         return [_coerce_spice_number(token, field_name=field_name) for token in tokens]
     if isinstance(values, (list, tuple)):
         return [_coerce_spice_number(item, field_name=field_name) for item in values]
@@ -2642,9 +2859,132 @@ def _write_meas_netlist(
 ) -> Path:
     base_text = _read_netlist_text(base_netlist_path)
     updated = _append_unique_lines_before_end(base_text, statements)
-    output_path = base_netlist_path.with_name(f"{base_netlist_path.stem}_{suffix}{base_netlist_path.suffix}")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    output_dir = (_runner.workdir / "generated_netlists" / "measurements" / stamp).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{base_netlist_path.stem}_{suffix}{base_netlist_path.suffix}"
     output_path.write_text(updated, encoding="utf-8")
     return output_path
+
+
+def _write_generated_netlist_variant(
+    *,
+    base_netlist_path: Path,
+    netlist_text: str,
+    variant_kind: str,
+    variant_name: str,
+) -> Path:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    out_dir = (
+        _runner.workdir
+        / "generated_netlists"
+        / variant_kind
+        / f"{stamp}_{_safe_name(base_netlist_path.stem)}_{uuid.uuid4().hex[:8]}"
+    ).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    output_path = out_dir / f"{base_netlist_path.stem}_{_safe_name(variant_name)}{base_netlist_path.suffix}"
+    normalized = netlist_text.rstrip() + "\n"
+    if not any(line.strip().lower() == ".end" for line in normalized.splitlines()):
+        normalized += ".end\n"
+    output_path.write_text(normalized, encoding="utf-8")
+    return output_path
+
+
+_STEP_PARAM_RE = re.compile(r"^\s*\.step\s+param\s+([A-Za-z_][\w.$-]*)\b", re.IGNORECASE)
+_STEP_LABEL_PAIR_RE = re.compile(r"([A-Za-z_][\w.$-]*)\s*=\s*([^\s,]+)")
+
+
+def _extract_step_params(netlist_text: str) -> list[str]:
+    params: list[str] = []
+    seen: set[str] = set()
+    for raw_line in netlist_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("*", ";")):
+            continue
+        match = _STEP_PARAM_RE.match(line)
+        if not match:
+            continue
+        name = match.group(1).strip()
+        lowered = name.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        params.append(name)
+    return params
+
+
+def _likely_uses_parameter(netlist_text: str, parameter: str) -> bool:
+    target = parameter.strip()
+    if not target:
+        return False
+    brace_re = re.compile(r"\{\s*" + re.escape(target) + r"\s*\}", re.IGNORECASE)
+    bare_re = re.compile(r"\b" + re.escape(target) + r"\b", re.IGNORECASE)
+    for raw_line in netlist_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("*", ";")):
+            continue
+        lowered = line.lower()
+        if lowered.startswith(".step") or lowered.startswith(".param"):
+            continue
+        if brace_re.search(line) or bare_re.search(line):
+            return True
+    return False
+
+
+def _extract_value_from_step_label(*, label: str | None, parameter: str) -> float | None:
+    if not label:
+        return None
+    parameter_lower = parameter.lower()
+    fallback: float | None = None
+    for match in _STEP_LABEL_PAIR_RE.finditer(label):
+        key = match.group(1).strip()
+        token = match.group(2).strip()
+        parsed = _parse_spice_number_token(token)
+        if parsed is None:
+            continue
+        if key.lower() == parameter_lower:
+            return float(parsed)
+        if fallback is None:
+            fallback = float(parsed)
+    return fallback
+
+
+def _vector_name_candidates(parameter: str) -> list[str]:
+    base = parameter.strip()
+    if not base:
+        return []
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for token in (base, base.lower(), base.upper(), f"@{base}", f"@{base.lower()}", f"@{base.upper()}"):
+        key = token.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(token)
+    return candidates
+
+
+def _extract_step_parameter_value_from_dataset(
+    *,
+    dataset: RawDataset,
+    parameter: str,
+    step_index: int,
+) -> float | None:
+    label_value = _extract_value_from_step_label(
+        label=dataset.steps[step_index].label if dataset.steps and step_index < len(dataset.steps) else None,
+        parameter=parameter,
+    )
+    if label_value is not None:
+        return label_value
+
+    for vector_name in _vector_name_candidates(parameter):
+        try:
+            series = dataset.get_vector(vector_name, step_index=step_index)
+        except KeyError:
+            continue
+        if series:
+            return float(series[0].real)
+    return None
 
 
 def _aggregate_numeric(values: list[float]) -> dict[str, float | None]:
@@ -2666,18 +3006,20 @@ def _metric_from_series(series: list[complex], statistic: str) -> float:
     stat = statistic.strip().lower()
     real_values = [value.real for value in series]
     abs_values = [abs(value) for value in series]
+    is_complex_series = any(abs(value.imag) > 1e-24 for value in series)
+    metric_values = abs_values if is_complex_series else real_values
     if stat == "min":
-        return min(real_values)
+        return min(metric_values)
     if stat == "max":
-        return max(real_values)
+        return max(metric_values)
     if stat == "avg":
-        return sum(real_values) / len(real_values)
+        return sum(metric_values) / len(metric_values)
     if stat == "rms":
-        return math.sqrt(sum(value * value for value in real_values) / len(real_values))
+        return math.sqrt(sum(value * value for value in metric_values) / len(metric_values))
     if stat == "pp":
-        return max(real_values) - min(real_values)
+        return max(metric_values) - min(metric_values)
     if stat == "final":
-        return real_values[-1]
+        return metric_values[-1]
     if stat == "abs_max":
         return max(abs_values)
     raise ValueError("statistic must be one of: min, max, avg, rms, pp, final, abs_max")
@@ -2762,11 +3104,65 @@ def _assertion_requires_dataset(assertion: dict[str, Any]) -> bool:
     return check_type != "meas"
 
 
+_VERIFICATION_LEAF_TYPES = {"vector_stat", "bandwidth", "gain_phase_margin", "rise_fall_time", "settling_time", "meas"}
+_VERIFICATION_GROUP_TYPES = {"all_of", "any_of"}
+_VERIFICATION_ASSERTION_TYPES = _VERIFICATION_LEAF_TYPES | _VERIFICATION_GROUP_TYPES
+
+
+def _assertion_has_acceptance_criteria(assertion: dict[str, Any]) -> bool:
+    return any(key in assertion and assertion.get(key) is not None for key in ("min", "max", "target", "rel_tol_pct", "abs_tol"))
+
+
+def _validate_verification_assertion_schema(assertion: dict[str, Any], *, path: str) -> None:
+    if not isinstance(assertion, dict):
+        raise ValueError(f"{path} must be an object")
+    check_type = str(assertion.get("type", "vector_stat")).strip().lower()
+    if check_type not in _VERIFICATION_ASSERTION_TYPES:
+        raise ValueError(
+            f"{path}.type must be one of: {', '.join(sorted(_VERIFICATION_ASSERTION_TYPES))}"
+        )
+    if check_type in _VERIFICATION_GROUP_TYPES:
+        children = assertion.get("assertions") or assertion.get("checks")
+        if not isinstance(children, list) or not children:
+            raise ValueError(f"{path} ({check_type}) requires a non-empty assertions list")
+        for idx, child in enumerate(children):
+            _validate_verification_assertion_schema(child, path=f"{path}.{check_type}[{idx}]")
+        return
+    if check_type == "meas":
+        name = str(assertion.get("name", "")).strip()
+        if not name:
+            raise ValueError(f"{path} (meas) requires `name`")
+    else:
+        vector = str(assertion.get("vector", "")).strip()
+        if not vector:
+            raise ValueError(f"{path} ({check_type}) requires `vector`")
+    if not _assertion_has_acceptance_criteria(assertion):
+        raise ValueError(
+            f"{path} ({check_type}) must include at least one acceptance criterion: "
+            "min, max, target, rel_tol_pct, or abs_tol."
+        )
+    if (assertion.get("rel_tol_pct") is not None or assertion.get("abs_tol") is not None) and assertion.get("target") is None:
+        raise ValueError(f"{path} must include target when rel_tol_pct or abs_tol is provided.")
+
+
+def _dedupe_conditions(*conditions: str) -> str:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for condition in conditions:
+        text = str(condition).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        ordered.append(text)
+    return " and ".join(ordered)
+
+
 def _evaluate_verification_assertion(
     *,
     assertion: dict[str, Any],
     dataset: RawDataset | None,
     measurement_map: dict[str, float],
+    measurement_steps_map: dict[str, list[dict[str, Any]]],
     default_id: str,
     fail_fast: bool,
 ) -> dict[str, Any]:
@@ -2795,6 +3191,7 @@ def _evaluate_verification_assertion(
                 assertion=child,
                 dataset=dataset,
                 measurement_map=measurement_map,
+                measurement_steps_map=measurement_steps_map,
                 default_id=f"{check_id}.{index}",
                 fail_fast=fail_fast,
             )
@@ -2837,71 +3234,172 @@ def _evaluate_verification_assertion(
         meas_name = str(assertion.get("name", "")).strip()
         if not meas_name:
             raise ValueError("meas assertion requires `name`")
-        value = measurement_map.get(meas_name)
+        lookup_key = meas_name.lower()
+        step_index_raw = assertion.get("step_index")
+        if step_index_raw is not None:
+            selected_step = int(step_index_raw)
+            step_rows = measurement_steps_map.get(lookup_key, [])
+            if selected_step < 0 or selected_step >= len(step_rows):
+                value = None
+            else:
+                row_value = step_rows[selected_step].get("value")
+                value = float(row_value) if row_value is not None else None
+            details["selected_step"] = selected_step
+            details["step_count"] = len(step_rows)
+        else:
+            step_rows = measurement_steps_map.get(lookup_key, [])
+            if len(step_rows) > 1:
+                per_step: list[dict[str, Any]] = []
+                for idx, row in enumerate(step_rows):
+                    row_value = row.get("value")
+                    step_value = float(row_value) if row_value is not None else None
+                    row_passed_limits, row_condition_limits = _evaluate_limits(
+                        value=step_value,
+                        minimum=minimum,
+                        maximum=maximum,
+                    )
+                    row_passed_tolerance, row_condition_tolerance, row_tolerance_details = _evaluate_target_tolerance(
+                        value=step_value,
+                        target=target,
+                        rel_tol_pct=rel_tol_pct,
+                        abs_tol=abs_tol,
+                    )
+                    per_step.append(
+                        {
+                            "step_index": idx,
+                            "value": step_value,
+                            "passed": bool(row_passed_limits and row_passed_tolerance),
+                            "condition": _dedupe_conditions(row_condition_limits, row_condition_tolerance),
+                            "tolerance": row_tolerance_details,
+                        }
+                    )
+                passed = all(bool(item.get("passed")) for item in per_step)
+                details["measurement_name"] = meas_name
+                details["step_count"] = len(step_rows)
+                details["per_step"] = per_step
+                return {
+                    "id": check_id,
+                    "type": check_type,
+                    "passed": passed,
+                    "value": per_step[-1]["value"] if per_step else None,
+                    "min": minimum,
+                    "max": maximum,
+                    "target": target,
+                    "rel_tol_pct": rel_tol_pct,
+                    "abs_tol": abs_tol,
+                    "condition": _dedupe_conditions(
+                        "all stepped measurement values must satisfy the assertion",
+                    ),
+                    "details": details,
+                }
+            value = measurement_map.get(lookup_key)
         details["measurement_name"] = meas_name
     else:
         if dataset is None:
             raise ValueError("No RAW dataset available for non-meas assertions")
-        step_index_raw = assertion.get("step_index")
-        selected_step = _resolve_step_index(dataset, int(step_index_raw) if step_index_raw is not None else None)
         vector = str(assertion.get("vector", "")).strip()
         if not vector:
             raise ValueError(f"{check_type} assertion requires `vector`")
-        if check_type == "vector_stat":
-            statistic = str(assertion.get("statistic", "final"))
-            series = dataset.get_vector(vector, step_index=selected_step)
-            value = _metric_from_series(series, statistic)
-            details.update({"vector": vector, "statistic": statistic, **_step_payload(dataset, selected_step)})
-        elif check_type == "bandwidth":
-            metric = str(assertion.get("metric", "lowpass_bandwidth_hz"))
-            result = compute_bandwidth(
-                frequency_hz=dataset.scale_values(step_index=selected_step),
-                response=dataset.get_vector(vector, step_index=selected_step),
-                reference=str(assertion.get("reference", "first")),
-                drop_db=float(assertion.get("drop_db", 3.0)),
-            )
-            value = result.get(metric)
-            details.update(
-                {"vector": vector, "metric": metric, "result": result, **_step_payload(dataset, selected_step)}
-            )
-        elif check_type == "gain_phase_margin":
-            metric = str(assertion.get("metric", "phase_margin_deg"))
-            result = compute_gain_phase_margin(
-                frequency_hz=dataset.scale_values(step_index=selected_step),
-                response=dataset.get_vector(vector, step_index=selected_step),
-            )
-            value = result.get(metric)
-            details.update(
-                {"vector": vector, "metric": metric, "result": result, **_step_payload(dataset, selected_step)}
-            )
-        elif check_type == "rise_fall_time":
-            metric = str(assertion.get("metric", "rise_time_s"))
-            result = compute_rise_fall_time(
-                time_s=dataset.scale_values(step_index=selected_step),
-                signal=dataset.get_vector(vector, step_index=selected_step),
-                low_threshold_pct=float(assertion.get("low_threshold_pct", 10.0)),
-                high_threshold_pct=float(assertion.get("high_threshold_pct", 90.0)),
-            )
-            value = result.get(metric)
-            details.update(
-                {"vector": vector, "metric": metric, "result": result, **_step_payload(dataset, selected_step)}
-            )
-        elif check_type == "settling_time":
-            metric = str(assertion.get("metric", "settling_time_s"))
-            result = compute_settling_time(
-                time_s=dataset.scale_values(step_index=selected_step),
-                signal=dataset.get_vector(vector, step_index=selected_step),
-                tolerance_percent=float(assertion.get("tolerance_percent", 2.0)),
-                target_value=float(assertion["target_value"])
-                if "target_value" in assertion and assertion["target_value"] is not None
-                else None,
-            )
-            value = result.get(metric)
-            details.update(
-                {"vector": vector, "metric": metric, "result": result, **_step_payload(dataset, selected_step)}
-            )
+        step_index_raw = assertion.get("step_index")
+        if step_index_raw is None and dataset.step_count > 1:
+            step_indices = list(range(dataset.step_count))
         else:
+            selected_step = _resolve_step_index(dataset, int(step_index_raw) if step_index_raw is not None else None)
+            step_indices = [selected_step if selected_step is not None else 0]
+
+        def _value_for_step(idx: int) -> tuple[float | None, dict[str, Any]]:
+            selected = _resolve_step_index(dataset, idx)
+            if check_type == "vector_stat":
+                statistic = str(assertion.get("statistic", "final"))
+                series = dataset.get_vector(vector, step_index=selected)
+                return _metric_from_series(series, statistic), {
+                    "vector": vector,
+                    "statistic": statistic,
+                    **_step_payload(dataset, selected),
+                }
+            if check_type == "bandwidth":
+                metric = str(assertion.get("metric", "lowpass_bandwidth_hz"))
+                result = compute_bandwidth(
+                    frequency_hz=dataset.scale_values(step_index=selected),
+                    response=dataset.get_vector(vector, step_index=selected),
+                    reference=str(assertion.get("reference", "first")),
+                    drop_db=float(assertion.get("drop_db", 3.0)),
+                )
+                return result.get(metric), {"vector": vector, "metric": metric, "result": result, **_step_payload(dataset, selected)}
+            if check_type == "gain_phase_margin":
+                metric = str(assertion.get("metric", "phase_margin_deg"))
+                result = compute_gain_phase_margin(
+                    frequency_hz=dataset.scale_values(step_index=selected),
+                    response=dataset.get_vector(vector, step_index=selected),
+                )
+                return result.get(metric), {"vector": vector, "metric": metric, "result": result, **_step_payload(dataset, selected)}
+            if check_type == "rise_fall_time":
+                metric = str(assertion.get("metric", "rise_time_s"))
+                result = compute_rise_fall_time(
+                    time_s=dataset.scale_values(step_index=selected),
+                    signal=dataset.get_vector(vector, step_index=selected),
+                    low_threshold_pct=float(assertion.get("low_threshold_pct", 10.0)),
+                    high_threshold_pct=float(assertion.get("high_threshold_pct", 90.0)),
+                )
+                return result.get(metric), {"vector": vector, "metric": metric, "result": result, **_step_payload(dataset, selected)}
+            if check_type == "settling_time":
+                metric = str(assertion.get("metric", "settling_time_s"))
+                result = compute_settling_time(
+                    time_s=dataset.scale_values(step_index=selected),
+                    signal=dataset.get_vector(vector, step_index=selected),
+                    tolerance_percent=float(assertion.get("tolerance_percent", 2.0)),
+                    target_value=float(assertion["target_value"])
+                    if "target_value" in assertion and assertion["target_value"] is not None
+                    else None,
+                )
+                return result.get(metric), {"vector": vector, "metric": metric, "result": result, **_step_payload(dataset, selected)}
             raise ValueError(f"Unsupported assertion type '{check_type}'")
+
+        if len(step_indices) == 1:
+            value, step_details = _value_for_step(step_indices[0])
+            details.update(step_details)
+        else:
+            per_step: list[dict[str, Any]] = []
+            for idx in step_indices:
+                step_value, step_details = _value_for_step(idx)
+                row_passed_limits, row_condition_limits = _evaluate_limits(
+                    value=step_value,
+                    minimum=minimum,
+                    maximum=maximum,
+                )
+                row_passed_tolerance, row_condition_tolerance, row_tolerance_details = _evaluate_target_tolerance(
+                    value=step_value,
+                    target=target,
+                    rel_tol_pct=rel_tol_pct,
+                    abs_tol=abs_tol,
+                )
+                per_step.append(
+                    {
+                        "step_index": idx,
+                        "value": step_value,
+                        "passed": bool(row_passed_limits and row_passed_tolerance),
+                        "condition": _dedupe_conditions(row_condition_limits, row_condition_tolerance),
+                        "details": step_details,
+                        "tolerance": row_tolerance_details,
+                    }
+                )
+            details["per_step"] = per_step
+            details["step_count"] = dataset.step_count
+            value = per_step[-1]["value"] if per_step else None
+            passed = all(bool(row.get("passed")) for row in per_step)
+            return {
+                "id": check_id,
+                "type": check_type,
+                "passed": passed,
+                "value": value,
+                "min": minimum,
+                "max": maximum,
+                "target": target,
+                "rel_tol_pct": rel_tol_pct,
+                "abs_tol": abs_tol,
+                "condition": "all stepped values must satisfy the assertion",
+                "details": details,
+            }
 
     passed_limits, condition_limits = _evaluate_limits(value=value, minimum=minimum, maximum=maximum)
     passed_tolerance, condition_tolerance, tolerance_details = _evaluate_target_tolerance(
@@ -2910,10 +3408,10 @@ def _evaluate_verification_assertion(
         rel_tol_pct=rel_tol_pct,
         abs_tol=abs_tol,
     )
-    conditions = [condition_limits]
-    if condition_tolerance != "no target/tolerance provided":
-        conditions.append(condition_tolerance)
-    combined_condition = " and ".join(part for part in conditions if part)
+    combined_condition = _dedupe_conditions(
+        condition_limits,
+        None if condition_tolerance == "no target/tolerance provided" else condition_tolerance,
+    )
     if tolerance_details is not None:
         details["tolerance"] = tolerance_details
 
@@ -3088,6 +3586,7 @@ def _job_public_payload(job: dict[str, Any]) -> dict[str, Any]:
         "retry_count": int(job.get("retry_count", 0)),
         "queue_seq": job.get("queue_seq"),
         "run_id": job.get("run_id"),
+        "attempt_run_ids": list(job.get("attempt_run_ids") or []),
         "error": job.get("error"),
         "summary": job.get("summary"),
     }
@@ -3129,8 +3628,10 @@ def _ensure_job_worker() -> None:
                     _job_queue.task_done()
                     continue
                 with _job_lock:
+                    pending_run_id = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
                     job["status"] = "running"
                     job["started_at"] = _now_iso()
+                    job["run_id"] = pending_run_id
                     job["summary"] = "Running simulation."
                     _save_job_state()
                 try:
@@ -3143,9 +3644,19 @@ def _ensure_job_worker() -> None:
                         timeout_seconds=job.get("timeout_seconds"),
                         cancel_requested=lambda: bool(_jobs.get(job_id, {}).get("cancel_requested", False)),
                     )
+                    # Keep the queue-level run id stable from running->terminal states.
+                    run.run_id = pending_run_id
                     _register_run(run)
+                    cleaned_outputs = _cleanup_staged_runtime_outputs(run_path=run_source)
                     with _job_lock:
                         job["run_id"] = run.run_id
+                        attempts = list(job.get("attempt_run_ids") or [])
+                        if run.run_id not in attempts:
+                            attempts.append(run.run_id)
+                        job["attempt_run_ids"] = attempts
+                        if cleaned_outputs:
+                            previous_cleaned = list(job.get("cleanup_outputs") or [])
+                            job["cleanup_outputs"] = [*previous_cleaned, *cleaned_outputs]
                         job["error"] = None
                         if canceled:
                             job["status"] = "canceled"
@@ -3238,10 +3749,11 @@ def _queue_simulation_job(
         "source_snapshot_rewritten_include_lines": int(snapshot["rewritten_include_lines"]),
         "source_snapshot_warnings": list(snapshot["warnings"]),
         "priority": int(priority),
-        "max_retries": max(0, int(max_retries)),
+        "max_retries": int(max_retries),
         "retry_count": 0,
         "queue_seq": None,
         "run_id": None,
+        "attempt_run_ids": [],
         "error": None,
         "summary": (
             "Queued"
@@ -3919,6 +4431,7 @@ _SIM_DIRECTIVE_PREFIXES = (
     ".tf",
     ".tran",
 )
+_UNRESOLVED_PLACEHOLDER_RE = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
 
 _INTENT_TEMPLATE_MAP: dict[str, str] = {
     "rc_lowpass": "rc_lowpass_ac",
@@ -3969,7 +4482,7 @@ _MISSING_INCLUDE_RE = re.compile(
 )
 _MISSING_SUBCKT_RE = re.compile(r"(?i)unknown subcircuit(?: called in:)?\s*(.*)")
 _MISSING_MODEL_RE = re.compile(
-    r"(?i)(?:can't find definition of model|unknown model|could not find model)\s*\"?([a-zA-Z0-9_.:$+-]+)\"?"
+    r"(?i)(?:can't find definition of model|unable to find definition of model|unknown model|could not find model)\s*\"?([a-zA-Z0-9_.:$+-]+)\"?"
 )
 _SUBCKT_DEF_RE = re.compile(r"(?im)^\s*\.subckt\s+([^\s]+)")
 _MODEL_DEF_RE = re.compile(r"(?im)^\s*\.model\s+([^\s]+)")
@@ -3977,6 +4490,7 @@ _CONVERGENCE_RE = re.compile(
     r"(?i)(time step too small|convergence failed|gmin stepping failed|source stepping failed|newton iteration failed)"
 )
 _MODEL_FILE_SUFFIXES = {".lib", ".sub", ".mod", ".cir", ".spi", ".txt"}
+_MODEL_INCLUDE_CANDIDATE_SUFFIXES = {".lib", ".sub", ".mod", ".spi", ".txt"}
 _DEFAULT_MODEL_SEARCH_PATHS = [
     "~/Documents/LTspice/lib/sub",
     "~/Documents/LTspiceXVII/lib/sub",
@@ -4007,11 +4521,21 @@ def _extract_model_issues_from_text(log_text: str) -> dict[str, Any]:
     missing_subcircuits: set[str] = set()
     missing_models: set[str] = set()
     matched_lines: list[str] = []
-    for raw in log_text.splitlines():
+    lines = log_text.splitlines()
+    pending_subckt_name = False
+    for raw in lines:
         line = raw.strip()
         if not line:
             continue
         matched = False
+        if pending_subckt_name:
+            tokens = [token for token in re.split(r"\s+", line) if token]
+            if tokens:
+                candidate = tokens[-1].strip().strip('"')
+                if candidate and candidate.lower() not in {"in", "out", "0"}:
+                    missing_subcircuits.add(candidate)
+                    matched = True
+            pending_subckt_name = False
         include_match = _MISSING_INCLUDE_RE.search(line)
         if include_match:
             missing_includes.add(include_match.group(1).strip().strip('"'))
@@ -4021,6 +4545,8 @@ def _extract_model_issues_from_text(log_text: str) -> dict[str, Any]:
             value = subckt_match.group(1).strip()
             if value:
                 missing_subcircuits.add(value)
+            else:
+                pending_subckt_name = True
             matched = True
         model_match = _MISSING_MODEL_RE.search(line)
         if model_match:
@@ -4167,7 +4693,11 @@ def _suggest_model_resolutions(
 
     for missing_include in issues.get("missing_include_files", []):
         filename = Path(str(missing_include)).name.lower()
-        direct_paths = [str(path) for path in filename_map.get(filename, [])]
+        direct_paths = [
+            str(path)
+            for path in filename_map.get(filename, [])
+            if path.suffix.lower() in _MODEL_INCLUDE_CANDIDATE_SUFFIXES
+        ]
         ranked_names = _rank_matches(
             filename,
             list(filename_map.keys()),
@@ -4177,6 +4707,8 @@ def _suggest_model_resolutions(
         for ranked in ranked_names:
             candidate_name = str(ranked["candidate"]).lower()
             for candidate_path in filename_map.get(candidate_name, [])[:limit_per_issue]:
+                if candidate_path.suffix.lower() not in _MODEL_INCLUDE_CANDIDATE_SUFFIXES:
+                    continue
                 ranked_paths.append(
                     {
                         "path": str(candidate_path),
@@ -4580,6 +5112,12 @@ _PLOT_PRESETS: dict[str, dict[str, Any]] = {
         "pane_layout": "per_trace",
     },
 }
+_PLOT_PRESET_DOMAINS: dict[str, set[str]] = {
+    "bode": {"ac"},
+    "noise": {"ac"},
+    "transient_startup": {"tran"},
+    "step_compare": {"ac", "dc", "tran", "generic"},
+}
 
 
 def _normalize_plot_preset(value: str) -> str:
@@ -4615,6 +5153,19 @@ def _default_vectors_for_plot_preset(dataset: RawDataset, preset: str) -> list[s
     if voltages:
         return [voltages[0]]
     return [vector_names[0]]
+
+
+def _plot_preset_domain_warning(*, dataset: RawDataset, preset: str) -> str | None:
+    supported = _PLOT_PRESET_DOMAINS.get(preset)
+    if not supported:
+        return None
+    detected = _infer_plot_type(dataset)
+    if detected in supported:
+        return None
+    return (
+        f"Preset '{preset}' is optimized for plot type(s) {sorted(supported)} "
+        f"but selected dataset is '{detected}'."
+    )
 
 
 def _validate_schematic_file(path: Path) -> dict[str, Any]:
@@ -4668,6 +5219,13 @@ def _validate_schematic_file(path: Path) -> dict[str, Any]:
     if not sim_directives:
         issues.append("No simulation directive was found in schematic TEXT commands.")
         suggestions.append("Add a directive such as `.op`, `.tran`, `.ac`, or `.dc`.")
+    unresolved_tokens = sorted(set(_UNRESOLVED_PLACEHOLDER_RE.findall(text)))
+    if unresolved_tokens:
+        issues.append(
+            "Unresolved template placeholders were found in schematic content: "
+            + ", ".join(unresolved_tokens)
+        )
+        suggestions.append("Render template parameters before validating/simulating this schematic.")
     if wires == 0:
         warnings.append("No wire segments were found; component pins may be unconnected.")
     if path.suffix.lower() != ".asc":
@@ -4681,6 +5239,7 @@ def _validate_schematic_file(path: Path) -> dict[str, Any]:
         "has_ground": has_ground,
         "directives": directives,
         "simulation_directives": sim_directives,
+        "unresolved_placeholders": unresolved_tokens,
         "issues": issues,
         "warnings": warnings,
         "suggestions": suggestions,
@@ -4935,19 +5494,26 @@ def parseMeasResults(
     log_path: str | None = None,
 ) -> dict[str, Any]:
     """Parse LTspice .meas results from a run log or explicit log path."""
-    if log_path:
-        target = Path(log_path).expanduser().resolve()
+    normalized_run_id = _normalize_optional_selector("run_id", run_id)
+    normalized_log_path = _normalize_optional_selector("log_path", log_path)
+    _ensure_mutually_exclusive_selectors(
+        context="parseMeasResults",
+        values={"run_id": normalized_run_id, "log_path": normalized_log_path},
+    )
+
+    if normalized_log_path:
+        target = Path(normalized_log_path).expanduser().resolve()
         if not target.exists():
             raise FileNotFoundError(f"Log file not found: {target}")
         text = read_text_auto(target)
         parsed = _parse_meas_results_from_text(text)
         return {
-            "run_id": run_id,
+            "run_id": None,
             "log_path": str(target),
             **parsed,
         }
 
-    run = _resolve_run(run_id)
+    run = _resolve_run(normalized_run_id)
     log_target = run.log_utf8_path or run.log_path
     if log_target is None or not log_target.exists():
         return {
@@ -4961,15 +5527,13 @@ def parseMeasResults(
     text = read_text_auto(log_target)
     netlist_target = run.netlist_path
     statement_kinds: dict[str, str] = {}
-    expected_measurements: set[str] | None = None
     if netlist_target is not None and netlist_target.exists():
         try:
             netlist_text = read_text_auto(netlist_target)
             statement_kinds = _parse_meas_statement_kinds(netlist_text)
-            expected_measurements = set(statement_kinds.keys())
         except Exception:
             pass
-    parsed = _parse_meas_results_from_text(text, expected_names=expected_measurements)
+    parsed = _parse_meas_results_from_text(text)
     if statement_kinds:
         _apply_meas_statement_kinds(parsed, statement_kinds=statement_kinds)
     return {
@@ -4992,22 +5556,36 @@ def runMeasAutomation(
     open_raw_after_run: bool = False,
 ) -> dict[str, Any]:
     """Inject .meas directives into a netlist, run simulation, and parse measurement values."""
+    normalized_netlist_path = _normalize_optional_selector("netlist_path", netlist_path)
+    normalized_asc_path = _normalize_optional_selector("asc_path", asc_path)
+    _ensure_mutually_exclusive_selectors(
+        context="runMeasAutomation",
+        values={
+            "netlist_content": netlist_content,
+            "netlist_path": normalized_netlist_path,
+            "asc_path": normalized_asc_path,
+        },
+    )
     statements = _build_meas_statements(measurements)
     source_netlist: Path
     if netlist_content is not None:
         source_netlist = _runner.write_netlist(netlist_content, circuit_name=circuit_name)
-    elif netlist_path is not None:
-        source_netlist = Path(netlist_path).expanduser().resolve()
+    elif normalized_netlist_path is not None:
+        source_netlist = Path(normalized_netlist_path).expanduser().resolve()
         if not source_netlist.exists():
             raise FileNotFoundError(f"Netlist file not found: {source_netlist}")
-    elif asc_path is not None:
-        asc_resolved = Path(asc_path).expanduser().resolve()
+        staged = _stage_sync_source_netlist(source_path=source_netlist, purpose="meas_automation")
+        source_netlist = Path(str(staged["run_path"])).expanduser().resolve()
+    elif normalized_asc_path is not None:
+        asc_resolved = Path(normalized_asc_path).expanduser().resolve()
         if not asc_resolved.exists():
             raise FileNotFoundError(f"Schematic file not found: {asc_resolved}")
         target = _resolve_schematic_simulation_target(asc_resolved, require_sidecar_on_macos=True)
         if not bool(target.get("can_batch_simulate")):
             raise ValueError(str(target.get("error")))
         source_netlist = Path(str(target["run_target_path"])).expanduser().resolve()
+        staged = _stage_sync_source_netlist(source_path=source_netlist, purpose="meas_automation_asc")
+        source_netlist = Path(str(staged["run_path"])).expanduser().resolve()
     else:
         raise ValueError("Provide one of netlist_content, netlist_path, or asc_path.")
 
@@ -5069,37 +5647,17 @@ def runMeasAutomation(
     ]
     requested_measurements_succeeded = not failed_requested and not missing_requested
     simulation_succeeded = bool(run_payload_with_meas.get("succeeded", False))
+    overall_succeeded = simulation_succeeded and requested_measurements_succeeded
+    run_payload_with_meas["simulation_succeeded"] = simulation_succeeded
+    run_payload_with_meas["requested_measurements_succeeded"] = requested_measurements_succeeded
+    run_payload_with_meas["overall_succeeded"] = overall_succeeded
 
+    wrapper_warnings: list[str] = []
     if not requested_measurements_succeeded:
-        issue_parts: list[str] = []
-        if failed_requested:
-            issue_parts.append(
-                "failed: "
-                + ", ".join(
-                    (
-                        f"{item['name']} ({item.get('reason')})"
-                        if item.get("reason")
-                        else str(item["name"])
-                    )
-                    for item in failed_requested
-                )
-            )
-        if missing_requested:
-            issue_parts.append("missing: " + ", ".join(missing_requested))
-        message = "Requested measurements were not fully produced (" + "; ".join(issue_parts) + ")."
-        issues = list(run_payload_with_meas.get("issues") or [])
-        if message not in issues:
-            issues.append(message)
-        run_payload_with_meas["issues"] = issues
-        warnings = list(run_payload_with_meas.get("warnings") or [])
-        warnings.append(
+        wrapper_warnings.append(
             "One or more requested .meas directives did not produce a numeric result. "
             "Inspect failed_measurements/missing_requested_measurements for details."
         )
-        run_payload_with_meas["warnings"] = warnings
-    run_payload_with_meas["simulation_succeeded"] = simulation_succeeded
-    run_payload_with_meas["requested_measurements_succeeded"] = requested_measurements_succeeded
-    run_payload_with_meas["succeeded"] = simulation_succeeded and requested_measurements_succeeded
 
     meas_payload = dict(meas_payload)
     meas_payload["requested_measurements"] = requested_names
@@ -5116,7 +5674,10 @@ def runMeasAutomation(
         "requested_measurements": requested_names,
         "failed_measurements": failed_requested,
         "missing_requested_measurements": missing_requested,
+        "simulation_succeeded": simulation_succeeded,
         "requested_measurements_succeeded": requested_measurements_succeeded,
+        "overall_succeeded": overall_succeeded,
+        "warnings": wrapper_warnings,
     }
 
 
@@ -5154,6 +5715,13 @@ def runVerificationPlan(
     """
     if not assertions:
         raise ValueError("assertions must contain at least one assertion object")
+    if run_id is not None and measurements:
+        raise ValueError(
+            "runVerificationPlan does not support `run_id` together with `measurements`. "
+            "Provide simulation inputs (netlist_path/netlist_content/asc_path) when injecting .meas directives."
+        )
+    for idx, assertion in enumerate(assertions):
+        _validate_verification_assertion_schema(assertion, path=f"assertions[{idx}]")
 
     context = _resolve_run_target_for_input(
         run_id=run_id,
@@ -5170,36 +5738,47 @@ def runVerificationPlan(
     run_payload: dict[str, Any] = context["run_payload"]
 
     measurement_map: dict[str, float] = {}
+    measurement_steps_map: dict[str, list[dict[str, Any]]] = {}
     measurement_report: dict[str, Any] | None = None
     if measurements:
         meas_source_netlist = netlist_path
         meas_source_content = netlist_content
         meas_source_asc = asc_path
-        if run_id and not any([netlist_path, netlist_content, asc_path]):
-            measurement_report = parseMeasResults(run_id=run.run_id)
-        else:
-            measurement_report = runMeasAutomation(
-                measurements=measurements,
-                netlist_path=meas_source_netlist,
-                netlist_content=meas_source_content,
-                asc_path=meas_source_asc,
-                circuit_name=circuit_name or "verification_meas",
-                ascii_raw=ascii_raw,
-                timeout_seconds=timeout_seconds,
-                show_ui=show_ui,
-                open_raw_after_run=open_raw_after_run,
-            )
-            run_payload = measurement_report["run"]
-            run = _resolve_run(str(run_payload["run_id"]))
-            measurement_report = measurement_report["measurements"]
+        measurement_report = runMeasAutomation(
+            measurements=measurements,
+            netlist_path=meas_source_netlist,
+            netlist_content=meas_source_content,
+            asc_path=meas_source_asc,
+            circuit_name=circuit_name or "verification_meas",
+            ascii_raw=ascii_raw,
+            timeout_seconds=timeout_seconds,
+            show_ui=show_ui,
+            open_raw_after_run=open_raw_after_run,
+        )
+        run_payload = measurement_report["run"]
+        run = _resolve_run(str(run_payload["run_id"]))
+        measurement_report = measurement_report["measurements"]
         measurement_map = {
-            str(key): float(value)
+            str(key).strip().lower(): float(value)
             for key, value in (measurement_report.get("measurements", {}) if measurement_report else {}).items()
+            if str(key).strip()
+        }
+        measurement_steps_map = {
+            str(name).strip().lower(): list(rows if isinstance(rows, list) else [])
+            for name, rows in (measurement_report.get("measurement_steps", {}) if measurement_report else {}).items()
+            if str(name).strip()
         }
     else:
         parsed_meas = parseMeasResults(run_id=run.run_id)
         measurement_map = {
-            str(key): float(value) for key, value in parsed_meas.get("measurements", {}).items()
+            str(key).strip().lower(): float(value)
+            for key, value in parsed_meas.get("measurements", {}).items()
+            if str(key).strip()
+        }
+        measurement_steps_map = {
+            str(name).strip().lower(): list(rows if isinstance(rows, list) else [])
+            for name, rows in parsed_meas.get("measurement_steps", {}).items()
+            if str(name).strip()
         }
         measurement_report = parsed_meas
 
@@ -5227,6 +5806,7 @@ def runVerificationPlan(
                 assertion=assertion,
                 dataset=dataset,
                 measurement_map=measurement_map,
+                measurement_steps_map=measurement_steps_map,
                 default_id=f"check_{index}",
                 fail_fast=fail_fast,
             )
@@ -5248,6 +5828,17 @@ def runVerificationPlan(
             )
             if fail_fast:
                 break
+
+    # Guarantee unique check ids to avoid collisions in client ID-indexed maps.
+    seen_ids: dict[str, int] = {}
+    for item in checks:
+        original = str(item.get("id") or "").strip() or "check"
+        count = seen_ids.get(original, 0) + 1
+        seen_ids[original] = count
+        if count > 1:
+            item["id"] = f"{original}#{count}"
+        else:
+            item["id"] = original
 
     passed_count = sum(1 for item in checks if item.get("passed"))
     failed_count = len(checks) - passed_count
@@ -5284,32 +5875,91 @@ def runSweepStudy(
     ascii_raw: bool = False,
 ) -> dict[str, Any]:
     """Run stepped or Monte-Carlo parameter studies and return aggregate metrics."""
-    param_name = parameter.strip()
+    param_name = str(parameter).strip()
     if not param_name:
         raise ValueError("parameter must not be empty")
+    normalized_netlist_path = _normalize_optional_selector("netlist_path", netlist_path)
+    if netlist_content is not None and normalized_netlist_path is not None:
+        raise ValueError("Provide only one of netlist_content or netlist_path, not both.")
     base_path: Path
+    source_netlist_path: str | None = None
+    staged_netlist_path: str | None = None
+    staging_warnings: list[str] = []
     if netlist_content is not None:
         base_path = _runner.write_netlist(netlist_content, circuit_name=circuit_name)
-    elif netlist_path is not None:
-        base_path = Path(netlist_path).expanduser().resolve()
-        if not base_path.exists():
-            raise FileNotFoundError(f"Netlist file not found: {base_path}")
+    elif normalized_netlist_path is not None:
+        source_path = Path(normalized_netlist_path).expanduser().resolve()
+        if not source_path.exists():
+            raise FileNotFoundError(f"Netlist file not found: {source_path}")
+        staged = _stage_sync_source_netlist(source_path=source_path, purpose="sweep_study")
+        base_path = Path(str(staged["run_path"])).expanduser().resolve()
+        source_netlist_path = str(source_path)
+        staged_netlist_path = str(base_path)
+        staging_warnings = list(staged.get("warnings") or [])
     else:
-        raise ValueError("Provide netlist_content or netlist_path")
+        raise ValueError("Provide netlist_content or netlist_path.")
 
     mode_norm = mode.strip().lower()
+    if mode_norm not in {"step", "monte_carlo"}:
+        raise ValueError("mode must be one of: step, monte_carlo")
+    base_text = _read_netlist_text(base_path)
+    existing_step_params = _extract_step_params(base_text)
+    if existing_step_params:
+        lowered_existing = {name.lower() for name in existing_step_params}
+        if param_name.lower() in lowered_existing:
+            raise ValueError(
+                f"Duplicate dimensions in .STEP: param {param_name.lower()}. "
+                "The source netlist already defines this swept parameter."
+            )
+        raise ValueError(
+            "runSweepStudy does not support source netlists that already contain .step directives. "
+            f"Existing .step parameters: {', '.join(existing_step_params)}."
+        )
+
+    warnings: list[str] = []
+    if not _likely_uses_parameter(base_text, param_name):
+        warnings.append(
+            f"Parameter '{param_name}' does not appear to be referenced in circuit equations. "
+            "Sweep results may be unchanged across points."
+        )
     records: list[dict[str, Any]] = []
 
     if mode_norm == "step":
+        if values is not None and any(item is not None for item in (start, stop, step)):
+            raise ValueError("Provide either values OR start/stop/step, not both.")
         sweep_values = _coerce_spice_number_list(values, field_name="values")
+        if sweep_values:
+            seen_values: set[float] = set()
+            duplicate_values: list[float] = []
+            for entry in sweep_values:
+                token = float(entry)
+                if token in seen_values:
+                    duplicate_values.append(token)
+                seen_values.add(token)
+            if duplicate_values:
+                duplicate_tokens = ", ".join(f"{item:.12g}" for item in sorted(set(duplicate_values)))
+                raise ValueError(
+                    "values contains duplicate sweep points, which LTspice may collapse. "
+                    f"Remove duplicates: {duplicate_tokens}"
+                )
         if not sweep_values:
-            if start is None or stop is None or step is None or step == 0:
+            if start is None or stop is None or step is None:
                 raise ValueError("For mode='step', provide values or (start, stop, step).")
             start_value = _coerce_spice_number(start, field_name="start")
             stop_value = _coerce_spice_number(stop, field_name="stop")
             step_value = _coerce_spice_number(step, field_name="step")
             if step_value == 0:
                 raise ValueError("step must not be zero.")
+            if step_value > 0 and start_value > stop_value:
+                raise ValueError(
+                    "step sweep is incompatible: start > stop with a positive step. "
+                    "Use a negative step or swap start/stop."
+                )
+            if step_value < 0 and start_value < stop_value:
+                raise ValueError(
+                    "step sweep is incompatible: start < stop with a negative step. "
+                    "Use a positive step or swap start/stop."
+                )
             current = start_value
             direction = 1.0 if step_value > 0 else -1.0
             max_points = 200000
@@ -5327,11 +5977,16 @@ def runSweepStudy(
                         "Generated too many sweep points from start/stop/step. "
                         "Check step direction and bounds."
                     )
+            if not sweep_values:
+                raise ValueError("The generated step range is empty. Check start/stop/step values.")
         step_line = ".step param " + param_name + " list " + " ".join(f"{float(value):.12g}" for value in sweep_values)
-        text = _read_netlist_text(base_path)
-        stepped_text = _append_unique_lines_before_end(text, [step_line])
-        stepped_path = base_path.with_name(f"{base_path.stem}_step_study{base_path.suffix}")
-        stepped_path.write_text(stepped_text, encoding="utf-8")
+        stepped_text = _append_unique_lines_before_end(base_text, [step_line])
+        stepped_path = _write_generated_netlist_variant(
+            base_netlist_path=base_path,
+            netlist_text=stepped_text,
+            variant_kind="sweep_step",
+            variant_name="step_study",
+        )
 
         run_payload = simulateNetlistFile(
             netlist_path=str(stepped_path),
@@ -5358,14 +6013,31 @@ def runSweepStudy(
         )
         if use_point_aligned_fallback:
             full_series = dataset.get_vector(metric_vector, step_index=None)
+            parameter_series: list[complex] | None = None
+            for vector_name in _vector_name_candidates(param_name):
+                try:
+                    parameter_series = dataset.get_vector(vector_name, step_index=None)
+                    break
+                except KeyError:
+                    continue
             for idx, sample in enumerate(full_series[: len(sweep_values)]):
                 value = _metric_from_series([sample], metric_statistic)
                 metric_values.append(value)
+                parameter_value = None
+                if parameter_series is not None and idx < len(parameter_series):
+                    parameter_value = float(parameter_series[idx].real)
+                elif idx < len(sweep_values):
+                    parameter_value = float(sweep_values[idx])
+                step_label = (
+                    f"{param_name}={float(parameter_value):.12g}"
+                    if parameter_value is not None
+                    else None
+                )
                 records.append(
                     {
                         "index": idx,
-                        "parameter_value": sweep_values[idx] if idx < len(sweep_values) else None,
-                        "step_label": f"{param_name}={float(sweep_values[idx]):.12g}",
+                        "parameter_value": parameter_value,
+                        "step_label": step_label,
                         "metric_value": value,
                         "run_id": run.run_id,
                     }
@@ -5377,11 +6049,20 @@ def runSweepStudy(
                 series = dataset.get_vector(metric_vector, step_index=selected)
                 value = _metric_from_series(series, metric_statistic)
                 metric_values.append(value)
+                parameter_value = _extract_step_parameter_value_from_dataset(
+                    dataset=dataset,
+                    parameter=param_name,
+                    step_index=idx,
+                )
+                if parameter_value is None and idx < len(sweep_values):
+                    parameter_value = float(sweep_values[idx])
                 label = dataset.steps[idx].label if dataset.steps and idx < len(dataset.steps) else None
+                if not label and parameter_value is not None:
+                    label = f"{param_name}={float(parameter_value):.12g}"
                 records.append(
                     {
                         "index": idx,
-                        "parameter_value": sweep_values[idx] if idx < len(sweep_values) else None,
+                        "parameter_value": parameter_value,
                         "step_label": label,
                         "metric_value": value,
                         "run_id": run.run_id,
@@ -5390,11 +6071,12 @@ def runSweepStudy(
     else:
         if nominal is None:
             raise ValueError("For mode='monte_carlo', nominal is required.")
-        sample_count = max(1, min(500, int(samples)))
+        sample_count = _require_int("samples", samples, minimum=1, maximum=500)
         nominal_value = _coerce_spice_number(nominal, field_name="nominal")
         sigma_pct_value = _coerce_spice_number(sigma_pct, field_name="sigma_pct")
+        if sigma_pct_value < 0:
+            raise ValueError("sigma_pct must be >= 0.")
         spread = abs(float(nominal_value)) * (abs(float(sigma_pct_value)) / 100.0)
-        base_text = _read_netlist_text(base_path)
         metric_values: list[float] = []
         for idx in range(sample_count):
             if distribution == "uniform":
@@ -5407,8 +6089,12 @@ def runSweepStudy(
                 param_name=param_name,
                 param_value=sample_value,
             )
-            candidate_path = base_path.with_name(f"{base_path.stem}_mc_{idx + 1}{base_path.suffix}")
-            candidate_path.write_text(candidate_text, encoding="utf-8")
+            candidate_path = _write_generated_netlist_variant(
+                base_netlist_path=base_path,
+                netlist_text=candidate_text,
+                variant_kind="sweep_monte_carlo",
+                variant_name=f"mc_{idx + 1}",
+            )
             run_payload = simulateNetlistFile(
                 netlist_path=str(candidate_path),
                 ascii_raw=ascii_raw,
@@ -5425,6 +6111,11 @@ def runSweepStudy(
             }
             if run_payload.get("succeeded", False):
                 dataset = _resolve_dataset(plot=None, run_id=run.run_id, raw_path=None)
+                if dataset.step_count > 1:
+                    raise ValueError(
+                        "Monte Carlo sweep received multi-step RAW output. "
+                        "Use a source netlist without existing .step directives."
+                    )
                 selected = _resolve_step_index(dataset, 0)
                 series = dataset.get_vector(metric_vector, step_index=selected)
                 value = _metric_from_series(series, metric_statistic)
@@ -5459,6 +6150,10 @@ def runSweepStudy(
         "records": records,
         "aggregate": aggregate,
         "worst_case": worst_case,
+        "warnings": warnings,
+        "source_netlist_path": source_netlist_path,
+        "staged_netlist_path": staged_netlist_path,
+        "staging_warnings": staging_warnings,
     }
 
 
@@ -5513,12 +6208,22 @@ def generateVerifyAndCleanCircuit(
             "min": 0.0,
         }
     ]
-    verification = runVerificationPlan(
-        assertions=verification_assertions,
-        run_id=str(simulation["run_id"]),
-        measurements=measurements,
-        fail_fast=fail_fast_verification,
-    )
+    if measurements:
+        # `runVerificationPlan` treats `run_id` and injected measurements as
+        # mutually exclusive input modes. When measurement directives are
+        # requested, verify by re-simulating from the generated schematic path.
+        verification = runVerificationPlan(
+            assertions=verification_assertions,
+            asc_path=asc_path,
+            measurements=measurements,
+            fail_fast=fail_fast_verification,
+        )
+    else:
+        verification = runVerificationPlan(
+            assertions=verification_assertions,
+            run_id=str(simulation["run_id"]),
+            fail_fast=fail_fast_verification,
+        )
 
     target_path = asc_path
     clean_result: dict[str, Any] | None = None
@@ -5588,6 +6293,8 @@ def autoCleanSchematicLayout(
     target.parent.mkdir(parents=True, exist_ok=True)
 
     before = _analyze_schematic_visual_quality(source)
+    connectivity_before = _lint_schematic_file(source, library=None, strict=True)
+    source_backup_text = read_text_auto(source)
     action_details: dict[str, Any]
     sidecar = _resolve_sidecar_netlist_path(source)
     if prefer_sidecar_regeneration and sidecar is not None and sidecar.exists():
@@ -5615,6 +6322,15 @@ def autoCleanSchematicLayout(
             ),
         }
 
+    connectivity_after = _lint_schematic_file(target, library=None, strict=True)
+    if connectivity_before.get("valid", False) and not connectivity_after.get("valid", False):
+        if target == source:
+            source.write_text(source_backup_text, encoding="utf-8")
+        raise ValueError(
+            "autoCleanSchematicLayout aborted: cleaned layout introduced connectivity errors "
+            "(for example unconnected pins or dangling wires)."
+        )
+
     after = _analyze_schematic_visual_quality(target)
     render_payload: dict[str, Any] | None = None
     if render_after:
@@ -5631,6 +6347,8 @@ def autoCleanSchematicLayout(
         "after": after,
         "score_delta": round(float(after["score"]) - float(before["score"]), 3),
         "action_details": action_details,
+        "connectivity_before": connectivity_before,
+        "connectivity_after": connectivity_after,
         "render": render_payload,
     }
 
@@ -5746,8 +6464,13 @@ def queueSimulationJob(
 ) -> dict[str, Any]:
     """Queue a simulation job and return a job id for status polling/cancelation."""
     global _loaded_netlist
+    if netlist_content is not None and netlist_path is not None:
+        raise ValueError("Provide only one of netlist_content or netlist_path, not both.")
     if netlist_content is None and netlist_path is None:
         raise ValueError("Provide either netlist_content or netlist_path.")
+    safe_timeout = _require_optional_positive_int("timeout_seconds", timeout_seconds)
+    safe_priority = _require_int("priority", priority, minimum=0, maximum=1000)
+    safe_max_retries = _require_int("max_retries", max_retries, minimum=0)
     source: Path
     if netlist_content is not None:
         source = _runner.write_netlist(netlist_content, circuit_name=circuit_name)
@@ -5759,10 +6482,10 @@ def queueSimulationJob(
     return _queue_simulation_job(
         source_path=source,
         ascii_raw=ascii_raw,
-        timeout_seconds=timeout_seconds,
+        timeout_seconds=safe_timeout,
         kind="netlist",
-        priority=max(0, min(1000, int(priority))),
-        max_retries=max(0, int(max_retries)),
+        priority=safe_priority,
+        max_retries=safe_max_retries,
     )
 
 
@@ -5774,10 +6497,24 @@ def listJobs(
     include_history: bool = False,
 ) -> dict[str, Any]:
     """List queued/running/completed simulation jobs."""
-    safe_limit = max(1, min(500, int(limit)))
-    status_filter = status.strip().lower() if status else None
+    safe_limit = _require_int("limit", limit, minimum=1, maximum=500)
+    status_filter = _normalize_optional_selector("status", status)
+    if status_filter is not None:
+        status_filter = status_filter.lower()
+        if status_filter not in _JOB_ALL_STATUSES:
+            raise ValueError(
+                "status must be one of: " + ", ".join(sorted(_JOB_ALL_STATUSES))
+            )
     with _job_lock:
-        pool = [job for job_id in _job_order if (job := _jobs.get(job_id)) is not None]
+        all_jobs = [job for job_id in _job_order if (job := _jobs.get(job_id)) is not None]
+        if include_history:
+            pool = all_jobs
+        else:
+            pool = [
+                job
+                for job in all_jobs
+                if str(job.get("status", "")).lower() not in _JOB_TERMINAL_STATUSES
+            ]
         if order_by == "priority":
             selected_jobs = sorted(
                 pool,
@@ -5845,9 +6582,20 @@ def cancelJob(job_id: str, force: bool = False) -> dict[str, Any]:
     with _job_lock:
         job = _jobs.get(job_id)
         if job is None:
-            raise ValueError(f"Unknown job_id '{job_id}'")
+            history_index = _job_history_index.get(job_id)
+            if history_index is None:
+                raise ValueError(f"Unknown job_id '{job_id}'")
+            history_job = _job_history[history_index]
+            payload = _job_public_payload(history_job)
+            payload["from_history"] = True
+            payload["no_op"] = True
+            payload["reason"] = "job_already_terminal"
+            return payload
         if job.get("status") in {"succeeded", "failed", "canceled"}:
-            return _job_public_payload(job)
+            payload = _job_public_payload(job)
+            payload["no_op"] = True
+            payload["reason"] = "job_already_terminal"
+            return payload
         job["cancel_requested"] = True
         if job.get("status") == "queued":
             job["status"] = "canceled"
@@ -5867,8 +6615,14 @@ def listJobHistory(
     status: str | None = None,
 ) -> dict[str, Any]:
     """List archived (terminal) queue jobs retained across daemon restarts."""
-    safe_limit = max(1, min(2000, int(limit)))
-    status_filter = status.strip().lower() if status else None
+    safe_limit = _require_int("limit", limit, minimum=1, maximum=2000)
+    status_filter = _normalize_optional_selector("status", status)
+    if status_filter is not None:
+        status_filter = status_filter.lower()
+        if status_filter not in _JOB_TERMINAL_STATUSES:
+            raise ValueError(
+                "status must be one of: " + ", ".join(sorted(_JOB_TERMINAL_STATUSES))
+            )
     with _job_lock:
         rows: list[dict[str, Any]] = []
         for item in reversed(_job_history):
@@ -5962,10 +6716,7 @@ def listLtspiceLibraryEntries(
     lib_zip_path: str | None = None,
 ) -> dict[str, Any]:
     """List LTspice symbol ZIP entries (.asy), optionally filtered by query."""
-    if limit <= 0:
-        return {"zip_path": str(DEFAULT_LTSPICE_LIB_ZIP), "entries": [], "returned_count": 0}
-
-    safe_limit = min(int(limit), 5000)
+    safe_limit = _require_int("limit", limit, minimum=1, maximum=5000)
     library = _resolve_symbol_library(lib_zip_path)
     entries = library.list_entries(query=query, limit=safe_limit)
     return {
@@ -5985,10 +6736,7 @@ def listLtspiceSymbols(
     lib_zip_path: str | None = None,
 ) -> dict[str, Any]:
     """List/search LTspice symbols parsed from the symbol library ZIP."""
-    if limit <= 0:
-        return {"symbols": [], "returned_count": 0}
-
-    safe_limit = min(int(limit), 5000)
+    safe_limit = _require_int("limit", limit, minimum=1, maximum=5000)
     symbol_lib = _resolve_symbol_library(lib_zip_path)
     symbols = symbol_lib.list_symbols(
         query=query,
@@ -6021,7 +6769,7 @@ def getLtspiceSymbolInfo(
 
     if include_source:
         raw_source = symbol_lib.read_symbol_source(symbol)
-        max_chars = max(0, int(source_max_chars))
+        max_chars = _require_int("source_max_chars", source_max_chars, minimum=1, maximum=500_000)
         if max_chars and len(raw_source) > max_chars:
             payload["source"] = raw_source[:max_chars]
             payload["source_truncated"] = True
@@ -6203,6 +6951,12 @@ def renderLtspicePlotImage(
     """
     if not vectors:
         raise ValueError("vectors must contain at least one vector name")
+    session_payload: dict[str, Any] | None = None
+    if render_session_id and run_id is None and raw_path is None:
+        session_payload = _render_sessions.get(render_session_id)
+        if not session_payload:
+            raise ValueError(f"Unknown render_session_id '{render_session_id}'")
+        raw_path = str(session_payload.get("path") or "")
     dataset = _resolve_dataset(plot=plot, run_id=run_id, raw_path=raw_path)
     selected_step = _resolve_step_index(dataset, step_index)
     _validate_vectors_exist(dataset=dataset, vectors=vectors, step_index=selected_step)
@@ -6242,11 +6996,13 @@ def renderLtspicePlotImage(
     title_hint = render_dataset.path.name
     close_after_capture = True
     if render_session_id:
-        session = _render_sessions.get(render_session_id)
+        session = session_payload or _render_sessions.get(render_session_id)
         if not session:
             raise ValueError(f"Unknown render_session_id '{render_session_id}'")
-        session_path = Path(str(session.get("path") or "")).expanduser().resolve()
-        if session.get("path") and session_path != render_dataset.path:
+        session_path_raw = str(session.get("path") or "")
+        session_path = Path(session_path_raw).expanduser().resolve() if session_path_raw else None
+        valid_session_paths: set[Path] = {render_dataset.path, dataset.path}
+        if session_path is not None and session_path not in valid_session_paths:
             raise ValueError(
                 "render_session_id is bound to a different path. "
                 "Start a render session for the selected step/raw file first."
@@ -6391,7 +7147,7 @@ def listPlotPresets() -> dict[str, Any]:
 @mcp.tool()
 def generatePlotPresetSettings(
     preset: str,
-    vectors: list[str] | None = None,
+    vectors: list[str] | str | None = None,
     plot: str | None = None,
     run_id: str | None = None,
     raw_path: str | None = None,
@@ -6401,8 +7157,17 @@ def generatePlotPresetSettings(
     """Generate deterministic .plt settings for a named preset."""
     normalized_preset = _normalize_plot_preset(preset)
     dataset = _resolve_dataset(plot=plot, run_id=run_id, raw_path=raw_path)
-    selected_vectors = vectors or _default_vectors_for_plot_preset(dataset, normalized_preset)
+    selected_vectors: list[str]
+    if vectors is None:
+        selected_vectors = _default_vectors_for_plot_preset(dataset, normalized_preset)
+    elif isinstance(vectors, str):
+        selected_vectors = [vectors]
+    else:
+        selected_vectors = list(vectors)
+    if not selected_vectors:
+        raise ValueError("vectors must contain at least one vector name")
     settings = _PLOT_PRESETS[normalized_preset]
+    domain_warning = _plot_preset_domain_warning(dataset=dataset, preset=normalized_preset)
     payload = generatePlotSettings(
         vectors=selected_vectors,
         plot=plot,
@@ -6418,13 +7183,15 @@ def generatePlotPresetSettings(
     payload["plot_preset"] = normalized_preset
     payload["preset_settings"] = settings
     payload["vectors_selected"] = selected_vectors
+    if domain_warning:
+        payload.setdefault("warnings", []).append(domain_warning)
     return payload
 
 
 @mcp.tool()
 def renderLtspicePlotPresetImage(
     preset: str,
-    vectors: list[str] | None = None,
+    vectors: list[str] | str | None = None,
     plot: str | None = None,
     run_id: str | None = None,
     raw_path: str | None = None,
@@ -6437,9 +7204,24 @@ def renderLtspicePlotPresetImage(
 ) -> CallToolResult:
     """Render a plot image using a built-in deterministic preset."""
     normalized_preset = _normalize_plot_preset(preset)
+    session_payload: dict[str, Any] | None = None
+    if render_session_id and run_id is None and raw_path is None:
+        session_payload = _render_sessions.get(render_session_id)
+        if not session_payload:
+            raise ValueError(f"Unknown render_session_id '{render_session_id}'")
+        raw_path = str(session_payload.get("path") or "")
     dataset = _resolve_dataset(plot=plot, run_id=run_id, raw_path=raw_path)
-    selected_vectors = vectors or _default_vectors_for_plot_preset(dataset, normalized_preset)
+    selected_vectors: list[str]
+    if vectors is None:
+        selected_vectors = _default_vectors_for_plot_preset(dataset, normalized_preset)
+    elif isinstance(vectors, str):
+        selected_vectors = [vectors]
+    else:
+        selected_vectors = list(vectors)
+    if not selected_vectors:
+        raise ValueError("vectors must contain at least one vector name")
     settings = _PLOT_PRESETS[normalized_preset]
+    domain_warning = _plot_preset_domain_warning(dataset=dataset, preset=normalized_preset)
     result = renderLtspicePlotImage(
         vectors=selected_vectors,
         plot=plot,
@@ -6463,6 +7245,8 @@ def renderLtspicePlotPresetImage(
     merged["plot_preset"] = normalized_preset
     merged["preset_settings"] = settings
     merged["vectors_selected"] = selected_vectors
+    if domain_warning:
+        merged.setdefault("warnings", []).append(domain_warning)
     return _image_tool_result(merged)
 
 
@@ -6611,7 +7395,7 @@ def readLtspiceUiText(
 def createSchematic(
     components: list[dict[str, Any]],
     wires: list[dict[str, Any]] | None = None,
-    directives: list[dict[str, Any] | str] | None = None,
+    directives: list[dict[str, Any] | str] | str | None = None,
     labels: list[dict[str, Any]] | None = None,
     circuit_name: str = "schematic",
     output_path: str | None = None,
@@ -6943,8 +7727,10 @@ def runSimulation(
     if _loaded_netlist is None:
         raise ValueError("No netlist is loaded. Use loadCircuit or loadNetlistFromFile first.")
 
+    staged = _stage_sync_source_netlist(source_path=_loaded_netlist, purpose="run_simulation")
+    staged_path = Path(str(staged["run_path"])).expanduser().resolve()
     run, ui_events, effective_ui, retry_payload = _run_simulation_with_auto_convergence_retry(
-        netlist_path=_loaded_netlist,
+        netlist_path=staged_path,
         ascii_raw=ascii_raw,
         timeout_seconds=timeout_seconds,
         show_ui=show_ui,
@@ -6956,6 +7742,10 @@ def runSimulation(
             "LTspice batch mode ignores ngspice commands; use directives (.tran/.ac/.op) in the netlist."
         )
     response = _run_payload(run, include_output=False, log_tail_lines=120)
+    response["source_netlist_path"] = str(_loaded_netlist)
+    response["staged_netlist_path"] = str(staged_path)
+    if staged.get("warnings"):
+        response["staging_warnings"] = list(staged["warnings"])
     if notes:
         response["notes"] = notes
     response["ui_enabled"] = effective_ui
@@ -7007,14 +7797,20 @@ def simulateNetlistFile(
     if not path.exists():
         raise FileNotFoundError(f"Netlist file not found: {path}")
     _loaded_netlist = path
+    staged = _stage_sync_source_netlist(source_path=path, purpose="simulate_netlist_file")
+    staged_path = Path(str(staged["run_path"])).expanduser().resolve()
     run, ui_events, effective_ui, retry_payload = _run_simulation_with_auto_convergence_retry(
-        netlist_path=path,
+        netlist_path=staged_path,
         ascii_raw=ascii_raw,
         timeout_seconds=timeout_seconds,
         show_ui=show_ui,
         open_raw_after_run=open_raw_after_run,
     )
     response = _run_payload(run, include_output=False, log_tail_lines=120)
+    response["source_netlist_path"] = str(path)
+    response["staged_netlist_path"] = str(staged_path)
+    if staged.get("warnings"):
+        response["staging_warnings"] = list(staged["warnings"])
     response["ui_enabled"] = effective_ui
     response["auto_convergence_retry"] = retry_payload
     if ui_events:
@@ -7104,6 +7900,10 @@ def lintSchematic(
             "wire_crossing": crossing_count,
         }
         payload["valid"] = len(payload.get("errors", [])) == 0
+    if isinstance(payload.get("validation"), dict):
+        payload["validation"]["valid"] = bool(payload.get("valid", False))
+        payload["validation"]["issues"] = list(payload.get("errors", []))
+        payload["validation"]["warnings"] = list(payload.get("warnings", []))
     return payload
 
 
@@ -7126,6 +7926,8 @@ def simulateSchematicFile(
     path = Path(asc_path).expanduser().resolve()
     if not path.exists():
         raise FileNotFoundError(f"Schematic file not found: {path}")
+    if path.suffix.lower() != ".asc":
+        raise ValueError("simulateSchematicFile expects an .asc schematic path.")
 
     validation: dict[str, Any] | None = None
     if validate_first:
@@ -7147,8 +7949,10 @@ def simulateSchematicFile(
     )
 
     _loaded_netlist = run_target
+    staged = _stage_sync_source_netlist(source_path=run_target, purpose="simulate_schematic")
+    staged_path = Path(str(staged["run_path"])).expanduser().resolve()
     run, ui_events, effective_ui, retry_payload = _run_simulation_with_auto_convergence_retry(
-        netlist_path=run_target,
+        netlist_path=staged_path,
         ascii_raw=ascii_raw,
         timeout_seconds=timeout_seconds,
         show_ui=show_ui,
@@ -7157,11 +7961,14 @@ def simulateSchematicFile(
     response = _run_payload(run, include_output=False, log_tail_lines=120)
     response["schematic_path"] = str(path)
     response["run_target_path"] = str(run_target)
+    response["staged_run_target_path"] = str(staged_path)
     response["used_sidecar_netlist"] = sidecar_netlist is not None
     if sidecar_netlist is not None:
         response["sidecar_netlist_path"] = str(sidecar_netlist)
     response["ui_enabled"] = effective_ui
     response["auto_convergence_retry"] = retry_payload
+    if staged.get("warnings"):
+        response["staging_warnings"] = list(staged["warnings"])
     if validation is not None:
         response["schematic_validation"] = validation
     if ui_events:
@@ -7196,19 +8003,32 @@ def scanModelIssues(
     max_suggestions_per_issue: int = 5,
 ) -> dict[str, Any]:
     """Scan LTspice log text for missing model/include/subcircuit issues."""
+    safe_run_id = _normalize_optional_selector("run_id", run_id)
+    safe_log_path = _normalize_optional_selector("log_path", log_path)
+    _ensure_mutually_exclusive_selectors(
+        context="scanModelIssues",
+        values={"run_id": safe_run_id, "log_path": safe_log_path},
+    )
+    safe_max_scan_files = _require_int("max_scan_files", max_scan_files, minimum=1, maximum=100_000)
+    safe_max_suggestions = _require_int(
+        "max_suggestions_per_issue",
+        max_suggestions_per_issue,
+        minimum=1,
+        maximum=200,
+    )
     resolved_log: Path | None = None
     source_run_id: str | None = None
     source_path: Path | None = None
-    if log_path:
-        resolved_log = Path(log_path).expanduser().resolve()
+    if safe_log_path:
+        resolved_log = Path(safe_log_path).expanduser().resolve()
     else:
-        run = _resolve_run(run_id)
+        run = _resolve_run(safe_run_id)
         source_run_id = run.run_id
         source_path = run.netlist_path
         resolved_log = run.log_path
     if resolved_log is None or not resolved_log.exists():
         return {
-            "run_id": source_run_id or run_id,
+            "run_id": source_run_id or safe_run_id,
             "log_path": str(resolved_log) if resolved_log else None,
             "has_model_issues": False,
             "missing_include_files": [],
@@ -7219,7 +8039,7 @@ def scanModelIssues(
         }
     text = read_text_auto(resolved_log)
     payload = _extract_model_issues_from_text(text)
-    payload["run_id"] = source_run_id or run_id
+    payload["run_id"] = source_run_id or safe_run_id
     payload["log_path"] = str(resolved_log)
     payload["suggestions"] = []
     if payload["missing_include_files"]:
@@ -7246,12 +8066,12 @@ def scanModelIssues(
         )
         inventory = _scan_model_inventory(
             search_paths=resolved_search_paths,
-            max_scan_files=max_scan_files,
+            max_scan_files=safe_max_scan_files,
         )
         payload["resolution_suggestions"] = _suggest_model_resolutions(
             issues=payload,
             inventory=inventory,
-            limit_per_issue=max_suggestions_per_issue,
+            limit_per_issue=safe_max_suggestions,
         )
         payload["model_search"] = {
             "search_paths": inventory["search_paths"],
@@ -7281,7 +8101,20 @@ def importModelFile(
     )
     target_dir.mkdir(parents=True, exist_ok=True)
     target_name = destination_name or source.name
-    target = (target_dir / target_name).resolve()
+    if not target_name.strip():
+        raise ValueError("destination_name must not be empty when provided.")
+    target_candidate = Path(target_name)
+    if target_candidate.is_absolute():
+        raise ValueError("destination_name must be relative to models_dir and must not be absolute.")
+    if any(part in {"..", "."} for part in target_candidate.parts):
+        raise ValueError("destination_name must not contain path traversal segments ('.' or '..').")
+    if target_candidate.name != target_candidate.as_posix():
+        raise ValueError("destination_name must be a simple filename without path separators.")
+    target = (target_dir / target_candidate.name).resolve()
+    try:
+        target.relative_to(target_dir)
+    except ValueError as exc:
+        raise ValueError("Resolved destination escaped models_dir; choose a safe destination_name.") from exc
     if target.exists() and target.read_bytes() == source.read_bytes():
         imported = False
     else:
@@ -7603,7 +8436,7 @@ def tailDaemonLog(
     log_dir: str | None = None,
 ) -> dict[str, Any]:
     """Return tail text from the active daemon log file."""
-    max_lines = max(1, min(5000, int(lines)))
+    max_lines = _require_int("lines", lines, minimum=1, maximum=5000)
     try:
         resolved = _resolve_daemon_log_path(log_path=log_path, log_dir=log_dir)
     except FileNotFoundError as exc:
@@ -7631,17 +8464,18 @@ def getRecentErrors(
     log_dir: str | None = None,
 ) -> dict[str, Any]:
     """Scan recent daemon logs and return structured error entries."""
-    max_items = max(1, min(1000, int(limit)))
+    max_items = _require_int("limit", limit, minimum=1, maximum=1000)
+    safe_log_count = _require_int("log_count", log_count, minimum=1, maximum=30)
     entries = _collect_recent_log_entries(
         limit=max_items,
         include_warnings=bool(include_warnings),
-        log_count=max(1, min(30, int(log_count))),
+        log_count=safe_log_count,
         log_dir=log_dir,
     )
     return {
         "entry_count": len(entries),
         "limit": max_items,
-        "log_count": max(1, min(30, int(log_count))),
+        "log_count": safe_log_count,
         "include_warnings": bool(include_warnings),
         "entries": entries,
     }
@@ -7653,7 +8487,7 @@ def getCaptureHealth(
     include_recent_events: bool = False,
 ) -> dict[str, Any]:
     """Summarize ScreenCapture/LTspice capture health from in-process capture events."""
-    max_items = max(1, min(2000, int(limit)))
+    max_items = _require_int("limit", limit, minimum=1, maximum=2000)
     health = get_capture_health_snapshot(limit=max_items)
     health["limit"] = max_items
     if include_recent_events:
@@ -7664,9 +8498,8 @@ def getCaptureHealth(
 @mcp.tool()
 def listRuns(limit: int = 20) -> list[dict[str, Any]]:
     """List recent simulation runs (newest first)."""
-    if limit <= 0:
-        return []
-    selected_ids = list(reversed(_run_order[-limit:]))
+    safe_limit = _require_int("limit", limit, minimum=1, maximum=1000)
+    selected_ids = list(reversed(_run_order[-safe_limit:]))
     return [_runs[run_id].as_dict(include_output=False) for run_id in selected_ids]
 
 
@@ -7684,10 +8517,16 @@ def getRunDetails(
 @mcp.tool()
 def getPlotNames(run_id: str | None = None, raw_path: str | None = None) -> dict[str, Any]:
     """List LTspice plot names available in one RAW file or all RAW files from a run."""
-    if raw_path:
-        dataset = _resolve_dataset(plot=None, run_id=run_id, raw_path=raw_path)
+    normalized_run_id = _normalize_optional_selector("run_id", run_id)
+    normalized_raw_path = _normalize_optional_selector("raw_path", raw_path)
+    _ensure_mutually_exclusive_selectors(
+        context="getPlotNames",
+        values={"run_id": normalized_run_id, "raw_path": normalized_raw_path},
+    )
+    if normalized_raw_path:
+        dataset = _resolve_dataset(plot=None, run_id=None, raw_path=normalized_raw_path)
         return {
-            "run_id": run_id,
+            "run_id": None,
             "plots": [
                 {
                     "plot_name": dataset.plot_name,
@@ -7698,7 +8537,11 @@ def getPlotNames(run_id: str | None = None, raw_path: str | None = None) -> dict
             ],
         }
 
-    run = _resolve_run(run_id)
+    run = _resolve_run(normalized_run_id)
+    if not run.raw_files:
+        raise ValueError(
+            f"Run '{run.run_id}' has no RAW files. Check the log or LTspice output."
+        )
     plots: list[dict[str, Any]] = []
     for candidate in run.raw_files:
         try:
@@ -7857,6 +8700,7 @@ def getBandwidth(
     drop_db: float = 3.0,
 ) -> dict[str, Any]:
     """Compute -drop_db bandwidth for an AC response vector."""
+    safe_drop_db = _require_float("drop_db", drop_db, minimum=0.0)
     dataset = _resolve_dataset(plot=plot, run_id=run_id, raw_path=raw_path)
     selected_step = _resolve_step_index(dataset, step_index)
     if dataset.scale_name.lower() != "frequency":
@@ -7866,7 +8710,7 @@ def getBandwidth(
         frequency_hz=dataset.scale_values(step_index=selected_step),
         response=dataset.get_vector(vector, step_index=selected_step),
         reference=reference,
-        drop_db=drop_db,
+        drop_db=safe_drop_db,
     )
     return {
         "plot_name": dataset.plot_name,
@@ -7915,6 +8759,8 @@ def getRiseFallTime(
     high_threshold_pct: float = 90.0,
 ) -> dict[str, Any]:
     """Compute first rise/fall times for a transient response."""
+    safe_low = _require_float("low_threshold_pct", low_threshold_pct)
+    safe_high = _require_float("high_threshold_pct", high_threshold_pct)
     dataset = _resolve_dataset(plot=plot, run_id=run_id, raw_path=raw_path)
     selected_step = _resolve_step_index(dataset, step_index)
     if dataset.scale_name.lower() != "time":
@@ -7923,8 +8769,8 @@ def getRiseFallTime(
     result = compute_rise_fall_time(
         time_s=dataset.scale_values(step_index=selected_step),
         signal=dataset.get_vector(vector, step_index=selected_step),
-        low_threshold_pct=low_threshold_pct,
-        high_threshold_pct=high_threshold_pct,
+        low_threshold_pct=safe_low,
+        high_threshold_pct=safe_high,
     )
     return {
         "plot_name": dataset.plot_name,
@@ -7946,6 +8792,8 @@ def getSettlingTime(
     target_value: float | None = None,
 ) -> dict[str, Any]:
     """Compute settling time to a target within tolerance_percent band."""
+    safe_tolerance = _require_float("tolerance_percent", tolerance_percent, minimum=0.0)
+    safe_target = None if target_value is None else _require_float("target_value", target_value)
     dataset = _resolve_dataset(plot=plot, run_id=run_id, raw_path=raw_path)
     selected_step = _resolve_step_index(dataset, step_index)
     if dataset.scale_name.lower() != "time":
@@ -7954,8 +8802,8 @@ def getSettlingTime(
     result = compute_settling_time(
         time_s=dataset.scale_values(step_index=selected_step),
         signal=dataset.get_vector(vector, step_index=selected_step),
-        tolerance_percent=tolerance_percent,
-        target_value=target_value,
+        tolerance_percent=safe_tolerance,
+        target_value=safe_target,
     )
     return {
         "plot_name": dataset.plot_name,

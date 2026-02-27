@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -403,9 +404,10 @@ def _resolve_output_path(
 ) -> Path:
     if output_path:
         return Path(output_path).expanduser().resolve()
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     safe = _sanitize_name(circuit_name)
-    return (workdir / "schematics" / f"{stamp}_{safe}" / f"{safe}.asc").resolve()
+    unique = hashlib.sha1(f"{stamp}:{safe}".encode("utf-8")).hexdigest()[:8]
+    return (workdir / "schematics" / f"{stamp}_{safe}_{unique}" / f"{safe}.asc").resolve()
 
 
 def _resolve_stable_output_path(
@@ -447,6 +449,25 @@ def _safe_format(template: str, parameters: dict[str, Any]) -> str:
             return "{" + key + "}"
 
     return template.format_map(_MissingDict({key: str(value) for key, value in parameters.items()}))
+
+
+_UNRESOLVED_TEMPLATE_TOKEN_RE = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
+
+
+def _collect_unresolved_template_tokens(value: Any) -> set[str]:
+    tokens: set[str] = set()
+    if isinstance(value, str):
+        tokens.update(_UNRESOLVED_TEMPLATE_TOKEN_RE.findall(value))
+        return tokens
+    if isinstance(value, list):
+        for item in value:
+            tokens.update(_collect_unresolved_template_tokens(item))
+        return tokens
+    if isinstance(value, dict):
+        for item in value.values():
+            tokens.update(_collect_unresolved_template_tokens(item))
+        return tokens
+    return tokens
 
 
 def _format_recursive(value: Any, parameters: dict[str, Any]) -> Any:
@@ -535,10 +556,34 @@ def build_schematic_from_spec(
         builder.add_component(component)
         component_objs.append(component)
 
-    for wire in wires or []:
+    if wires is not None and not isinstance(wires, list):
+        raise ValueError("wires must be a list of objects with keys: x1, y1, x2, y2")
+    if labels is not None and not isinstance(labels, list):
+        raise ValueError("labels must be a list of objects with keys: x, y, name")
+    normalized_directives: list[dict[str, Any] | str] = []
+    if directives is None:
+        normalized_directives = []
+    elif isinstance(directives, str):
+        normalized_directives = [directives]
+    elif isinstance(directives, list):
+        normalized_directives = directives
+    else:
+        raise ValueError("directives must be a list (or string) of directive entries")
+
+    for wire_index, wire in enumerate(wires or []):
+        if not isinstance(wire, dict):
+            raise ValueError(f"wires[{wire_index}] must be an object")
+        missing = [key for key in ("x1", "y1", "x2", "y2") if key not in wire]
+        if missing:
+            raise ValueError(f"wires[{wire_index}] missing required field(s): {', '.join(missing)}")
         builder.add_wire(int(wire["x1"]), int(wire["y1"]), int(wire["x2"]), int(wire["y2"]))
 
-    for label in labels or []:
+    for label_index, label in enumerate(labels or []):
+        if not isinstance(label, dict):
+            raise ValueError(f"labels[{label_index}] must be an object")
+        missing = [key for key in ("x", "y", "name") if key not in label]
+        if missing:
+            raise ValueError(f"labels[{label_index}] missing required field(s): {', '.join(missing)}")
         builder.add_flag(int(label["x"]), int(label["y"]), str(label["name"]))
 
     # Optional pin-level net labels directly from component definition.
@@ -557,10 +602,12 @@ def build_schematic_from_spec(
             x, y = _component_pin_position(lib, component, spice_order=spice_order)
             builder.add_flag(x, y, net_name)
 
-    for index, directive in enumerate(directives or []):
+    for index, directive in enumerate(normalized_directives):
         if isinstance(directive, str):
             builder.add_directive(48, sheet_height - 120 + index * 24, directive)
             continue
+        if not isinstance(directive, dict):
+            raise ValueError(f"directives[{index}] must be a string or object")
         text = str(directive.get("text", "")).strip()
         if not text:
             continue
@@ -1229,6 +1276,12 @@ def build_schematic_from_template(
 
     params = {str(key): value for key, value in (parameters or {}).items()}
     rendered = _format_recursive(matched, params)
+    unresolved_tokens = _collect_unresolved_template_tokens(rendered)
+    if unresolved_tokens:
+        raise ValueError(
+            "Template contains unresolved placeholders after substitution: "
+            + ", ".join(sorted(unresolved_tokens))
+        )
     tpl_type = str(rendered.get("type", "netlist")).strip().lower()
     resolved_name = circuit_name or str(rendered.get("circuit_name") or template_name)
     resolved_width = int(

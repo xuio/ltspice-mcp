@@ -75,11 +75,15 @@ class TestSchematicRuntimeTools(unittest.TestCase):
         self.assertEqual(payload["run_id"], "run-schematic-1")
         self.assertEqual(payload["schematic_path"], str(asc_path.resolve()))
         self.assertEqual(payload["run_target_path"], str(sidecar.resolve()))
+        self.assertIn("staged_run_target_path", payload)
         self.assertTrue(payload["used_sidecar_netlist"])
         self.assertIn("schematic_validation", payload)
         self.assertTrue(payload["schematic_validation"]["valid"])
         run_mock.assert_called_once()
-        self.assertEqual(run_mock.call_args.kwargs["netlist_path"], sidecar.resolve())
+        staged_target = Path(str(payload["staged_run_target_path"])).resolve()
+        self.assertTrue(staged_target.exists())
+        self.assertNotEqual(staged_target, sidecar.resolve())
+        self.assertEqual(run_mock.call_args.kwargs["netlist_path"], staged_target)
 
     def test_simulate_schematic_file_can_abort_on_invalid_preflight(self) -> None:
         temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_simulate_schematic_abort_test_"))

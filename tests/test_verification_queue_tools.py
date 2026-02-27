@@ -579,13 +579,13 @@ class TestVerificationAndQueueTools(unittest.TestCase):
         self.assertFalse(payload["requested_measurements_succeeded"])
         self.assertFalse(payload["run"]["requested_measurements_succeeded"])
         self.assertTrue(payload["run"]["simulation_succeeded"])
-        self.assertFalse(payload["run"]["succeeded"])
+        self.assertFalse(payload["run"]["overall_succeeded"])
         failed = payload["failed_measurements"]
         self.assertEqual(len(failed), 1)
         self.assertEqual(failed[0]["name"], "bad")
         self.assertIn("no such vector", str(failed[0].get("reason", "")))
         self.assertEqual(payload["missing_requested_measurements"], [])
-        self.assertIn("bad", " ".join(payload["run"]["issues"]).lower())
+        self.assertTrue(payload["warnings"])
 
     def test_run_verification_plan_supports_vector_and_meas_checks(self) -> None:
         run = _make_run(self.temp_dir, run_id="verify-run")
@@ -900,6 +900,47 @@ class TestVerificationAndQueueTools(unittest.TestCase):
         self.assertEqual(payload["record_count"], 2)
         self.assertEqual([row["metric_value"] for row in payload["records"]], [2.0, 4.0])
         self.assertAlmostEqual(payload["aggregate"]["mean"], 3.0)
+
+    def test_run_sweep_study_warns_when_parameter_appears_unused(self) -> None:
+        netlist = self.temp_dir / "step_unused_param.cir"
+        netlist.write_text("* step study\nR1 in out 1k\n.end\n", encoding="utf-8")
+        run = _make_run(self.temp_dir, run_id="step-unused")
+        dataset = RawDataset(
+            path=self.temp_dir / "step_unused.raw",
+            plot_name="Transient Analysis",
+            flags={"stepped"},
+            metadata={},
+            variables=[
+                RawVariable(index=0, name="time", kind="time"),
+                RawVariable(index=1, name="V(out)", kind="voltage"),
+            ],
+            values=[
+                [0.0 + 0j, 1.0 + 0j, 0.0 + 0j, 1.0 + 0j],
+                [1.0 + 0j, 2.0 + 0j, 3.0 + 0j, 4.0 + 0j],
+            ],
+            steps=[
+                RawStep(index=0, start=0, end=2, label="NOSUCH=1"),
+                RawStep(index=1, start=2, end=4, label="NOSUCH=2"),
+            ],
+        )
+        with (
+            patch(
+                "ltspice_mcp.server.simulateNetlistFile",
+                return_value={"run_id": run.run_id, "succeeded": True},
+            ),
+            patch("ltspice_mcp.server._resolve_run", return_value=run),
+            patch("ltspice_mcp.server._resolve_dataset", return_value=dataset),
+        ):
+            payload = server.runSweepStudy(
+                parameter="NO_SUCH",
+                mode="step",
+                netlist_path=str(netlist),
+                values=["1", "2"],
+                metric_vector="V(out)",
+                metric_statistic="final",
+            )
+        self.assertTrue(payload["warnings"])
+        self.assertIn("does not appear to be referenced", payload["warnings"][0])
 
     def test_run_sweep_study_step_mode_operating_point_fallback_aligns_points(self) -> None:
         netlist = self.temp_dir / "step_study_op.cir"
@@ -1412,6 +1453,214 @@ class TestVerificationAndQueueTools(unittest.TestCase):
         history_after = server.listJobHistory(limit=50)
         self.assertTrue(any(item["job_id"] == queued["job_id"] for item in history_after["jobs"]))
 
+    def test_list_jobs_include_history_flag_controls_terminal_visibility(self) -> None:
+        netlist = self.temp_dir / "history_visibility.cir"
+        netlist.write_text("* history visibility\n.end\n", encoding="utf-8")
+        with patch("ltspice_mcp.server._ensure_job_worker", return_value=None):
+            queued = server.queueSimulationJob(netlist_path=str(netlist), priority=5, max_retries=0)
+        canceled = server.cancelJob(job_id=queued["job_id"])
+        self.assertEqual(canceled["status"], "canceled")
+
+        without_history = server.listJobs(limit=10, include_history=False)
+        self.assertEqual(without_history["count"], 0)
+
+        with_history = server.listJobs(limit=10, include_history=True)
+        self.assertGreaterEqual(with_history["count"], 1)
+        self.assertTrue(any(item["job_id"] == queued["job_id"] for item in with_history["jobs"]))
+
+    def test_cancel_job_returns_terminal_noop_for_history_only_job(self) -> None:
+        netlist = self.temp_dir / "history_only_job.cir"
+        netlist.write_text("* history only\n.end\n", encoding="utf-8")
+        with patch("ltspice_mcp.server._ensure_job_worker", return_value=None):
+            queued = server.queueSimulationJob(netlist_path=str(netlist), priority=5, max_retries=0)
+        canceled = server.cancelJob(job_id=queued["job_id"])
+        self.assertEqual(canceled["status"], "canceled")
+        self.assertIsNotNone(canceled["archived_at"])
+
+        # Simulate a terminal job that exists only in archived history.
+        with server._job_lock:
+            server._jobs.pop(queued["job_id"], None)
+            if queued["job_id"] in server._job_order:
+                server._job_order.remove(queued["job_id"])
+        history_only = server.cancelJob(job_id=queued["job_id"])
+        self.assertTrue(history_only["from_history"])
+        self.assertTrue(history_only["no_op"])
+        self.assertEqual(history_only["reason"], "job_already_terminal")
+        self.assertEqual(history_only["status"], "canceled")
+        self.assertIsNotNone(history_only["archived_at"])
+
+    def test_queue_rejects_invalid_priority_retry_and_timeout_inputs(self) -> None:
+        netlist = self.temp_dir / "queue_validation.cir"
+        netlist.write_text("* queue validation\n.end\n", encoding="utf-8")
+        with patch("ltspice_mcp.server._ensure_job_worker", return_value=None):
+            with self.assertRaisesRegex(ValueError, "priority must be >= 0"):
+                server.queueSimulationJob(netlist_path=str(netlist), priority=-1)
+            with self.assertRaisesRegex(ValueError, "max_retries must be >= 0"):
+                server.queueSimulationJob(netlist_path=str(netlist), max_retries=-1)
+            with self.assertRaisesRegex(ValueError, "timeout_seconds must be >= 1"):
+                server.queueSimulationJob(netlist_path=str(netlist), timeout_seconds=0)
+            with self.assertRaisesRegex(ValueError, "max_retries must be an integer, not boolean"):
+                server.queueSimulationJob(netlist_path=str(netlist), max_retries=True)
+            with self.assertRaisesRegex(ValueError, "priority must be an integer, not boolean"):
+                server.queueSimulationJob(netlist_path=str(netlist), priority=False)
+
+    def test_parse_meas_results_rejects_conflicting_selectors(self) -> None:
+        log_path = self.temp_dir / "selector_conflict.log"
+        log_path.write_text("gain: 1\n", encoding="utf-8")
+        run = _make_run(self.temp_dir, run_id="selector-conflict-run")
+        server._register_run(run)
+        with self.assertRaisesRegex(ValueError, "accepts only one source selector"):
+            server.parseMeasResults(run_id=run.run_id, log_path=str(log_path))
+
+    def test_parse_meas_results_run_and_log_path_are_equivalent(self) -> None:
+        run = _make_run(self.temp_dir, run_id="selector-eq-run")
+        assert run.log_path is not None
+        run.log_path.write_text("foo: v(in)=1\n", encoding="utf-8")
+        server._register_run(run)
+
+        via_run = server.parseMeasResults(run_id=run.run_id)
+        via_path = server.parseMeasResults(log_path=str(run.log_path))
+        self.assertEqual(via_run["measurements"], via_path["measurements"])
+        self.assertEqual(via_run["count"], via_path["count"])
+
+    def test_run_meas_automation_supports_short_form_measurements(self) -> None:
+        netlist = self.temp_dir / "meas_short_form_base.cir"
+        netlist.write_text(
+            "\n".join(
+                [
+                    "* short-form measurement",
+                    "V1 in 0 1",
+                    ".op",
+                    ".end",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        run = _make_run(self.temp_dir, run_id="meas-short-form-run")
+        assert run.log_path is not None
+        run.log_path.write_text("foo: v(in)=1\n", encoding="utf-8")
+        with (
+            patch("ltspice_mcp.server.simulateNetlistFile", return_value={"run_id": run.run_id, "succeeded": True}),
+            patch("ltspice_mcp.server._resolve_run", return_value=run),
+        ):
+            payload = server.runMeasAutomation(
+                netlist_path=str(netlist),
+                measurements=["foo PARAM V(in)"],
+            )
+        self.assertEqual(payload["requested_measurements"], ["foo"])
+        self.assertEqual(payload["measurements"]["requested_measurements"], ["foo"])
+        self.assertEqual(payload["measurements"]["missing_requested_measurements"], [])
+        self.assertTrue(payload["requested_measurements_succeeded"])
+
+    def test_run_verification_plan_meas_works_with_short_form_results(self) -> None:
+        run = _make_run(self.temp_dir, run_id="verify-short-form-run")
+        assert run.log_path is not None
+        run.log_path.write_text("foo: v(in)=1\n", encoding="utf-8")
+        server._register_run(run)
+        payload = server.runVerificationPlan(
+            run_id=run.run_id,
+            assertions=[{"id": "mfoo", "type": "meas", "name": "FOO", "min": 0.0}],
+        )
+        self.assertTrue(payload["overall_passed"])
+        self.assertEqual(payload["checks"][0]["id"], "mfoo")
+        self.assertTrue(payload["checks"][0]["passed"])
+        self.assertAlmostEqual(payload["checks"][0]["value"], 1.0, places=9)
+
+    def test_run_verification_plan_rejects_conflicting_or_unconstrained_inputs(self) -> None:
+        run = _make_run(self.temp_dir, run_id="verify-conflict-run")
+        server._register_run(run)
+        netlist = self.temp_dir / "verify_conflict.cir"
+        netlist.write_text("* verify conflict\n.end\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "accepts only one source selector"):
+            server.runVerificationPlan(
+                run_id=run.run_id,
+                netlist_path=str(netlist),
+                assertions=[{"type": "meas", "name": "foo", "min": 0.0}],
+            )
+        with self.assertRaisesRegex(ValueError, "must include at least one acceptance criterion"):
+            server.runVerificationPlan(
+                run_id=run.run_id,
+                assertions=[{"type": "meas", "name": "foo"}],
+            )
+        with self.assertRaisesRegex(ValueError, "does not support `run_id` together with `measurements`"):
+            server.runVerificationPlan(
+                run_id=run.run_id,
+                measurements=["foo PARAM V(in)"],
+                assertions=[{"type": "meas", "name": "foo", "min": 0.0}],
+            )
+
+    def test_get_plot_names_rejects_conflicting_selectors_and_reports_missing_raw(self) -> None:
+        raw_path = self.temp_dir / "plot_names.raw"
+        raw_path.write_text("placeholder\n", encoding="utf-8")
+        run = _make_run(self.temp_dir, run_id="plot-names-run")
+        run.raw_files = []
+        server._register_run(run)
+
+        with self.assertRaisesRegex(ValueError, "accepts only one source selector"):
+            server.getPlotNames(run_id=run.run_id, raw_path=str(raw_path))
+        with self.assertRaisesRegex(ValueError, "has no RAW files"):
+            server.getPlotNames(run_id=run.run_id)
+
+    def test_get_plot_names_supports_ascii_complex_raw(self) -> None:
+        raw_path = self.temp_dir / "ascii_complex_ac.raw"
+        dataset = RawDataset(
+            path=raw_path.resolve(),
+            plot_name="AC Analysis",
+            flags={"complex"},
+            metadata={},
+            variables=[
+                RawVariable(index=0, name="frequency", kind="frequency"),
+                RawVariable(index=1, name="V(out)", kind="voltage"),
+            ],
+            values=[
+                [10.0 + 0j, 100.0 + 0j, 1000.0 + 0j],
+                [1.0 + 0.0j, 0.5 - 0.5j, 0.1 - 0.9j],
+            ],
+            steps=[],
+        )
+        server._write_raw_dataset_ascii(dataset, raw_path)
+        payload = server.getPlotNames(raw_path=str(raw_path))
+        self.assertEqual(payload["run_id"], None)
+        self.assertEqual(len(payload["plots"]), 1)
+        self.assertEqual(payload["plots"][0]["plot_name"], "AC Analysis")
+
+    def test_run_sweep_study_rejects_conflicting_step_specs_and_existing_step(self) -> None:
+        netlist = self.temp_dir / "step_conflict.cir"
+        netlist.write_text(
+            "\n".join(
+                [
+                    "* sweep conflict",
+                    ".step param A list 1k 2k",
+                    "R1 in out {A}",
+                    ".op",
+                    ".end",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "does not support source netlists that already contain \\.step"):
+            server.runSweepStudy(
+                parameter="B",
+                mode="step",
+                netlist_path=str(netlist),
+                values=["1k", "2k"],
+            )
+
+        plain = self.temp_dir / "step_conflict_plain.cir"
+        plain.write_text("* plain\nR1 in out 1k\n.end\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "Provide either values OR start/stop/step"):
+            server.runSweepStudy(
+                parameter="RVAL",
+                mode="step",
+                netlist_path=str(plain),
+                values=["1k", "2k"],
+                start="1k",
+                stop="2k",
+                step="1k",
+            )
+
     def test_generate_verify_and_clean_circuit_orchestration(self) -> None:
         asc = self.temp_dir / "orchestration.asc"
         asc.write_text("Version 4\nSHEET 1 200 200\n", encoding="utf-8")
@@ -1453,6 +1702,38 @@ class TestVerificationAndQueueTools(unittest.TestCase):
         self.assertTrue(payload["overall_passed"])
         self.assertEqual(payload["final_schematic_path"], str(cleaned))
         self.assertEqual(lint_mock.call_count, 2)
+
+    def test_generate_verify_and_clean_uses_asc_mode_when_measurements_requested(self) -> None:
+        asc = self.temp_dir / "orchestration_meas.asc"
+        asc.write_text("Version 4\nSHEET 1 200 200\n", encoding="utf-8")
+        with (
+            patch(
+                "ltspice_mcp.server.createIntentCircuit",
+                return_value={"intent": "rc_lowpass", "asc_path": str(asc), "schematic_validation": {"valid": True}},
+            ),
+            patch("ltspice_mcp.server.lintSchematic", return_value={"valid": True, "errors": [], "warnings": []}),
+            patch(
+                "ltspice_mcp.server.simulateSchematicFile",
+                return_value={"run_id": "run-orch-meas", "succeeded": True},
+            ),
+            patch("ltspice_mcp.server.autoCleanSchematicLayout", return_value=None),
+            patch(
+                "ltspice_mcp.server.inspectSchematicVisualQuality",
+                return_value={"quality": {"score": 99.0}, "render": None},
+            ),
+            patch("ltspice_mcp.server.runVerificationPlan") as verify_mock,
+        ):
+            verify_mock.return_value = {"overall_passed": True, "checks": []}
+            payload = server.generateVerifyAndCleanCircuit(
+                intent="rc_lowpass",
+                measurements=["foo PARAM V(in)"],
+                auto_clean=False,
+                render_after_clean=False,
+            )
+        self.assertTrue(payload["overall_passed"])
+        verify_kwargs = verify_mock.call_args.kwargs
+        self.assertEqual(verify_kwargs.get("asc_path"), str(asc))
+        self.assertNotIn("run_id", verify_kwargs)
 
 
 if __name__ == "__main__":
