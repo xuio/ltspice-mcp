@@ -1351,6 +1351,140 @@ class TestVerificationAndQueueTools(unittest.TestCase):
             text = candidate.read_text(encoding="utf-8")
             self.assertEqual(text.lower().count(".param rval="), 1)
 
+    def test_run_sweep_study_step_mode_returns_structured_failures(self) -> None:
+        netlist = self.temp_dir / "step_failed.cir"
+        netlist.write_text("* failed step\nR1 in out 1k\n.end\n", encoding="utf-8")
+        run = _make_run(self.temp_dir, run_id="step-failed")
+        with (
+            patch(
+                "ltspice_mcp.server.simulateNetlistFile",
+                return_value={
+                    "run_id": run.run_id,
+                    "succeeded": False,
+                    "issues": ["Fatal Error: Unknown model."],
+                },
+            ),
+            patch("ltspice_mcp.server._resolve_run", return_value=run),
+        ):
+            payload = server.runSweepStudy(
+                parameter="RVAL",
+                mode="step",
+                netlist_path=str(netlist),
+                values=["1k", "2k"],
+                metric_vector="V(out)",
+                metric_statistic="final",
+            )
+
+        self.assertEqual(payload["record_count"], 2)
+        self.assertFalse(payload["overall_succeeded"])
+        self.assertEqual(payload["failed_record_count"], 2)
+        self.assertEqual(payload["successful_record_count"], 0)
+        self.assertTrue(all(row["succeeded"] is False for row in payload["records"]))
+        self.assertTrue(all(row["metric_value"] is None for row in payload["records"]))
+        self.assertTrue(any("Sweep simulation failed before metric extraction" in warning for warning in payload["warnings"]))
+
+    def test_run_sweep_study_monte_carlo_all_failed_has_no_worst_case(self) -> None:
+        netlist = self.temp_dir / "mc_failed.cir"
+        netlist.write_text("* failed mc\nR1 in out {RVAL}\n.end\n", encoding="utf-8")
+        run = _make_run(self.temp_dir, run_id="mc-failed")
+        with (
+            patch(
+                "ltspice_mcp.server.simulateNetlistFile",
+                return_value={"run_id": run.run_id, "succeeded": False, "issues": ["Fatal Error"]},
+            ),
+            patch("ltspice_mcp.server._resolve_run", return_value=run),
+        ):
+            payload = server.runSweepStudy(
+                parameter="RVAL",
+                mode="monte_carlo",
+                netlist_path=str(netlist),
+                samples=3,
+                nominal=1000.0,
+                sigma_pct=5.0,
+                metric_vector="V(out)",
+                metric_statistic="final",
+            )
+
+        self.assertFalse(payload["overall_succeeded"])
+        self.assertEqual(payload["record_count"], 3)
+        self.assertEqual(payload["failed_record_count"], 3)
+        self.assertEqual(payload["successful_record_count"], 0)
+        self.assertIsNone(payload["worst_case"])
+        self.assertEqual(payload["aggregate"], {"min": None, "max": None, "mean": None, "stddev": None})
+        self.assertTrue(any("All sweep runs failed" in warning for warning in payload["warnings"]))
+
+    def test_run_sweep_study_rejects_invalid_distribution_value(self) -> None:
+        netlist = self.temp_dir / "mc_invalid_distribution.cir"
+        netlist.write_text("* dist\nR1 in out {RVAL}\n.end\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "distribution must be one of: gaussian, uniform"):
+            server.runSweepStudy(
+                parameter="RVAL",
+                mode="monte_carlo",
+                netlist_path=str(netlist),
+                samples=2,
+                nominal=1000.0,
+                sigma_pct=5.0,
+                distribution="bogus_mode",
+            )
+
+    def test_run_sweep_study_rejects_unknown_numeric_suffix_values(self) -> None:
+        netlist = self.temp_dir / "step_invalid_suffix.cir"
+        netlist.write_text("* invalid suffix\nR1 in out 1k\n.end\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "values must be a numeric value"):
+            server.runSweepStudy(
+                parameter="RVAL",
+                mode="step",
+                netlist_path=str(netlist),
+                values=["1foo", "2foo"],
+                metric_vector="V(out)",
+            )
+
+    def test_run_sweep_study_unused_parameter_warning_ignores_comment_mentions(self) -> None:
+        netlist = self.temp_dir / "unused_comment_param.cir"
+        netlist.write_text(
+            "\n".join(
+                [
+                    "* unused param warning",
+                    "R1 in out 1k ; RVAL mentioned only in comment",
+                    ".end",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        run = _make_run(self.temp_dir, run_id="unused-comment")
+        dataset = RawDataset(
+            path=self.temp_dir / "unused_comment.raw",
+            plot_name="Transient Analysis",
+            flags={"stepped"},
+            metadata={},
+            variables=[
+                RawVariable(index=0, name="time", kind="time"),
+                RawVariable(index=1, name="V(out)", kind="voltage"),
+            ],
+            values=[
+                [0.0 + 0j, 1.0 + 0j, 0.0 + 0j, 1.0 + 0j],
+                [1.0 + 0j, 2.0 + 0j, 3.0 + 0j, 4.0 + 0j],
+            ],
+            steps=[
+                RawStep(index=0, start=0, end=2, label="RVAL=1k"),
+                RawStep(index=1, start=2, end=4, label="RVAL=2k"),
+            ],
+        )
+        with (
+            patch("ltspice_mcp.server.simulateNetlistFile", return_value={"run_id": run.run_id, "succeeded": True}),
+            patch("ltspice_mcp.server._resolve_run", return_value=run),
+            patch("ltspice_mcp.server._resolve_dataset", return_value=dataset),
+        ):
+            payload = server.runSweepStudy(
+                parameter="RVAL",
+                mode="step",
+                netlist_path=str(netlist),
+                values=["1k", "2k"],
+                metric_vector="V(out)",
+            )
+        self.assertTrue(any("does not appear to be referenced" in warning for warning in payload["warnings"]))
+
     def test_auto_clean_and_visual_inspection_tools(self) -> None:
         asc = self.temp_dir / "messy.asc"
         asc.write_text(
@@ -1908,6 +2042,34 @@ class TestVerificationAndQueueTools(unittest.TestCase):
                 stop="2k",
                 step="1k",
             )
+
+    def test_scan_model_issues_run_id_uses_utf8_log_fallback(self) -> None:
+        run = _make_run(self.temp_dir, run_id="scan-fallback")
+        assert run.log_path is not None
+        run.log_path.unlink(missing_ok=True)
+        run.log_utf8_path = self.temp_dir / "scan-fallback.log.utf8.txt"
+        run.log_utf8_path.write_text(
+            "Fatal Error: Unknown model: DFAST\n",
+            encoding="utf-8",
+        )
+        run.artifacts.append(run.log_utf8_path)
+        server._register_run(run)
+
+        payload = server.scanModelIssues(run_id=run.run_id, suggest_matches=False)
+        self.assertTrue(payload["has_model_issues"])
+        self.assertIn("DFAST", payload["missing_models"])
+
+    def test_list_jobs_rejects_invalid_order_by(self) -> None:
+        with self.assertRaisesRegex(ValueError, "order_by must be one of"):
+            server.listJobs(order_by="definitely_not_supported")
+
+    def test_integer_only_inputs_reject_float_values(self) -> None:
+        netlist = self.temp_dir / "int_validation.cir"
+        netlist.write_text("* int validation\nR1 in out 1k\n.op\n.end\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "timeout_seconds must be an integer"):
+            server.queueSimulationJob(netlist_path=str(netlist), timeout_seconds=1.9)
+        with self.assertRaisesRegex(ValueError, "limit must be an integer"):
+            server.listRuns(limit=1.9)
 
     def test_generate_verify_and_clean_circuit_orchestration(self) -> None:
         asc = self.temp_dir / "orchestration.asc"

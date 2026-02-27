@@ -1116,6 +1116,34 @@ def _select_primary_raw(run: SimulationRun) -> Path | None:
     return max(available, key=lambda path: path.stat().st_size)
 
 
+def _select_preferred_log_artifact(
+    run: SimulationRun,
+    *,
+    prefer_non_empty: bool = True,
+) -> Path | None:
+    candidates = [run.log_utf8_path, run.log_path]
+    available: list[Path] = []
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if not candidate.exists() or not candidate.is_file():
+            continue
+        available.append(candidate)
+    if not available:
+        return None
+    if prefer_non_empty:
+        non_empty: list[Path] = []
+        for candidate in available:
+            try:
+                if candidate.stat().st_size > 0:
+                    non_empty.append(candidate)
+            except OSError:
+                continue
+        if non_empty:
+            return non_empty[0]
+    return available[0]
+
+
 def _target_path_from_run(run: SimulationRun, target: str) -> Path:
     if target == "netlist":
         return run.netlist_path
@@ -1127,10 +1155,9 @@ def _target_path_from_run(run: SimulationRun, target: str) -> Path:
             )
         return selected
     if target == "log":
-        if run.log_path is not None and run.log_path.exists() and run.log_path.is_file():
-            return run.log_path
-        if run.log_utf8_path is not None and run.log_utf8_path.exists() and run.log_utf8_path.is_file():
-            return run.log_utf8_path
+        selected_log = _select_preferred_log_artifact(run, prefer_non_empty=False)
+        if selected_log is not None:
+            return selected_log
         raise ValueError(f"Run '{run.run_id}' does not have an available log artifact.")
     raise ValueError("target must be one of: netlist, raw, log")
 
@@ -2030,12 +2057,7 @@ def _now_iso() -> str:
 def _effective_sync_timeout(timeout_seconds: int | None) -> int | None:
     if timeout_seconds is None:
         return None
-    if isinstance(timeout_seconds, bool):
-        raise ValueError("timeout_seconds must be a positive integer, not a boolean value.")
-    requested = int(timeout_seconds)
-    if requested <= 0:
-        raise ValueError("timeout_seconds must be > 0.")
-    return requested
+    return _require_int("timeout_seconds", timeout_seconds, minimum=1)
 
 
 def _normalize_optional_selector(name: str, value: str | None) -> str | None:
@@ -2069,10 +2091,22 @@ def _require_int(
 ) -> int:
     if isinstance(value, bool):
         raise ValueError(f"{name} must be an integer, not boolean {value!r}.")
-    try:
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError(f"{name} must be an integer.")
         number = int(value)
-    except Exception as exc:  # noqa: BLE001
-        raise ValueError(f"{name} must be an integer.") from exc
+    elif isinstance(value, str):
+        token = value.strip()
+        if not token or not re.fullmatch(r"[+-]?\d+", token):
+            raise ValueError(f"{name} must be an integer.")
+        try:
+            number = int(token, 10)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"{name} must be an integer.") from exc
+    else:
+        raise ValueError(f"{name} must be an integer.")
     if minimum is not None and number < minimum:
         raise ValueError(f"{name} must be >= {minimum}.")
     if maximum is not None and number > maximum:
@@ -2546,7 +2580,7 @@ _MEAS_MEASUREMENT_RE = re.compile(
     re.IGNORECASE,
 )
 _MEAS_FAILURE_RE = re.compile(
-    r'^\s*Measurement\s+"?(?P<name>[A-Za-z_][\w.$-]*)"?\s+FAIL(?:\'ed|ed|ED)?\b(?:\s*[:\-]\s*(?P<reason>.+))?\s*$',
+    r'^\s*Measurement\s+"?(?P<name>[A-Za-z_][\w.$-]*)"?\s+FAIL(?:\'ed|ed|ED)?\b(?:\s*[:\-]\s*(?P<reason>.+))?\s*\.?\s*$',
     re.IGNORECASE,
 )
 _MEAS_DUPLICATE_RESULT_RE = re.compile(
@@ -2612,6 +2646,18 @@ _SPICE_SUFFIX_SCALE: dict[str, float] = {
     "f": 1e-15,
     "mil": 25.4e-6,
 }
+_SPICE_SUFFIX_UNITLESS: set[str] = {
+    "db",
+    "deg",
+    "hz",
+    "v",
+    "a",
+    "s",
+    "sec",
+    "ohm",
+    "ohms",
+}
+_SPICE_SUFFIX_UNIT_TAILS: set[str] = {"hz", "v", "a", "s", "ohm", "ohms"}
 
 
 def _parse_spice_number_token(token: str) -> float | None:
@@ -2631,7 +2677,21 @@ def _parse_spice_number_token(token: str) -> float | None:
     except InvalidOperation:
         return None
     if suffix:
-        value *= Decimal(str(_SPICE_SUFFIX_SCALE.get(suffix, 1.0)))
+        scale = _SPICE_SUFFIX_SCALE.get(suffix)
+        if scale is not None:
+            value *= Decimal(str(scale))
+        elif suffix not in _SPICE_SUFFIX_UNITLESS:
+            matched_scale = False
+            for scale_key in sorted(_SPICE_SUFFIX_SCALE.keys(), key=len, reverse=True):
+                if not suffix.startswith(scale_key):
+                    continue
+                tail = suffix[len(scale_key) :]
+                if tail in _SPICE_SUFFIX_UNIT_TAILS:
+                    value *= Decimal(str(_SPICE_SUFFIX_SCALE[scale_key]))
+                    matched_scale = True
+                    break
+            if not matched_scale:
+                return None
     return float(value)
 
 
@@ -3100,29 +3160,73 @@ def _parse_meas_failures_from_text(text: str) -> list[dict[str, Any]]:
     seen: set[tuple[str, int]] = set()
     lines = text.splitlines()
     active_measurement: str | None = None
+    active_line: int | None = None
+    active_has_value = False
     for index, line in enumerate(lines):
         candidate_line = line.strip()
         if candidate_line.lower().startswith((".meas", ".measure")):
             parsed_stmt = _parse_meas_statement_tokens(candidate_line)
             if parsed_stmt:
                 active_measurement = parsed_stmt["name"].strip() or active_measurement
+                active_line = index + 1
+                active_has_value = False
                 continue
         match_header = _MEAS_MEASUREMENT_RE.match(line)
         if match_header:
             active_measurement = match_header.group("name").strip() or None
+            active_line = index + 1 if active_measurement else None
+            active_has_value = False
             continue
+        match_value = _MEAS_VALUE_RE.match(line)
+        if match_value:
+            value_name = match_value.group("name").strip()
+            if active_measurement and value_name.lower() == active_measurement.lower():
+                active_has_value = True
+                active_measurement = None
+                active_line = None
+            continue
+        match_colon = _MEAS_COLON_LINE_RE.match(line)
+        if match_colon:
+            value_name = match_colon.group("name").strip()
+            lowered_value_name = value_name.lower()
+            if lowered_value_name not in {"error", "warning", "fatal"}:
+                if active_measurement and lowered_value_name == active_measurement.lower():
+                    active_has_value = True
+                    active_measurement = None
+                    active_line = None
+                continue
         match = _MEAS_FAILURE_RE.match(line)
         duplicate_match = _MEAS_DUPLICATE_RESULT_RE.match(line) if match is None else None
-        generic_error_match = _MEAS_GENERIC_ERROR_RE.match(line) if match is None and duplicate_match is None else None
+        generic_error_match = (
+            _MEAS_GENERIC_ERROR_RE.match(line)
+            if (
+                match is None
+                and duplicate_match is None
+                and active_measurement is not None
+                and not active_has_value
+                and active_line is not None
+                and (index + 1) <= (active_line + 2)
+            )
+            else None
+        )
         if match:
             name = match.group("name").strip()
             reason = (match.group("reason") or "").strip() or None
+            active_measurement = None
+            active_line = None
+            active_has_value = False
         elif duplicate_match:
             name = duplicate_match.group("name").strip()
             reason = "Multiply defined .measure result."
+            active_measurement = None
+            active_line = None
+            active_has_value = False
         elif generic_error_match and active_measurement:
             name = active_measurement
             reason = generic_error_match.group("reason").strip()
+            active_measurement = None
+            active_line = None
+            active_has_value = False
         else:
             continue
         normalized = name.lower()
@@ -3277,7 +3381,19 @@ def _likely_uses_parameter(netlist_text: str, parameter: str) -> bool:
     brace_re = re.compile(r"\{\s*" + re.escape(target) + r"\s*\}", re.IGNORECASE)
     bare_re = re.compile(r"\b" + re.escape(target) + r"\b", re.IGNORECASE)
     for raw_line in netlist_text.splitlines():
-        line = raw_line.strip()
+        line = raw_line
+        semicolon = line.find(";")
+        dollar = line.find("$")
+        split_at = None
+        if semicolon >= 0 and dollar >= 0:
+            split_at = min(semicolon, dollar)
+        elif semicolon >= 0:
+            split_at = semicolon
+        elif dollar >= 0:
+            split_at = dollar
+        if split_at is not None:
+            line = line[:split_at]
+        line = line.strip()
         if not line or line.startswith(("*", ";")):
             continue
         lowered = line.lower()
@@ -3380,6 +3496,33 @@ def _metric_from_series(series: list[complex], statistic: str) -> float:
     if stat == "abs_max":
         return max(abs_values)
     raise ValueError("statistic must be one of: min, max, avg, rms, pp, final, abs_max")
+
+
+_VALID_SWEEP_METRIC_STATISTICS: set[str] = {"min", "max", "avg", "rms", "pp", "final", "abs_max"}
+_DISALLOWED_VECTOR_EXPR_PREFIXES: tuple[str, ...] = (
+    "db(",
+    "mag(",
+    "ph(",
+    "phase(",
+    "real(",
+    "imag(",
+    "abs(",
+)
+
+
+def _validate_metric_vector_request(metric_vector: str) -> str:
+    requested = metric_vector.strip()
+    if not requested:
+        raise ValueError("metric_vector must not be empty.")
+    lowered = requested.lower()
+    if lowered.startswith(_DISALLOWED_VECTOR_EXPR_PREFIXES):
+        raise ValueError(
+            f"Unknown vector '{requested}'. metric_vector must be a raw LTspice vector name "
+            "(for example: V(out), I(R1))."
+        )
+    if any(char.isspace() for char in requested):
+        raise ValueError("metric_vector must be a single LTspice vector token without spaces.")
+    return requested
 
 
 def _select_metric_vector(
@@ -4675,15 +4818,17 @@ def _parse_structured_log_payload(line: str, marker: str) -> dict[str, Any] | No
 
 def _is_recent_error_line(line: str, *, include_warnings: bool) -> tuple[bool, str]:
     lowered = line.lower()
-    if " trace" in lowered:
+    if lowered.startswith("traceback (most recent call last):"):
         return False, "trace"
-    if " critical " in lowered or lowered.startswith("critical:"):
+    if re.match(r'^\s*File\s+".+",\s+line\s+\d+,\s+in\s+', line):
+        return False, "trace"
+    if re.search(r"(^|[\s\[])(critical)([:\]\s]|$)", lowered):
         return True, "critical"
-    if " error " in lowered or lowered.startswith("error:"):
+    if re.search(r"(^|[\s\[])(error)([:\]\s]|$)", lowered):
         return True, "error"
-    if include_warnings and (" warning " in lowered or lowered.startswith("warning:")):
+    if include_warnings and re.search(r"(^|[\s\[])(warning)([:\]\s]|$)", lowered):
         return True, "warning"
-    if "exception" in lowered or "traceback" in lowered:
+    if re.search(r"\b(exception|traceback)\b", lowered):
         return True, "exception"
     return False, "info"
 
@@ -4699,8 +4844,9 @@ def _collect_recent_log_entries(
     log_files = _list_daemon_log_files(resolved_dir, limit=max(1, log_count))
     if not log_files:
         return []
-    entries: list[dict[str, Any]] = []
+    entries: list[tuple[int, int, dict[str, Any]]] = []
     for log_file in log_files:
+        file_mtime_ns = int(log_file.stat().st_mtime_ns)
         lines = read_text_auto(log_file).splitlines()
         for line_no, line in enumerate(lines, start=1):
             include_line, inferred_level = _is_recent_error_line(
@@ -4729,16 +4875,21 @@ def _collect_recent_log_entries(
             if not include_line:
                 continue
             entries.append(
-                {
-                    "log_path": str(log_file),
-                    "line_number": line_no,
-                    "level": inferred_level,
-                    "message": line,
-                    "tool_event": tool_payload,
-                    "capture_event": capture_payload,
-                }
+                (
+                    file_mtime_ns,
+                    line_no,
+                    {
+                        "log_path": str(log_file),
+                        "line_number": line_no,
+                        "level": inferred_level,
+                        "message": line,
+                        "tool_event": tool_payload,
+                        "capture_event": capture_payload,
+                    },
+                )
             )
-    return entries[-max(1, limit) :]
+    entries.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [item[2] for item in entries[: max(1, limit)]]
 
 
 def _run_simulation_with_ui(
@@ -4955,11 +5106,12 @@ _INTENT_DEFAULT_PARAMETERS: dict[str, dict[str, Any]] = {
 
 _FLOATING_NODE_RE = re.compile(r"(?i)\bnode\s+([a-zA-Z0-9_.$:+-]+)\b.*\bfloating\b")
 _MISSING_INCLUDE_RE = re.compile(
-    r"(?i)(?:could not open include file|unable to open .*?)(?:\s*[:\"]\s*)([^\"\s]+)"
+    r"(?i)(?:could not|unable to)\s+open\s+include\s+file\s*:?\s*(?P<path>.+)$"
 )
-_MISSING_SUBCKT_RE = re.compile(r"(?i)unknown subcircuit(?: called in:)?\s*(.*)")
+_MISSING_SUBCKT_CALLED_IN_RE = re.compile(r"(?i)unknown subcircuit called in:\s*(?P<body>.*)$")
+_MISSING_SUBCKT_COLON_RE = re.compile(r"(?i)unknown subcircuit\s*:?\s*(?P<body>.+)$")
 _MISSING_MODEL_RE = re.compile(
-    r"(?i)(?:can't find definition of model|unable to find definition of model|unknown model|could not find model)\s*\"?([a-zA-Z0-9_.:$+-]+)\"?"
+    r"(?i)(?:can't find definition of model|unable to find definition of model|unknown model|could not find model)\s*:?\s*(?P<name>.+)$"
 )
 _SUBCKT_DEF_RE = re.compile(r"(?im)^\s*\.subckt\s+([^\s]+)")
 _MODEL_DEF_RE = re.compile(r"(?im)^\s*\.model\s+([^\s]+)")
@@ -4993,6 +5145,65 @@ def _merge_intent_parameters(intent: str, parameters: dict[str, Any] | None) -> 
     return defaults
 
 
+def _strip_model_issue_quotes(token: str) -> str:
+    cleaned = token.strip().strip(",.;")
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {'"', "'"}:
+        cleaned = cleaned[1:-1].strip()
+    return cleaned.strip().strip(",.;")
+
+
+def _extract_missing_include_token(value: str) -> str | None:
+    token = value.strip()
+    if not token:
+        return None
+    token = _strip_model_issue_quotes(token)
+    return token or None
+
+
+def _extract_missing_model_token(value: str) -> str | None:
+    token = _strip_model_issue_quotes(value)
+    if not token:
+        return None
+    if " " in token:
+        token = token.split()[0]
+    token = token.lstrip(":")
+    return token or None
+
+
+def _extract_subckt_name_from_instance_line(line: str) -> str | None:
+    code = line
+    semicolon = code.find(";")
+    dollar = code.find("$")
+    split_at = None
+    if semicolon >= 0 and dollar >= 0:
+        split_at = min(semicolon, dollar)
+    elif semicolon >= 0:
+        split_at = semicolon
+    elif dollar >= 0:
+        split_at = dollar
+    if split_at is not None:
+        code = code[:split_at]
+    tokens = [token for token in code.strip().split() if token]
+    if not tokens:
+        return None
+    if not tokens[0].upper().startswith("X"):
+        candidate = _strip_model_issue_quotes(tokens[-1]).lstrip(":")
+        return candidate or None
+
+    candidate: str | None = None
+    for token in tokens[1:]:
+        upper = token.upper()
+        if upper.startswith("PARAMS:"):
+            break
+        if "=" in token and candidate is not None:
+            break
+        candidate = token
+    if candidate is None:
+        return None
+    normalized = _strip_model_issue_quotes(candidate).lstrip(":")
+    return normalized or None
+
+
 def _extract_model_issues_from_text(log_text: str) -> dict[str, Any]:
     missing_includes: set[str] = set()
     missing_subcircuits: set[str] = set()
@@ -5006,29 +5217,46 @@ def _extract_model_issues_from_text(log_text: str) -> dict[str, Any]:
             continue
         matched = False
         if pending_subckt_name:
-            tokens = [token for token in re.split(r"\s+", line) if token]
-            if tokens:
-                candidate = tokens[-1].strip().strip('"')
-                if candidate and candidate.lower() not in {"in", "out", "0"}:
-                    missing_subcircuits.add(candidate)
-                    matched = True
+            candidate = _extract_subckt_name_from_instance_line(line)
+            if candidate:
+                missing_subcircuits.add(candidate)
+                matched = True
             pending_subckt_name = False
         include_match = _MISSING_INCLUDE_RE.search(line)
         if include_match:
-            missing_includes.add(include_match.group(1).strip().strip('"'))
-            matched = True
-        subckt_match = _MISSING_SUBCKT_RE.search(line)
-        if subckt_match:
-            value = subckt_match.group(1).strip()
-            if value:
-                missing_subcircuits.add(value)
+            include_token = _extract_missing_include_token(include_match.group("path"))
+            if include_token:
+                missing_includes.add(include_token)
+                matched = True
+        subckt_called_match = _MISSING_SUBCKT_CALLED_IN_RE.search(line)
+        if subckt_called_match:
+            body = subckt_called_match.group("body").strip()
+            if body:
+                candidate = _extract_subckt_name_from_instance_line(body)
+                if candidate:
+                    missing_subcircuits.add(candidate)
+                    matched = True
             else:
                 pending_subckt_name = True
             matched = True
+        elif "unknown subcircuit" in line.lower():
+            subckt_match = _MISSING_SUBCKT_COLON_RE.search(line)
+            if subckt_match:
+                body = subckt_match.group("body").strip()
+                candidate = _extract_subckt_name_from_instance_line(body)
+                if candidate:
+                    missing_subcircuits.add(candidate)
+                elif body:
+                    fallback = _strip_model_issue_quotes(body).lstrip(":")
+                    if fallback:
+                        missing_subcircuits.add(fallback)
+                matched = True
         model_match = _MISSING_MODEL_RE.search(line)
         if model_match:
-            missing_models.add(model_match.group(1).strip())
-            matched = True
+            model_token = _extract_missing_model_token(model_match.group("name"))
+            if model_token:
+                missing_models.add(model_token)
+                matched = True
         if matched:
             matched_lines.append(line)
     return {
@@ -6067,14 +6295,18 @@ def parseMeasResults(
         }
 
     run = _resolve_run(normalized_run_id)
-    log_target = run.log_utf8_path or run.log_path
-    if log_target is None or not log_target.exists():
+    log_target = _select_preferred_log_artifact(run, prefer_non_empty=True)
+    if log_target is None:
         return {
             "run_id": run.run_id,
             "log_path": None,
             "count": 0,
             "measurements": {},
+            "measurements_text": {},
+            "measurements_display": {},
+            "measurement_steps": {},
             "items": [],
+            "failed_measurements": [],
             "warning": "No log file available for the selected run.",
         }
     text = read_text_auto(log_target)
@@ -6122,6 +6354,8 @@ def runMeasAutomation(
     )
     statements = _build_meas_statements(measurements)
     source_netlist: Path
+    source_netlist_for_response: Path | None = None
+    staged_source_netlist: Path | None = None
     source_text_for_scope: str | None = None
     if netlist_content is not None:
         normalized_content = netlist_content.rstrip() + "\n"
@@ -6135,6 +6369,7 @@ def runMeasAutomation(
             require_analysis=False,
         )
         source_netlist = _runner.write_netlist(netlist_content, circuit_name=circuit_name)
+        source_netlist_for_response = source_netlist
         source_text_for_scope = normalized_content
     elif normalized_netlist_path is not None:
         source_netlist, loaded_text = _load_validated_netlist_file(
@@ -6146,17 +6381,21 @@ def runMeasAutomation(
             require_analysis=False,
         )
         source_text_for_scope = loaded_text
+        source_netlist_for_response = source_netlist
         staged = _stage_sync_source_netlist(source_path=source_netlist, purpose="meas_automation")
         source_netlist = Path(str(staged["run_path"])).expanduser().resolve()
+        staged_source_netlist = source_netlist
     elif normalized_asc_path is not None:
         asc_resolved = _validate_schematic_path(normalized_asc_path, field_name="asc_path")
         target = _resolve_schematic_simulation_target(asc_resolved, require_sidecar_on_macos=True)
         if not bool(target.get("can_batch_simulate")):
             raise ValueError(str(target.get("error")))
         source_netlist = Path(str(target["run_target_path"])).expanduser().resolve()
+        source_netlist_for_response = source_netlist
         source_text_for_scope = _read_netlist_text(source_netlist)
         staged = _stage_sync_source_netlist(source_path=source_netlist, purpose="meas_automation_asc")
         source_netlist = Path(str(staged["run_path"])).expanduser().resolve()
+        staged_source_netlist = source_netlist
     else:
         raise ValueError("Provide one of netlist_content, netlist_path, or asc_path.")
 
@@ -6193,9 +6432,9 @@ def runMeasAutomation(
     run_payload_with_meas = dict(run_payload)
 
     resolved_run = _resolve_run(str(run_payload["run_id"]))
-    log_target = resolved_run.log_utf8_path or resolved_run.log_path
+    log_target = _select_preferred_log_artifact(resolved_run, prefer_non_empty=True)
     failed_measurements: list[dict[str, Any]] = []
-    if log_target is not None and log_target.exists():
+    if log_target is not None:
         try:
             failed_measurements = _parse_meas_failures_from_text(read_text_auto(log_target))
         except Exception:  # noqa: BLE001
@@ -6216,6 +6455,11 @@ def runMeasAutomation(
         for name in (all_measurements.get("measurements") or {}).keys()
         if str(name).strip()
     }
+    failed_requested = [
+        failure
+        for failure in failed_requested
+        if str(failure.get("name", "")).strip().lower() not in observed_lookup
+    ]
     failed_lookup = {
         str(entry.get("name", "")).strip().lower()
         for entry in failed_requested
@@ -6303,7 +6547,8 @@ def runMeasAutomation(
         ]
 
     return {
-        "source_netlist_path": str(source_netlist),
+        "source_netlist_path": str(source_netlist_for_response or source_netlist),
+        "staged_source_netlist_path": str(staged_source_netlist) if staged_source_netlist else None,
         "meas_netlist_path": str(meas_netlist),
         "meas_statements": statements,
         "run": run_payload_with_meas,
@@ -6379,6 +6624,7 @@ def runVerificationPlan(
     measurement_steps_map: dict[str, list[dict[str, Any]]] = {}
     measurement_failure_map: dict[str, list[str]] = {}
     measurement_report: dict[str, Any] | None = None
+    measurement_execution_succeeded = True
     if measurements:
         meas_source_netlist = netlist_path
         meas_source_content = netlist_content
@@ -6393,6 +6639,10 @@ def runVerificationPlan(
             timeout_seconds=timeout_seconds,
             show_ui=show_ui,
             open_raw_after_run=open_raw_after_run,
+        )
+        measurement_execution_succeeded = bool(
+            measurement_report.get("requested_measurements_succeeded", False)
+            and measurement_report.get("overall_succeeded", False)
         )
         run_payload = measurement_report["run"]
         run = _resolve_run(str(run_payload["run_id"]))
@@ -6530,11 +6780,16 @@ def runVerificationPlan(
 
     passed_count = sum(1 for item in checks if item.get("passed"))
     failed_count = len(checks) - passed_count
-    overall_passed = failed_count == 0 and bool(run_payload.get("succeeded", False))
+    overall_passed = (
+        failed_count == 0
+        and bool(run_payload.get("succeeded", False))
+        and measurement_execution_succeeded
+    )
     return {
         "overall_passed": overall_passed,
         "passed_count": passed_count,
         "failed_count": failed_count,
+        "measurement_execution_succeeded": measurement_execution_succeeded,
         "run_source": context["source"],
         "run": run_payload,
         "checks": checks,
@@ -6566,6 +6821,11 @@ def runSweepStudy(
     param_name = str(parameter).strip()
     if not param_name:
         raise ValueError("parameter must not be empty")
+    metric_stat = str(metric_statistic).strip().lower()
+    if metric_stat not in _VALID_SWEEP_METRIC_STATISTICS:
+        raise ValueError("statistic must be one of: min, max, avg, rms, pp, final, abs_max")
+    requested_metric_vector = _validate_metric_vector_request(metric_vector)
+
     normalized_netlist_path = _normalize_optional_selector("netlist_path", netlist_path)
     if netlist_content is not None and normalized_netlist_path is not None:
         raise ValueError("Provide only one of netlist_content or netlist_path, not both.")
@@ -6620,12 +6880,22 @@ def runSweepStudy(
         )
 
     warnings: list[str] = []
+    warning_seen: set[str] = set()
+
+    def _add_warning(message: str) -> None:
+        text = str(message).strip()
+        if not text or text in warning_seen:
+            return
+        warning_seen.add(text)
+        warnings.append(text)
+
     if not _likely_uses_parameter(base_text, param_name):
-        warnings.append(
+        _add_warning(
             f"Parameter '{param_name}' does not appear to be referenced in circuit equations. "
             "Sweep results may be unchanged across points."
         )
     records: list[dict[str, Any]] = []
+    selected_metric_vector = requested_metric_vector
 
     if mode_norm == "step":
         if values is not None and any(item is not None for item in (start, stop, step)):
@@ -6699,85 +6969,105 @@ def runSweepStudy(
             open_raw_after_run=False,
         )
         run = _resolve_run(str(run_payload["run_id"]))
-        dataset = _resolve_dataset(plot=None, run_id=run.run_id, raw_path=None)
-        selected_metric_vector, metric_warning = _select_metric_vector(
-            dataset,
-            metric_vector,
-            allow_fallback=metric_vector.strip().lower() in {"", "v(out)"},
-        )
-        if metric_warning:
-            warnings.append(metric_warning)
-        metric_values: list[float] = []
-        plot_name_lower = dataset.plot_name.strip().lower()
-        is_operating_point_plot = (
-            "operating point" in plot_name_lower
-            or plot_name_lower.startswith("op point")
-            or plot_name_lower.startswith(".op")
-        )
-        use_point_aligned_fallback = (
-            dataset.step_count <= 1
-            and "stepped" in dataset.flags
-            and dataset.points > 1
-            and is_operating_point_plot
-            and len(sweep_values) == dataset.points
-        )
-        if use_point_aligned_fallback:
-            full_series = dataset.get_vector(selected_metric_vector, step_index=None)
-            parameter_series: list[complex] | None = None
-            for vector_name in _vector_name_candidates(param_name):
-                try:
-                    parameter_series = dataset.get_vector(vector_name, step_index=None)
-                    break
-                except KeyError:
-                    continue
-            for idx, sample in enumerate(full_series[: len(sweep_values)]):
-                value = _metric_from_series([sample], metric_statistic)
-                metric_values.append(value)
-                parameter_value = None
-                if parameter_series is not None and idx < len(parameter_series):
-                    parameter_value = float(parameter_series[idx].real)
-                elif idx < len(sweep_values):
-                    parameter_value = float(sweep_values[idx])
-                step_label = (
-                    f"{param_name}={float(parameter_value):.12g}"
-                    if parameter_value is not None
-                    else None
-                )
+        if not bool(run_payload.get("succeeded", False)):
+            for idx, sweep_value in enumerate(sweep_values):
                 records.append(
                     {
                         "index": idx,
-                        "parameter_value": parameter_value,
-                        "step_label": step_label,
-                        "metric_value": value,
+                        "parameter_value": float(sweep_value),
+                        "step_label": f"{param_name}={float(sweep_value):.12g}",
+                        "metric_value": None,
                         "run_id": run.run_id,
+                        "succeeded": False,
+                        "issues": list(run_payload.get("issues") or []),
                     }
                 )
+            _add_warning(
+                "Sweep simulation failed before metric extraction. "
+                "See run issues for the root cause."
+            )
         else:
-            step_indices = list(range(dataset.step_count))
-            for idx in step_indices:
-                selected = _resolve_step_index(dataset, idx)
-                series = dataset.get_vector(selected_metric_vector, step_index=selected)
-                value = _metric_from_series(series, metric_statistic)
-                metric_values.append(value)
-                parameter_value = _extract_step_parameter_value_from_dataset(
-                    dataset=dataset,
-                    parameter=param_name,
-                    step_index=idx,
-                )
-                if parameter_value is None and idx < len(sweep_values):
-                    parameter_value = float(sweep_values[idx])
-                label = dataset.steps[idx].label if dataset.steps and idx < len(dataset.steps) else None
-                if not label and parameter_value is not None:
-                    label = f"{param_name}={float(parameter_value):.12g}"
-                records.append(
-                    {
-                        "index": idx,
-                        "parameter_value": parameter_value,
-                        "step_label": label,
-                        "metric_value": value,
-                        "run_id": run.run_id,
-                    }
-                )
+            dataset = _resolve_dataset(plot=None, run_id=run.run_id, raw_path=None)
+            selected_metric_vector, metric_warning = _select_metric_vector(
+                dataset,
+                requested_metric_vector,
+                allow_fallback=False,
+            )
+            if metric_warning:
+                _add_warning(metric_warning)
+            metric_values: list[float] = []
+            plot_name_lower = dataset.plot_name.strip().lower()
+            is_operating_point_plot = (
+                "operating point" in plot_name_lower
+                or plot_name_lower.startswith("op point")
+                or plot_name_lower.startswith(".op")
+            )
+            use_point_aligned_fallback = (
+                dataset.step_count <= 1
+                and "stepped" in dataset.flags
+                and dataset.points > 1
+                and is_operating_point_plot
+                and len(sweep_values) == dataset.points
+            )
+            if use_point_aligned_fallback:
+                full_series = dataset.get_vector(selected_metric_vector, step_index=None)
+                parameter_series: list[complex] | None = None
+                for vector_name in _vector_name_candidates(param_name):
+                    try:
+                        parameter_series = dataset.get_vector(vector_name, step_index=None)
+                        break
+                    except KeyError:
+                        continue
+                for idx, sample in enumerate(full_series[: len(sweep_values)]):
+                    value = _metric_from_series([sample], metric_stat)
+                    metric_values.append(value)
+                    parameter_value = None
+                    if parameter_series is not None and idx < len(parameter_series):
+                        parameter_value = float(parameter_series[idx].real)
+                    elif idx < len(sweep_values):
+                        parameter_value = float(sweep_values[idx])
+                    step_label = (
+                        f"{param_name}={float(parameter_value):.12g}"
+                        if parameter_value is not None
+                        else None
+                    )
+                    records.append(
+                        {
+                            "index": idx,
+                            "parameter_value": parameter_value,
+                            "step_label": step_label,
+                            "metric_value": value,
+                            "run_id": run.run_id,
+                            "succeeded": True,
+                        }
+                    )
+            else:
+                step_indices = list(range(dataset.step_count))
+                for idx in step_indices:
+                    selected = _resolve_step_index(dataset, idx)
+                    series = dataset.get_vector(selected_metric_vector, step_index=selected)
+                    value = _metric_from_series(series, metric_stat)
+                    metric_values.append(value)
+                    parameter_value = _extract_step_parameter_value_from_dataset(
+                        dataset=dataset,
+                        parameter=param_name,
+                        step_index=idx,
+                    )
+                    if parameter_value is None and idx < len(sweep_values):
+                        parameter_value = float(sweep_values[idx])
+                    label = dataset.steps[idx].label if dataset.steps and idx < len(dataset.steps) else None
+                    if not label and parameter_value is not None:
+                        label = f"{param_name}={float(parameter_value):.12g}"
+                    records.append(
+                        {
+                            "index": idx,
+                            "parameter_value": parameter_value,
+                            "step_label": label,
+                            "metric_value": value,
+                            "run_id": run.run_id,
+                            "succeeded": True,
+                        }
+                    )
     else:
         if nominal is None:
             raise ValueError("For mode='monte_carlo', nominal is required.")
@@ -6786,10 +7076,12 @@ def runSweepStudy(
         sigma_pct_value = _coerce_spice_number(sigma_pct, field_name="sigma_pct")
         if sigma_pct_value < 0:
             raise ValueError("sigma_pct must be >= 0.")
+        distribution_norm = str(distribution).strip().lower()
+        if distribution_norm not in {"gaussian", "uniform"}:
+            raise ValueError("distribution must be one of: gaussian, uniform")
         spread = abs(float(nominal_value)) * (abs(float(sigma_pct_value)) / 100.0)
-        metric_values: list[float] = []
         for idx in range(sample_count):
-            if distribution == "uniform":
+            if distribution_norm == "uniform":
                 delta = random.uniform(-spread, spread)
             else:
                 delta = random.gauss(0.0, spread)
@@ -6829,40 +7121,55 @@ def runSweepStudy(
                 selected = _resolve_step_index(dataset, 0)
                 selected_metric_vector, metric_warning = _select_metric_vector(
                     dataset,
-                    metric_vector,
-                    allow_fallback=metric_vector.strip().lower() in {"", "v(out)"},
+                    requested_metric_vector,
+                    allow_fallback=False,
                 )
                 if metric_warning:
-                    warnings.append(metric_warning)
+                    _add_warning(metric_warning)
                 series = dataset.get_vector(selected_metric_vector, step_index=selected)
-                value = _metric_from_series(series, metric_statistic)
-                metric_values.append(value)
+                value = _metric_from_series(series, metric_stat)
                 record["metric_value"] = value
             else:
                 record["metric_value"] = None
                 record["issues"] = run_payload.get("issues", [])
             records.append(record)
 
-    numeric_values = [float(item["metric_value"]) for item in records if item.get("metric_value") is not None]
+    numeric_values = [
+        float(item["metric_value"])
+        for item in records
+        if item.get("succeeded", False) and item.get("metric_value") is not None
+    ]
     aggregate = _aggregate_numeric(numeric_values)
     worst_case = None
-    if records:
-        if metric_statistic in {"max", "abs_max", "pp"}:
-            worst_case = max(records, key=lambda item: float(item.get("metric_value") or float("-inf")))
-        elif metric_statistic == "min":
-            worst_case = min(records, key=lambda item: float(item.get("metric_value") or float("inf")))
+    numeric_records = [
+        item for item in records if item.get("succeeded", False) and item.get("metric_value") is not None
+    ]
+    if numeric_records:
+        if metric_stat in {"max", "abs_max", "pp"}:
+            worst_case = max(numeric_records, key=lambda item: float(item["metric_value"]))
+        elif metric_stat == "min":
+            worst_case = min(numeric_records, key=lambda item: float(item["metric_value"]))
         else:
             center = aggregate["mean"] if aggregate.get("mean") is not None else 0.0
             worst_case = max(
-                records,
-                key=lambda item: abs(float(item.get("metric_value") or center) - float(center)),
+                numeric_records,
+                key=lambda item: abs(float(item["metric_value"]) - float(center)),
             )
+    failed_record_count = sum(1 for row in records if not row.get("succeeded", False))
+    successful_record_count = len(records) - failed_record_count
+    overall_succeeded = bool(records) and failed_record_count == 0 and bool(numeric_records)
+    if records and not numeric_records:
+        _add_warning("All sweep runs failed; aggregate metrics are unavailable.")
 
     return {
         "mode": mode_norm,
         "parameter": param_name,
-        "metric_vector": metric_vector,
-        "metric_statistic": metric_statistic,
+        "metric_vector": requested_metric_vector,
+        "metric_vector_selected": selected_metric_vector,
+        "metric_statistic": metric_stat,
+        "overall_succeeded": overall_succeeded,
+        "successful_record_count": successful_record_count,
+        "failed_record_count": failed_record_count,
         "record_count": len(records),
         "records": records,
         "aggregate": aggregate,
@@ -6972,10 +7279,16 @@ def generateVerifyAndCleanCircuit(
         render=render_after_clean,
         downscale_factor=downscale_factor,
     )
+    clean_connectivity_ok = True
+    if isinstance(clean_result, dict):
+        connectivity_after = clean_result.get("connectivity_after")
+        if isinstance(connectivity_after, dict) and "valid" in connectivity_after:
+            clean_connectivity_ok = bool(connectivity_after.get("valid"))
     overall_passed = bool(
         simulation.get("succeeded", False)
         and verification.get("overall_passed", False)
         and lint_after.get("valid", False)
+        and clean_connectivity_ok
     )
     return {
         "overall_passed": overall_passed,
@@ -7010,7 +7323,11 @@ def autoCleanSchematicLayout(
     target.parent.mkdir(parents=True, exist_ok=True)
 
     before = _analyze_schematic_visual_quality(source)
-    connectivity_before = _lint_schematic_file(source, library=None, strict=True)
+    try:
+        symbol_lib = _resolve_symbol_library(None)
+    except Exception:
+        symbol_lib = None
+    connectivity_before = _lint_schematic_file(source, library=symbol_lib, strict=True)
     source_backup_text = read_text_auto(source)
     action_details: dict[str, Any]
     sidecar = _resolve_sidecar_netlist_path(source)
@@ -7039,7 +7356,7 @@ def autoCleanSchematicLayout(
             ),
         }
 
-    connectivity_after = _lint_schematic_file(target, library=None, strict=True)
+    connectivity_after = _lint_schematic_file(target, library=symbol_lib, strict=True)
     if connectivity_before.get("valid", False) and not connectivity_after.get("valid", False):
         if target == source:
             source.write_text(source_backup_text, encoding="utf-8")
@@ -7237,6 +7554,9 @@ def listJobs(
             raise ValueError(
                 "status must be one of: " + ", ".join(sorted(_JOB_ALL_STATUSES))
             )
+    order_by_normalized = str(order_by).strip().lower()
+    if order_by_normalized not in {"created_at", "priority"}:
+        raise ValueError("order_by must be one of: created_at, priority")
     with _job_lock:
         all_jobs = [job for job_id in _job_order if (job := _jobs.get(job_id)) is not None]
         if include_history:
@@ -7247,7 +7567,7 @@ def listJobs(
                 for job in all_jobs
                 if str(job.get("status", "")).lower() not in _JOB_TERMINAL_STATUSES
             ]
-        if order_by == "priority":
+        if order_by_normalized == "priority":
             selected_jobs = sorted(
                 pool,
                 key=lambda job: (
@@ -7281,7 +7601,7 @@ def listJobs(
     return {
         "limit": safe_limit,
         "status_filter": status_filter,
-        "order_by": order_by,
+        "order_by": order_by_normalized,
         "include_history": bool(include_history),
         "count": len(selected),
         "jobs": selected,
@@ -8498,7 +8818,7 @@ def loadCircuit(netlist: str, circuit_name: str = "circuit") -> dict[str, Any]:
 
 @mcp.tool()
 def loadNetlistFromFile(filepath: str) -> dict[str, Any]:
-    """Load an existing .cir/.net/.asc file as the current circuit."""
+    """Load an existing netlist file (.cir/.net/.sp/.spi/.sub/.lib/.txt) as the current circuit."""
     global _loaded_netlist
     _loaded_netlist = None
     path, _ = _load_validated_netlist_file(
@@ -8827,12 +9147,17 @@ def scanModelIssues(
     source_run_id: str | None = None
     source_path: Path | None = None
     if safe_log_path:
-        resolved_log = Path(safe_log_path).expanduser().resolve()
+        resolved_log = _validate_log_file_path(safe_log_path, field_name="log_path")
     else:
         run = _resolve_run(safe_run_id)
         source_run_id = run.run_id
         source_path = run.netlist_path
-        resolved_log = run.log_path
+        candidate_log = _select_preferred_log_artifact(run, prefer_non_empty=True)
+        if candidate_log is not None:
+            try:
+                resolved_log = _validate_log_file_path(candidate_log, field_name="run log")
+            except Exception:  # noqa: BLE001
+                resolved_log = None
     if resolved_log is None or not resolved_log.exists():
         return {
             "run_id": source_run_id or safe_run_id,
@@ -8960,9 +9285,91 @@ def patchNetlistModelBindings(
         backup_path = path.with_suffix(path.suffix + ".bak")
         backup_path.write_text(original_text, encoding="utf-8")
 
+    def _split_comment_suffix(raw_line: str) -> tuple[str, str]:
+        semicolon = raw_line.find(";")
+        dollar = raw_line.find("$")
+        split_at = None
+        if semicolon >= 0 and dollar >= 0:
+            split_at = min(semicolon, dollar)
+        elif semicolon >= 0:
+            split_at = semicolon
+        elif dollar >= 0:
+            split_at = dollar
+        if split_at is None:
+            return raw_line, ""
+        return raw_line[:split_at], raw_line[split_at:]
+
+    def _replace_subckt_alias(tokens: list[str]) -> int:
+        if not tokens or not subckt_lookup or not tokens[0][:1].upper() == "X":
+            return 0
+        candidate_idx: int | None = None
+        for idx in range(1, len(tokens)):
+            token = tokens[idx]
+            upper = token.upper()
+            if upper.startswith("PARAMS:"):
+                break
+            if "=" in token and candidate_idx is not None:
+                break
+            candidate_idx = idx
+        if candidate_idx is None:
+            return 0
+        old_symbol = tokens[candidate_idx]
+        new_symbol = subckt_lookup.get(old_symbol.lower())
+        if not new_symbol or new_symbol == old_symbol:
+            return 0
+        tokens[candidate_idx] = new_symbol
+        return 1
+
+    def _replace_model_alias(tokens: list[str]) -> int:
+        if not tokens or not model_lookup:
+            return 0
+        head = tokens[0]
+        directive = head.lower()
+        if directive == ".include" or directive == ".inc" or directive == ".param":
+            return 0
+        changed = 0
+        if directive == ".model" and len(tokens) >= 2:
+            old_name = tokens[1]
+            new_name = model_lookup.get(old_name.lower())
+            if new_name and new_name != old_name:
+                tokens[1] = new_name
+                changed += 1
+            return changed
+
+        lead = head[:1].upper()
+        model_idx: int | None = None
+        if lead == "D" and len(tokens) >= 4:
+            model_idx = 3
+        elif lead == "M" and len(tokens) >= 6:
+            model_idx = 5
+        elif lead == "Q":
+            for idx in (5, 4):
+                if idx >= len(tokens):
+                    continue
+                token = tokens[idx]
+                if token.upper().startswith("PARAMS:") or "=" in token:
+                    continue
+                model_idx = idx
+                break
+        elif lead == "J" and len(tokens) >= 5:
+            model_idx = 4
+
+        if model_idx is None or model_idx >= len(tokens):
+            return changed
+        model_token = tokens[model_idx]
+        replacement = model_lookup.get(model_token.lower())
+        if replacement and replacement != model_token:
+            tokens[model_idx] = replacement
+            changed += 1
+        return changed
+
     include_lines: list[str] = []
-    for raw_include in include_files or []:
-        include_target = Path(raw_include).expanduser().resolve()
+    for index, raw_include in enumerate(include_files or []):
+        include_target = _resolve_existing_file_path(
+            str(raw_include),
+            field_name=f"include_files[{index}]",
+            require_readable=True,
+        )
         include_lines.append(f'.include "{include_target}"')
     added_include_lines = _append_lines_if_missing(path, include_lines) if include_lines else []
 
@@ -8976,38 +9383,27 @@ def patchNetlistModelBindings(
         for key, value in (model_aliases or {}).items()
         if str(key).strip() and str(value).strip()
     }
-    model_pattern = None
-    if model_lookup:
-        model_pattern = re.compile(
-            r"\b(" + "|".join(re.escape(key) for key in sorted(model_lookup.keys(), key=len, reverse=True)) + r")\b",
-            re.IGNORECASE,
-        )
 
     updated_lines: list[str] = []
     replacement_count = 0
     for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
         line = raw_line
         stripped = raw_line.strip()
-        if stripped and not stripped.startswith("*"):
-            tokens = raw_line.split()
-            if tokens and tokens[0][:1].upper() == "X" and subckt_lookup:
-                model_idx = len(tokens) - 1
-                while model_idx > 0 and "=" in tokens[model_idx]:
-                    model_idx -= 1
-                old_symbol = tokens[model_idx]
-                new_symbol = subckt_lookup.get(old_symbol.lower())
-                if new_symbol and new_symbol != old_symbol:
-                    tokens[model_idx] = new_symbol
-                    line = " ".join(tokens)
-                    replacement_count += 1
-            if model_pattern is not None:
-                replaced_line = model_pattern.sub(
-                    lambda match: model_lookup.get(match.group(1).lower(), match.group(1)),
-                    line,
-                )
-                if replaced_line != line:
-                    replacement_count += 1
-                line = replaced_line
+        if stripped and not stripped.startswith(("*", ";")):
+            code, comment = _split_comment_suffix(raw_line)
+            if code.strip():
+                leading = code[: len(code) - len(code.lstrip())]
+                tokens = code.split()
+                local_replacements = 0
+                local_replacements += _replace_subckt_alias(tokens)
+                local_replacements += _replace_model_alias(tokens)
+                if local_replacements:
+                    rebuilt = leading + " ".join(tokens)
+                    if comment:
+                        separator = "" if comment.startswith((" ", "\t")) else " "
+                        rebuilt = rebuilt + separator + comment
+                    line = rebuilt
+                    replacement_count += local_replacements
         updated_lines.append(line)
 
     path.write_text("\n".join(updated_lines).rstrip() + "\n", encoding="utf-8")

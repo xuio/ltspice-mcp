@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime
@@ -227,6 +228,42 @@ class TestDevelopmentTools(unittest.TestCase):
             include_suggestions[0].get("direct_matches") or include_suggestions[0].get("best_matches")
         )
 
+    def test_scan_model_issues_parses_variants_and_avoids_false_positives(self) -> None:
+        log_path = self.temp_dir / "model_variants.log"
+        log_path.write_text(
+            "\n".join(
+                [
+                    "Warning: Unable to open waveform cache: /tmp/not_an_include.raw",
+                    'Fatal Error: Could not open include file: "/Users/moritz/My Models/vendor model.lib"',
+                    "Fatal Error: Could not open include file: 'foo.lib'",
+                    r"Fatal Error: Could not open include file: C:\Program Files\LTspice\lib\foo.lib",
+                    "Fatal Error: Unable to find definition of model 'unknownmodel'",
+                    "Fatal Error: Unknown model: DFAST",
+                    "Fatal Error: Unknown subcircuit called in:",
+                    "XU1 in out mysubckt PARAMS: gain=1",
+                    "Fatal Error: Unknown subcircuit: mysub2",
+                    "Fatal Error: Unknown subcircuit called in: XU2 in out mysub3 ; inline comment",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        payload = server.scanModelIssues(log_path=str(log_path), suggest_matches=False)
+
+        self.assertTrue(payload["has_model_issues"])
+        self.assertIn("/Users/moritz/My Models/vendor model.lib", payload["missing_include_files"])
+        self.assertIn("foo.lib", payload["missing_include_files"])
+        self.assertIn(r"C:\Program Files\LTspice\lib\foo.lib", payload["missing_include_files"])
+        self.assertNotIn("/tmp/not_an_include.raw", payload["missing_include_files"])
+        self.assertIn("unknownmodel", payload["missing_models"])
+        self.assertIn("DFAST", payload["missing_models"])
+        self.assertIn("mysubckt", payload["missing_subcircuits"])
+        self.assertIn("mysub2", payload["missing_subcircuits"])
+        self.assertIn("mysub3", payload["missing_subcircuits"])
+        self.assertNotIn("gain=1", payload["missing_subcircuits"])
+        self.assertNotIn("comment", payload["missing_subcircuits"])
+
     def test_import_model_and_patch_bindings(self) -> None:
         model_source = self.temp_dir / "foo.lib"
         model_source.write_text(".subckt myamp in out\n.ends myamp\n", encoding="utf-8")
@@ -250,6 +287,39 @@ class TestDevelopmentTools(unittest.TestCase):
         self.assertIn("myamp", text)
         self.assertIn(".include", text)
         self.assertTrue(Path(str(patched["backup_path"])).exists())
+
+    def test_patch_model_bindings_scope_avoids_non_model_rewrites(self) -> None:
+        netlist_path = self.temp_dir / "patch_scope.cir"
+        netlist_path.write_text(
+            "\n".join(
+                [
+                    '.include "/Users/moritz/dev/projects/emfi-tool/sim/oldmodel.lib"',
+                    ".param oldmodel=1000",
+                    "R1 oldmodel 0 1k $ oldmodel should remain in comment",
+                    "D1 in oldmodel oldmodel ; oldmodel should remain in comment",
+                    "X1 in out oldsub PARAMS: gain=1 ; oldsub should remain in comment",
+                    ".model oldmodel D(Is=1e-12)",
+                    ".end",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        payload = server.patchNetlistModelBindings(
+            netlist_path=str(netlist_path),
+            model_aliases={"oldmodel": "newmodel"},
+            subckt_aliases={"oldsub": "newsub"},
+            backup=False,
+        )
+        text = netlist_path.read_text(encoding="utf-8")
+        self.assertGreaterEqual(payload["replacements"], 3)
+        self.assertIn('.include "/Users/moritz/dev/projects/emfi-tool/sim/oldmodel.lib"', text)
+        self.assertIn(".param oldmodel=1000", text)
+        self.assertIn("R1 oldmodel 0 1k $ oldmodel should remain in comment", text)
+        self.assertIn("D1 in oldmodel newmodel ; oldmodel should remain in comment", text)
+        self.assertIn("X1 in out newsub PARAMS: gain=1 ; oldsub should remain in comment", text)
+        self.assertIn(".model newmodel D(Is=1e-12)", text)
 
     def test_auto_debug_schematic_adds_bleeder_and_reruns(self) -> None:
         asc_path = self.temp_dir / "debug.asc"
@@ -552,6 +622,49 @@ class TestDevelopmentTools(unittest.TestCase):
         self.assertTrue(any("run failed" in message for message in messages))
         self.assertTrue(any("tool_call_error" in message for message in messages))
         self.assertTrue(any("capture_close_incomplete" in message for message in messages))
+
+    def test_get_recent_errors_detects_common_severity_variants(self) -> None:
+        log_dir = self.temp_dir / "daemon_variants" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "ltspice-mcp-daemon-20260227-120000.log"
+        log_file.write_text(
+            "\n".join(
+                [
+                    "ERROR uppercase_without_colon_marker",
+                    "WARNING uppercase_warning_without_colon_marker",
+                    "CRITICAL backend crashed",
+                    "[ERROR] bracket form failure",
+                    "INFO exceptional throughput",
+                    "ERROR trace buffer overflow in parser",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        errors = server.getRecentErrors(limit=20, log_count=1, include_warnings=True, log_dir=str(log_dir))
+        messages = [entry["message"] for entry in errors["entries"]]
+        joined = "\n".join(messages)
+        self.assertIn("ERROR uppercase_without_colon_marker", joined)
+        self.assertIn("WARNING uppercase_warning_without_colon_marker", joined)
+        self.assertIn("CRITICAL backend crashed", joined)
+        self.assertIn("[ERROR] bracket form failure", joined)
+        self.assertIn("ERROR trace buffer overflow in parser", joined)
+        self.assertNotIn("INFO exceptional throughput", joined)
+
+    def test_get_recent_errors_returns_newest_entry_across_multiple_logs(self) -> None:
+        log_dir = self.temp_dir / "daemon_order" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        old_log = log_dir / "ltspice-mcp-daemon-20260226-120000.log"
+        new_log = log_dir / "ltspice-mcp-daemon-20260227-120000.log"
+        old_log.write_text("ERROR old_error_marker\n", encoding="utf-8")
+        new_log.write_text("ERROR new_error_marker\n", encoding="utf-8")
+        os.utime(old_log, (1_700_000_000, 1_700_000_000))
+        os.utime(new_log, (1_700_100_000, 1_700_100_000))
+
+        payload = server.getRecentErrors(limit=1, log_count=2, include_warnings=False, log_dir=str(log_dir))
+        self.assertEqual(payload["entry_count"], 1)
+        self.assertIn("new_error_marker", payload["entries"][0]["message"])
 
     def test_get_capture_health_can_include_recent_events(self) -> None:
         with (
