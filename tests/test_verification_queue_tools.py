@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import json
+import threading
 import tempfile
 import time
 import unittest
@@ -462,7 +463,7 @@ class TestVerificationAndQueueTools(unittest.TestCase):
         self.assertIn(run.log_utf8_path, run.artifacts)
         popen_mock.assert_called_once()
 
-    def test_run_simulation_with_ui_applies_timeout_margin(self) -> None:
+    def test_run_simulation_with_ui_preserves_requested_timeout(self) -> None:
         netlist = self.temp_dir / "timeout_margin.cir"
         netlist.write_text("* timeout margin\n.end\n", encoding="utf-8")
         run = _make_run(self.temp_dir, run_id="timeout_margin_run")
@@ -480,8 +481,8 @@ class TestVerificationAndQueueTools(unittest.TestCase):
                     show_ui=False,
                     open_raw_after_run=False,
                 )
-            self.assertEqual(run_file_mock.call_args.kwargs["timeout_seconds"], 170)
-            self.assertTrue(
+            self.assertEqual(run_file_mock.call_args.kwargs["timeout_seconds"], 180)
+            self.assertFalse(
                 any("Requested timeout was reduced" in warning for warning in run.warnings),
             )
         finally:
@@ -586,6 +587,95 @@ class TestVerificationAndQueueTools(unittest.TestCase):
         self.assertIn("no such vector", str(failed[0].get("reason", "")))
         self.assertEqual(payload["missing_requested_measurements"], [])
         self.assertTrue(payload["warnings"])
+
+    def test_run_meas_automation_scopes_requested_measurements_and_isolates_legacy_meas(self) -> None:
+        netlist = self.temp_dir / "meas_scope_base.cir"
+        netlist.write_text(
+            "\n".join(
+                [
+                    "* scope base",
+                    ".meas op oldbad FIND V(nope)",
+                    "V1 in 0 1",
+                    ".op",
+                    ".end",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        run = _make_run(self.temp_dir, run_id="run-meas-scope")
+        assert run.log_path is not None
+        run.log_path.write_text(
+            "\n".join(
+                [
+                    ".meas op oldbad FIND V(nope)",
+                    "Error: FIND can not be evaluated over an interval.",
+                    "Measurement: newok",
+                    "newok: 2",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with (
+            patch(
+                "ltspice_mcp.server.simulateNetlistFile",
+                return_value={"run_id": run.run_id, "succeeded": True, "issues": [], "warnings": []},
+            ),
+            patch(
+                "ltspice_mcp.server.parseMeasResults",
+                return_value={
+                    "run_id": run.run_id,
+                    "count": 2,
+                    "measurements": {"oldbad": 0.0, "newok": 2.0},
+                    "measurements_text": {"oldbad": "0", "newok": "2"},
+                    "measurements_display": {"oldbad": "0", "newok": "2"},
+                    "measurement_steps": {},
+                    "items": [
+                        {"name": "oldbad", "value": 0.0, "value_text": "0", "steps": []},
+                        {"name": "newok", "value": 2.0, "value_text": "2", "steps": []},
+                    ],
+                },
+            ),
+            patch("ltspice_mcp.server._resolve_run", return_value=run),
+        ):
+            payload = server.runMeasAutomation(
+                netlist_path=str(netlist),
+                measurements=[".meas op NEWOK PARAM 2"],
+            )
+
+        self.assertEqual(payload["requested_measurements"], ["NEWOK"])
+        self.assertEqual(payload["measurements"]["measurements"], {"newok": 2.0})
+        self.assertTrue(payload["requested_measurements_succeeded"])
+        self.assertTrue(payload["overall_succeeded"])
+        self.assertEqual(payload["failed_measurements"], [])
+
+    def test_parse_meas_results_reports_mixed_success_and_failure(self) -> None:
+        run = _make_run(self.temp_dir, run_id="run-meas-mixed")
+        assert run.log_path is not None
+        run.log_path.write_text(
+            "\n".join(
+                [
+                    ".meas op oldbad FIND V(nope)",
+                    "Error: FIND can not be evaluated over an interval.",
+                    "Measurement: newok",
+                    "newok: 2",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        server._register_run(run)
+
+        payload = server.parseMeasResults(run_id=run.run_id)
+        self.assertEqual(payload["measurements"], {"newok": 2.0})
+        self.assertEqual(payload["count"], 1)
+        self.assertTrue(payload["failed_measurements"])
+        self.assertEqual(payload["failed_measurements"][0]["name"].lower(), "oldbad")
+        self.assertIn(
+            "find can not be evaluated over an interval",
+            str(payload["failed_measurements"][0].get("reason", "")).lower(),
+        )
 
     def test_run_verification_plan_supports_vector_and_meas_checks(self) -> None:
         run = _make_run(self.temp_dir, run_id="verify-run")
@@ -857,6 +947,50 @@ class TestVerificationAndQueueTools(unittest.TestCase):
         self.assertIsNotNone(payload["authoritative_values_text"]["lowpass_bandwidth_hz"])
         self.assertIn("__mcp_phase_margin", "\n".join(payload["measurement_statements"]))
         meas_mock.assert_called_once()
+
+    def test_validate_ltspice_measurements_fails_when_generated_meas_execution_fails(self) -> None:
+        run = _make_run(self.temp_dir, run_id="ac-validate-fail")
+        dataset = RawDataset(
+            path=self.temp_dir / "ac_validate_fail.raw",
+            plot_name="AC Analysis",
+            flags={"complex"},
+            metadata={},
+            variables=[
+                RawVariable(index=0, name="frequency", kind="frequency"),
+                RawVariable(index=1, name="V(out)", kind="voltage"),
+            ],
+            values=[
+                [10.0 + 0j, 100.0 + 0j, 1000.0 + 0j],
+                [1.0 + 0j, 0.5 + 0j, 0.25 + 0j],
+            ],
+            steps=[],
+        )
+        with (
+            patch("ltspice_mcp.server._resolve_dataset", return_value=dataset),
+            patch("ltspice_mcp.server._resolve_run_for_dataset_context", return_value=run),
+            patch("ltspice_mcp.server.runMeasAutomation") as meas_mock,
+        ):
+            meas_mock.return_value = {
+                "run": {"run_id": "ac-meas-fail", "overall_succeeded": False, "succeeded": False},
+                "meas_netlist_path": str(self.temp_dir / "ac_meas_fail.cir"),
+                "requested_measurements_succeeded": False,
+                "measurements": {
+                    "measurements": {},
+                    "measurements_text": {},
+                    "measurement_steps": {},
+                },
+            }
+            payload = server.validateLtspiceMeasurements(
+                vector="V(out)",
+                run_id=run.run_id,
+                reference="first",
+                drop_db=3.0,
+            )
+
+        self.assertFalse(payload["overall_passed"])
+        self.assertFalse(payload["measurement_execution_succeeded"])
+        self.assertFalse(payload["validation_run_succeeded"])
+        self.assertIn("ltspice_measurements", payload["failures"])
 
     def test_run_sweep_study_step_mode(self) -> None:
         netlist = self.temp_dir / "step_study.cir"
@@ -1286,6 +1420,80 @@ class TestVerificationAndQueueTools(unittest.TestCase):
 
         canceled = server.cancelJob(job_id=job_id)
         self.assertEqual(canceled["status"], "canceled")
+
+    def test_job_status_include_run_handles_inflight_run_materialization_gap(self) -> None:
+        job_id = "job-materialization-gap"
+        with server._job_lock:
+            server._jobs[job_id] = {
+                "job_id": job_id,
+                "status": "running",
+                "created_at": datetime.now().astimezone().isoformat(),
+                "cancel_requested": False,
+                "priority": 50,
+                "max_retries": 0,
+                "retry_count": 0,
+                "queue_seq": 1,
+                "run_id": "run-not-yet-registered",
+                "attempt_run_ids": ["run-not-yet-registered"],
+            }
+            if job_id not in server._job_order:
+                server._job_order.append(job_id)
+        try:
+            payload = server.jobStatus(job_id=job_id, include_run=True)
+        finally:
+            with server._job_lock:
+                server._jobs.pop(job_id, None)
+                if job_id in server._job_order:
+                    server._job_order.remove(job_id)
+
+        self.assertEqual(payload["status"], "running")
+        self.assertEqual(payload["run_id"], "run-not-yet-registered")
+        self.assertIn("run", payload)
+        self.assertFalse(payload["run"]["materialized"])
+        self.assertIn("not materialized yet", payload["run"]["message"])
+
+    def test_queue_running_status_includes_active_attempt_run_id(self) -> None:
+        netlist = self.temp_dir / "running_attempt.cir"
+        netlist.write_text("* running attempt\n.end\n", encoding="utf-8")
+        started = threading.Event()
+        release = threading.Event()
+
+        def fake_run(*, netlist_path: Path, ascii_raw: bool, timeout_seconds: int | None, cancel_requested):
+            _ = (netlist_path, ascii_raw, timeout_seconds, cancel_requested)
+            started.set()
+            release.wait(2.0)
+            run = _make_run(self.temp_dir, run_id="worker-final-id")
+            return run, False
+
+        with patch("ltspice_mcp.server._run_process_simulation_with_cancel", side_effect=fake_run):
+            queued = server.queueSimulationJob(netlist_path=str(netlist), priority=5, max_retries=0)
+            self.assertTrue(started.wait(2.0))
+            running = None
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                status = server.jobStatus(queued["job_id"], include_run=False)
+                if status["status"] == "running":
+                    running = status
+                    break
+                time.sleep(0.02)
+            self.assertIsNotNone(running)
+            assert running is not None
+            self.assertTrue(running["run_id"])
+            self.assertIn(running["run_id"], running["attempt_run_ids"])
+            release.set()
+            deadline = time.time() + 4.0
+            final_status = None
+            while time.time() < deadline:
+                polled = server.jobStatus(queued["job_id"], include_run=False)
+                if polled["status"] in {"succeeded", "failed", "canceled"}:
+                    final_status = polled
+                    break
+                time.sleep(0.02)
+            self.assertIsNotNone(final_status)
+            assert final_status is not None
+            self.assertEqual(final_status["status"], "succeeded")
+            self.assertTrue(final_status["attempt_run_ids"])
+            self.assertIn(final_status["run_id"], final_status["attempt_run_ids"])
 
     def test_queue_job_uses_submission_snapshot_even_if_source_changes(self) -> None:
         netlist = self.temp_dir / "queued_snapshot_clean.cir"

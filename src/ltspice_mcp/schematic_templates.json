@@ -8,6 +8,14 @@
       "circuit_name": "rc_lowpass_ac",
       "sheet_width": 1200,
       "sheet_height": 900,
+      "parameter_defaults": {
+        "vin_ac": "1",
+        "r_value": "1k",
+        "c_value": "100n",
+        "ac_points": "30",
+        "f_start": "10",
+        "f_stop": "1e6"
+      },
       "netlist_content": "* RC low-pass template\nV1 in 0 AC {vin_ac}\nR1 in out {r_value}\nC1 out 0 {c_value}\n.ac dec {ac_points} {f_start} {f_stop}\n.op\n.end"
     },
     {
@@ -17,6 +25,14 @@
       "circuit_name": "rl_highpass_ac",
       "sheet_width": 1200,
       "sheet_height": 900,
+      "parameter_defaults": {
+        "vin_ac": "1",
+        "l_value": "10m",
+        "r_value": "1k",
+        "ac_points": "30",
+        "f_start": "10",
+        "f_stop": "1e6"
+      },
       "netlist_content": "* RL high-pass template\nV1 in 0 AC {vin_ac}\nL1 in out {l_value}\nR1 out 0 {r_value}\n.ac dec {ac_points} {f_start} {f_stop}\n.end"
     },
     {
@@ -27,6 +43,14 @@
       "sheet_width": 1200,
       "sheet_height": 900,
       "placement_mode": "smart",
+      "parameter_defaults": {
+        "vin_ac": "1",
+        "r_value": "1k",
+        "c_value": "100n",
+        "ac_points": "30",
+        "f_start": "10",
+        "f_stop": "1e6"
+      },
       "netlist_content": "* RC high-pass template\nV1 in 0 AC {vin_ac}\nC1 in out {c_value}\nR1 out 0 {r_value}\n.ac dec {ac_points} {f_start} {f_stop}\n.op\n.end"
     },
     {
@@ -36,6 +60,11 @@
       "circuit_name": "resistor_divider_spec",
       "sheet_width": 880,
       "sheet_height": 680,
+      "parameter_defaults": {
+        "vin_dc": "12",
+        "r_top": "10k",
+        "r_bottom": "10k"
+      },
       "components": [
         {
           "symbol": "voltage",
@@ -82,6 +111,14 @@
       "circuit_name": "non_inverting_opamp_spec",
       "sheet_width": 1600,
       "sheet_height": 1100,
+      "parameter_defaults": {
+        "vin_signal": "SINE(0 0.1 1k) AC 1",
+        "rf_value": "10k",
+        "rg_value": "1k",
+        "vplus": "10",
+        "vminus": "-10",
+        "tran_stop": "10m"
+      },
       "components": [
         {
           "symbol": "voltage",
@@ -256,7 +293,7 @@
         ".tran 0 {tran_stop}",
         ".op"
       ],
-      "sidecar_netlist_content": "* Non-inverting amplifier sidecar\nVin in 0 {vin_signal}\nVCC vcc 0 {vplus}\nVEE vee 0 {vminus}\nXU1 in nfb out vcc vee UniversalOpamp2\nRf out nfb {rf_value}\nRg nfb 0 {rg_value}\n.tran 0 {tran_stop}\n.op\n.end"
+      "sidecar_netlist_content": "* Non-inverting amplifier sidecar\nVin in 0 {vin_signal}\nVCC vcc 0 {vplus}\nVEE vee 0 {vminus}\n.subckt UniversalOpamp2 noninv inv out vcc vee\nEGAIN out 0 noninv inv 1e6\nRout out 0 1\n.ends UniversalOpamp2\nXU1 in nfb out vcc vee UniversalOpamp2\nRf out nfb {rf_value}\nRg nfb 0 {rg_value}\n.tran 0 {tran_stop}\n.op\n.end"
     },
     {
       "name": "zener_regulator_dc",
@@ -266,6 +303,15 @@
       "sheet_width": 1200,
       "sheet_height": 900,
       "placement_mode": "smart",
+      "parameter_defaults": {
+        "vin_dc": "12",
+        "r_series": "330",
+        "r_load": "1k",
+        "zener_voltage": "5.1",
+        "dc_start": "6",
+        "dc_stop": "18",
+        "dc_step": "0.25"
+      },
       "netlist_content": "* Zener regulator\nV1 in 0 DC {vin_dc}\nR1 in out {r_series}\nD1 out 0 DZEN\nRload out 0 {r_load}\n.model DZEN D(BV={zener_voltage} IBV=1m)\n.dc V1 {dc_start} {dc_stop} {dc_step}\n.op\n.end"
     }
   ]

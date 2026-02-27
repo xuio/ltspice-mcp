@@ -109,6 +109,18 @@ class TestRenderSessions(unittest.TestCase):
             self.assertIsNone(capture_kwargs["open_path"])
             self.assertEqual(capture_kwargs["close_after_capture"], False)
 
+    def test_start_render_session_fails_when_ui_open_fails(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_render_session_fail_test_"))
+        asc_path = temp_dir / "session_fail.asc"
+        asc_path.write_text("Version 4\nSHEET 1 100 100\n", encoding="utf-8")
+
+        with patch("ltspice_mcp.server.open_in_ltspice_ui") as open_mock:
+            open_mock.return_value = {"opened": False, "return_code": 1, "stderr": "launch failed"}
+            with self.assertRaisesRegex(RuntimeError, "Failed to open LTspice UI target"):
+                server.startLtspiceRenderSession(path=str(asc_path))
+
+        self.assertEqual(server._render_sessions, {})
+
 
 if __name__ == "__main__":
     unittest.main()

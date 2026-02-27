@@ -403,7 +403,10 @@ def _resolve_output_path(
     output_path: str | None,
 ) -> Path:
     if output_path:
-        return Path(output_path).expanduser().resolve()
+        target = Path(output_path).expanduser().resolve()
+        if target.suffix.lower() != ".asc":
+            raise ValueError("output_path must end with '.asc' for schematic outputs.")
+        return target
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     safe = _sanitize_name(circuit_name)
     unique = hashlib.sha1(f"{stamp}:{safe}".encode("utf-8")).hexdigest()[:8]
@@ -417,7 +420,10 @@ def _resolve_stable_output_path(
     output_path: str | None,
 ) -> Path:
     if output_path:
-        return Path(output_path).expanduser().resolve()
+        target = Path(output_path).expanduser().resolve()
+        if target.suffix.lower() != ".asc":
+            raise ValueError("output_path must end with '.asc' for schematic outputs.")
+        return target
     safe = _sanitize_name(circuit_name)
     return (workdir / "schematics" / f"{safe}.asc").resolve()
 
@@ -497,6 +503,17 @@ def _load_template_payload(template_path: str | Path | None = None) -> tuple[Pat
 
 
 def list_schematic_templates(template_path: str | Path | None = None) -> dict[str, Any]:
+    def _extract_required_parameters(raw_template: dict[str, Any]) -> list[str]:
+        tokens = _collect_unresolved_template_tokens(raw_template)
+        defaults = raw_template.get("parameter_defaults") or {}
+        default_keys = {str(key).strip().lower() for key in defaults if str(key).strip()}
+        required = {
+            token.strip("{}")
+            for token in tokens
+            if token.strip("{}") and token.strip("{}").lower() not in default_keys
+        }
+        return sorted(required)
+
     source_path, payload = _load_template_payload(template_path)
     templates_out: list[dict[str, Any]] = []
     for raw in payload.get("templates", []):
@@ -505,12 +522,20 @@ def list_schematic_templates(template_path: str | Path | None = None) -> dict[st
         name = str(raw.get("name", "")).strip()
         if not name:
             continue
+        parameter_defaults_raw = raw.get("parameter_defaults") or {}
+        parameter_defaults = {
+            str(key): str(value)
+            for key, value in parameter_defaults_raw.items()
+            if str(key).strip()
+        }
         templates_out.append(
             {
                 "name": name,
                 "description": str(raw.get("description", "")),
                 "type": str(raw.get("type", "netlist")),
                 "circuit_name": str(raw.get("circuit_name") or name),
+                "required_parameters": _extract_required_parameters(raw),
+                "parameter_defaults": parameter_defaults,
             }
         )
     return {
@@ -533,17 +558,34 @@ def build_schematic_from_spec(
     sheet_height: int = 680,
     library: SymbolLibrary | None = None,
 ) -> dict[str, Any]:
-    lib = library
+    lib = library or SymbolLibrary()
     builder = SchematicBuilder(sheet_width=sheet_width, sheet_height=sheet_height)
 
-    component_objs: list[ComponentPlacement] = []
+    placed_components: list[tuple[dict[str, Any], ComponentPlacement]] = []
+    seen_references: dict[str, str] = {}
     for raw in components:
         try:
+            symbol_name = str(raw["symbol"]).strip()
+            reference_name = str(raw["reference"])
+            x = int(raw["x"])
+            y = int(raw["y"])
+            if symbol_name.lower() in {"gnd", "ground", "0"}:
+                builder.add_flag(x, y, "0")
+                continue
+            if not _symbol_exists(lib, symbol_name):
+                raise ValueError(f"Unknown LTspice symbol '{symbol_name}'")
+            lowered_reference = reference_name.strip().lower()
+            if lowered_reference in seen_references:
+                raise ValueError(
+                    f"Duplicate component reference '{reference_name}' "
+                    f"(already used by '{seen_references[lowered_reference]}')."
+                )
+            seen_references[lowered_reference] = reference_name
             component = ComponentPlacement(
-                symbol=str(raw["symbol"]),
-                reference=str(raw["reference"]),
-                x=int(raw["x"]),
-                y=int(raw["y"]),
+                symbol=symbol_name,
+                reference=reference_name,
+                x=x,
+                y=y,
                 orientation=_normalize_orientation(raw.get("orientation", raw.get("rotation", "R0"))),
                 value=str(raw["value"]) if raw.get("value") is not None else None,
                 attributes={
@@ -554,7 +596,7 @@ def build_schematic_from_spec(
         except KeyError as exc:
             raise ValueError(f"Missing required component field: {exc}") from exc
         builder.add_component(component)
-        component_objs.append(component)
+        placed_components.append((raw, component))
 
     if wires is not None and not isinstance(wires, list):
         raise ValueError("wires must be a list of objects with keys: x1, y1, x2, y2")
@@ -587,10 +629,8 @@ def build_schematic_from_spec(
         builder.add_flag(int(label["x"]), int(label["y"]), str(label["name"]))
 
     # Optional pin-level net labels directly from component definition.
-    for raw, component in zip(components, component_objs, strict=False):
+    for raw, component in placed_components:
         pin_nets = raw.get("pin_nets") or {}
-        if pin_nets and lib is None:
-            lib = SymbolLibrary()
         for raw_pin, raw_net in pin_nets.items():
             net_name = str(raw_net)
             try:
@@ -619,7 +659,7 @@ def build_schematic_from_spec(
     builder.write(out_path)
     return {
         "asc_path": str(out_path),
-        "components": len(component_objs),
+        "components": len(placed_components),
         "wires": len(builder.wires),
         "flags": len(builder.flags),
         "directives": len(builder.directives),
@@ -667,9 +707,15 @@ def _first_non_param_index(tokens: list[str], *, start_index: int) -> int | None
 
 def _symbol_exists(library: SymbolLibrary, symbol: str) -> bool:
     try:
-        library.resolve_entry(symbol)
+        if hasattr(library, "resolve_entry"):
+            library.resolve_entry(symbol)
+        else:
+            library.get(symbol)
     except Exception:
-        return False
+        try:
+            library.get(symbol)
+        except Exception:
+            return False
     return True
 
 
@@ -678,6 +724,7 @@ def _resolve_multi_pin_symbol(
     ref: str,
     model_token: str | None,
     library: SymbolLibrary,
+    node_count: int,
 ) -> str | None:
     lead = ref[:1].upper()
     if lead == "X":
@@ -698,18 +745,42 @@ def _resolve_multi_pin_symbol(
             seen.add(normalized.lower())
             if _symbol_exists(library, normalized):
                 return normalized
-        return None
+        return Path(model_token).stem or model_token
     if lead == "Q":
         if model_token and _symbol_exists(library, model_token):
-            return model_token
-        if model_token and "pnp" in model_token.lower():
-            return "pnp"
-        return "npn"
+            try:
+                if len(library.get(model_token).pins) >= node_count:
+                    return model_token
+            except Exception:
+                return model_token
+        is_pnp = bool(model_token and "pnp" in model_token.lower())
+        candidates = (["pnp4", "pnp"] if is_pnp else ["npn4", "npn"]) if node_count >= 4 else (["pnp"] if is_pnp else ["npn"])
+        for candidate in candidates:
+            if _symbol_exists(library, candidate):
+                try:
+                    if len(library.get(candidate).pins) >= node_count:
+                        return candidate
+                except Exception:
+                    return candidate
+        return candidates[-1]
     if lead == "M":
         if model_token and _symbol_exists(library, model_token):
-            return model_token
+            try:
+                if len(library.get(model_token).pins) >= node_count:
+                    return model_token
+            except Exception:
+                return model_token
         lowered = (model_token or "").lower()
-        return "pmos" if lowered.startswith("p") or "pmos" in lowered else "nmos"
+        is_pmos = lowered.startswith("p") or "pmos" in lowered
+        candidates = (["pmos4", "pmos"] if is_pmos else ["nmos4", "nmos"]) if node_count >= 4 else (["pmos"] if is_pmos else ["nmos"])
+        for candidate in candidates:
+            if _symbol_exists(library, candidate):
+                try:
+                    if len(library.get(candidate).pins) >= node_count:
+                        return candidate
+                except Exception:
+                    return candidate
+        return candidates[-1]
     return None
 
 
@@ -810,6 +881,35 @@ def _pin_count_for_symbol(library: SymbolLibrary, symbol: str) -> int | None:
         return None
 
 
+def _iter_logical_netlist_lines(netlist_content: str) -> list[tuple[int, str]]:
+    logical_lines: list[tuple[int, str]] = []
+    current_parts: list[str] = []
+    current_index = 0
+    for line_index, raw_line in enumerate(netlist_content.splitlines()):
+        cleaned = _strip_inline_comment(raw_line).strip()
+        if not cleaned:
+            if current_parts:
+                logical_lines.append((current_index, " ".join(current_parts).strip()))
+                current_parts = []
+            continue
+        if cleaned.startswith("+"):
+            continuation = cleaned[1:].strip()
+            if current_parts:
+                if continuation:
+                    current_parts.append(continuation)
+            elif continuation:
+                current_parts = [continuation]
+                current_index = line_index
+            continue
+        if current_parts:
+            logical_lines.append((current_index, " ".join(current_parts).strip()))
+        current_parts = [cleaned]
+        current_index = line_index
+    if current_parts:
+        logical_lines.append((current_index, " ".join(current_parts).strip()))
+    return logical_lines
+
+
 def _build_elements(
     netlist_content: str,
     library: SymbolLibrary,
@@ -817,16 +917,66 @@ def _build_elements(
     directives: list[str],
 ) -> list[_ParsedElement]:
     elements: list[_ParsedElement] = []
-    for line_index, raw_line in enumerate(netlist_content.splitlines()):
-        line = raw_line.strip()
-        if not line or line.startswith("*"):
+    logical_lines = _iter_logical_netlist_lines(netlist_content)
+    if not logical_lines:
+        return elements
+    in_control_block = False
+    subckt_depth = 0
+    conditional_depth = 0
+    title_consumed = False
+
+    for line_index, line in logical_lines:
+        if not line:
             continue
+        if not title_consumed:
+            title_consumed = True
+            continue
+        if line.startswith("*"):
+            continue
+
         tokens = _split_netlist_tokens(line)
         if not tokens:
             continue
-        if tokens[0].startswith("."):
-            directive = " ".join(tokens)
-            if directive.lower() != ".end":
+        directive = " ".join(tokens)
+        directive_lower = tokens[0].strip().lower()
+
+        if in_control_block:
+            directives.append(directive)
+            if directive_lower == ".endc":
+                in_control_block = False
+            continue
+        if subckt_depth > 0:
+            directives.append(directive)
+            if directive_lower == ".subckt":
+                subckt_depth += 1
+            elif directive_lower == ".ends":
+                subckt_depth = max(0, subckt_depth - 1)
+            continue
+        if conditional_depth > 0:
+            directives.append(directive)
+            if directive_lower == ".if":
+                conditional_depth += 1
+            elif directive_lower == ".endif":
+                conditional_depth = max(0, conditional_depth - 1)
+            continue
+
+        if directive_lower.startswith("."):
+            if directive_lower == ".control":
+                directives.append(directive)
+                in_control_block = True
+                continue
+            if directive_lower == ".subckt":
+                directives.append(directive)
+                subckt_depth = 1
+                continue
+            if directive_lower == ".if":
+                directives.append(directive)
+                conditional_depth = 1
+                continue
+            if directive_lower in {".else", ".elseif", ".endif"}:
+                directives.append(directive)
+                continue
+            if directive_lower != ".end":
                 directives.append(directive)
             continue
 
@@ -853,12 +1003,22 @@ def _build_elements(
                 nodes = nodes[:4]
             if lead == "M":
                 nodes = nodes[:4]
-            symbol = _resolve_multi_pin_symbol(ref=ref, model_token=model_token, library=library)
+            symbol = _resolve_multi_pin_symbol(
+                ref=ref,
+                model_token=model_token,
+                library=library,
+                node_count=len(nodes),
+            )
             if symbol is None:
                 warnings.append(
                     f"Could not resolve LTspice symbol for element '{ref}' model '{model_token}'."
                 )
                 continue
+            if lead == "X" and not _symbol_exists(library, symbol):
+                warnings.append(
+                    f"Subcircuit element '{ref}' uses unresolved symbol '{symbol}'. "
+                    "Inserted as a placeholder symbol."
+                )
             value = model_token
         else:
             warnings.append(f"Unsupported element '{ref}' was skipped.")
@@ -874,9 +1034,9 @@ def _build_elements(
         pin_count = _pin_count_for_symbol(library, symbol)
         if pin_count is not None and len(nodes) > pin_count:
             warnings.append(
-                f"Element '{ref}' has {len(nodes)} nodes but symbol '{symbol}' exposes {pin_count} pins; truncating."
+                f"Element '{ref}' has {len(nodes)} nodes but symbol '{symbol}' exposes {pin_count} pins. "
+                "Extra pins may be left unrouted in the schematic view."
             )
-            nodes = nodes[:pin_count]
         if pin_count is not None and len(nodes) == 0:
             warnings.append(f"Element '{ref}' has no routable pins after normalization.")
             continue
@@ -1162,6 +1322,17 @@ def build_schematic_from_netlist(
     )
     if not elements:
         raise ValueError("No supported components were parsed from netlist.")
+    seen_references: dict[str, int] = {}
+    duplicate_references: list[str] = []
+    for element in elements:
+        lowered = element.reference.strip().lower()
+        if lowered in seen_references:
+            duplicate_references.append(element.reference)
+        else:
+            seen_references[lowered] = element.source_index + 1
+    if duplicate_references:
+        duplicates = ", ".join(sorted(set(duplicate_references)))
+        raise ValueError(f"Duplicate element references detected in netlist import: {duplicates}")
 
     layout_metrics: dict[str, Any] = {"placement_mode": normalized_mode}
     if normalized_mode == "legacy":
@@ -1184,7 +1355,14 @@ def build_schematic_from_netlist(
 
     net_to_points: dict[str, list[tuple[int, int]]] = {}
     for placement, nodes in components:
+        pin_count = _pin_count_for_symbol(lib, placement.symbol)
         for spice_order, net_name in enumerate(nodes, start=1):
+            if pin_count is not None and spice_order > pin_count:
+                warnings.append(
+                    f"Pin mapping unavailable for '{placement.reference}' order {spice_order}; "
+                    f"symbol '{placement.symbol}' exposes {pin_count} pins."
+                )
+                continue
             try:
                 px, py = _component_pin_position(lib, placement, spice_order=spice_order)
             except Exception as exc:
@@ -1274,7 +1452,12 @@ def build_schematic_from_template(
             f"Template '{template_name}' was not found in {source_path}"
         )
 
-    params = {str(key): value for key, value in (parameters or {}).items()}
+    template_defaults = {
+        str(key): value
+        for key, value in (matched.get("parameter_defaults") or {}).items()
+        if str(key).strip()
+    }
+    params = {**template_defaults, **{str(key): value for key, value in (parameters or {}).items()}}
     rendered = _format_recursive(matched, params)
     unresolved_tokens = _collect_unresolved_template_tokens(rendered)
     if unresolved_tokens:
@@ -1488,23 +1671,41 @@ def watch_schematic_from_netlist_file(
 
     started = time.monotonic()
     updates: list[dict[str, Any]] = []
+    poll_errors: list[dict[str, Any]] = []
     polls = 0
     last_result: dict[str, Any] | None = None
 
     while True:
         polls += 1
-        result = sync_schematic_from_netlist_file(
-            workdir=workdir,
-            netlist_path=netlist_path,
-            circuit_name=circuit_name,
-            output_path=output_path,
-            state_path=state_path,
-            sheet_width=sheet_width,
-            sheet_height=sheet_height,
-            force=(force_initial_refresh and polls == 1),
-            library=library,
-            placement_mode=placement_mode,
-        )
+        try:
+            result = sync_schematic_from_netlist_file(
+                workdir=workdir,
+                netlist_path=netlist_path,
+                circuit_name=circuit_name,
+                output_path=output_path,
+                state_path=state_path,
+                sheet_width=sheet_width,
+                sheet_height=sheet_height,
+                force=(force_initial_refresh and polls == 1),
+                library=library,
+                placement_mode=placement_mode,
+            )
+        except Exception as exc:  # noqa: BLE001
+            elapsed_now = round(time.monotonic() - started, 6)
+            error_event = {
+                "poll_index": polls,
+                "elapsed_s": elapsed_now,
+                "updated": False,
+                "reason": "error",
+                "error": str(exc),
+            }
+            poll_errors.append(error_event)
+            last_result = error_event
+            elapsed = time.monotonic() - started
+            if elapsed >= duration_seconds:
+                break
+            time.sleep(min(poll_interval_seconds, duration_seconds - elapsed))
+            continue
         last_result = result
         if result.get("updated"):
             update_event = dict(result)
@@ -1526,5 +1727,7 @@ def watch_schematic_from_netlist_file(
         "poll_count": polls,
         "updates_count": len(updates),
         "updates": updates,
+        "error_count": len(poll_errors),
+        "errors": poll_errors,
         "last_result": last_result,
     }

@@ -2073,16 +2073,22 @@ def _apply_post_close_verification(
     if not bool(post_verify.get("verification_available")):
         return event
 
-    closed_before_verify = bool(event.get("closed", False))
+    closed_windows = int(event.get("closed_windows") or 0)
+    matched_windows = int(event.get("matched_windows") or 0)
+    closed_before_verify = bool(event.get("closed", False)) and closed_windows > 0
     verified_closed = bool(post_verify.get("verified_closed"))
+    if matched_windows <= 0 and closed_windows <= 0:
+        verified_closed = False
     event["closed_before_verify"] = closed_before_verify
     event["verified_closed"] = verified_closed
     event["verification_mismatch"] = closed_before_verify != verified_closed
-    event["closed"] = verified_closed
-    if verified_closed:
+    event["closed"] = bool(closed_windows > 0 and verified_closed)
+    if event["closed"]:
         event["partially_closed"] = False
-    elif int(event.get("closed_windows") or 0) > 0:
+    elif closed_windows > 0:
         event["partially_closed"] = True
+    else:
+        event["partially_closed"] = False
     return event
 
 

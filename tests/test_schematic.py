@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from ltspice_mcp.schematic import (
     PinDef,
@@ -60,7 +61,19 @@ class _StubMultiPinLibrary(_StubLibrary):
                 PinDef(x=0, y=40, spice_order=2, name="B"),
                 PinDef(x=40, y=0, spice_order=3, name="E"),
             ],
+            "npn4": [
+                PinDef(x=-40, y=0, spice_order=1, name="C"),
+                PinDef(x=0, y=40, spice_order=2, name="B"),
+                PinDef(x=40, y=0, spice_order=3, name="E"),
+                PinDef(x=0, y=-40, spice_order=4, name="S"),
+            ],
             "nmos": [
+                PinDef(x=-40, y=0, spice_order=1, name="D"),
+                PinDef(x=0, y=40, spice_order=2, name="G"),
+                PinDef(x=40, y=0, spice_order=3, name="S"),
+                PinDef(x=0, y=-40, spice_order=4, name="B"),
+            ],
+            "nmos4": [
                 PinDef(x=-40, y=0, spice_order=1, name="D"),
                 PinDef(x=0, y=40, spice_order=2, name="G"),
                 PinDef(x=40, y=0, spice_order=3, name="S"),
@@ -91,6 +104,14 @@ class _StubMultiPinLibrary(_StubLibrary):
         return _transform_point(pin.x, pin.y, orientation)
 
 
+class _StrictStubLibrary(_StubMultiPinLibrary):
+    def get(self, symbol: str) -> SymbolDef:
+        normalized = symbol.strip().lower()
+        if normalized in self._pin_map or normalized in {"res", "cap", "ind", "diode", "voltage", "current"}:
+            return super().get(symbol)
+        raise ValueError(f"Unknown symbol: {symbol}")
+
+
 class TestSchematicBuilders(unittest.TestCase):
     @staticmethod
     def _fixtures_dir() -> Path:
@@ -104,6 +125,7 @@ class TestSchematicBuilders(unittest.TestCase):
         self.temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_schematic_test_"))
         self.stub = _StubLibrary()
         self.multi_stub = _StubMultiPinLibrary()
+        self.strict_stub = _StrictStubLibrary()
 
     def test_build_schematic_from_spec(self) -> None:
         output_path = self.temp_dir / "spec_case.asc"
@@ -128,6 +150,48 @@ class TestSchematicBuilders(unittest.TestCase):
         self.assertTrue(asc.exists())
         text = asc.read_text(encoding="utf-8")
         self.assertEqual(text, self._fixture_text("spec_case.asc"))
+
+    def test_build_schematic_from_spec_maps_ground_symbol_to_flag(self) -> None:
+        output_path = self.temp_dir / "ground_map_case.asc"
+        result = build_schematic_from_spec(
+            workdir=self.temp_dir,
+            components=[
+                {"symbol": "voltage", "reference": "V1", "x": 120, "y": 120, "value": "DC 1"},
+                {"symbol": "res", "reference": "R1", "x": 280, "y": 120, "value": "1k"},
+                {"symbol": "gnd", "reference": "GND1", "x": 120, "y": 216},
+            ],
+            directives=[".op"],
+            circuit_name="ground_map_case",
+            output_path=str(output_path),
+            library=self.stub,
+        )
+        text = Path(result["asc_path"]).read_text(encoding="utf-8")
+        self.assertEqual(result["components"], 2)
+        self.assertIn("FLAG 120 216 0", text)
+        self.assertNotIn("SYMBOL gnd", text)
+
+    def test_build_schematic_from_spec_rejects_unknown_symbol_and_duplicate_refs(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Unknown LTspice symbol 'notasymbol'"):
+            build_schematic_from_spec(
+                workdir=self.temp_dir,
+                components=[{"symbol": "notasymbol", "reference": "X1", "x": 100, "y": 100}],
+                directives=[".op"],
+                circuit_name="unknown_symbol_case",
+                output_path=str(self.temp_dir / "unknown_symbol_case.asc"),
+                library=self.strict_stub,
+            )
+        with self.assertRaisesRegex(ValueError, "Duplicate component reference 'R1'"):
+            build_schematic_from_spec(
+                workdir=self.temp_dir,
+                components=[
+                    {"symbol": "res", "reference": "R1", "x": 100, "y": 100, "value": "1k"},
+                    {"symbol": "res", "reference": "R1", "x": 240, "y": 100, "value": "2k"},
+                ],
+                directives=[".op"],
+                circuit_name="duplicate_ref_case",
+                output_path=str(self.temp_dir / "duplicate_ref_case.asc"),
+                library=self.multi_stub,
+            )
 
     def test_build_schematic_from_netlist(self) -> None:
         output_path = self.temp_dir / "netlist_case.asc"
@@ -235,6 +299,27 @@ class TestSchematicBuilders(unittest.TestCase):
         self.assertIn("SYMATTR Value 2k", text)
         self.assertIn("SYMATTR Value 2u", text)
 
+    def test_template_listing_includes_required_and_default_parameters(self) -> None:
+        listing = list_schematic_templates()
+        entry = next(item for item in listing["templates"] if item["name"] == "rc_lowpass_ac")
+        self.assertIn("required_parameters", entry)
+        self.assertIn("parameter_defaults", entry)
+        self.assertIn("vin_ac", entry["parameter_defaults"])
+        self.assertIn("r_value", entry["parameter_defaults"])
+
+    def test_template_defaults_allow_render_without_explicit_parameters(self) -> None:
+        output_path = self.temp_dir / "template_defaults_case.asc"
+        result = build_schematic_from_template(
+            workdir=self.temp_dir,
+            template_name="rc_lowpass_ac",
+            output_path=str(output_path),
+            library=self.stub,
+        )
+        text = Path(result["asc_path"]).read_text(encoding="utf-8")
+        self.assertIn("SYMATTR Value AC 1", text)
+        self.assertIn("SYMATTR Value 1k", text)
+        self.assertIn("SYMATTR Value 100n", text)
+
     def test_non_inverting_opamp_template_rendering(self) -> None:
         output_path = self.temp_dir / "non_inverting_template.asc"
         result = build_schematic_from_template(
@@ -258,6 +343,144 @@ class TestSchematicBuilders(unittest.TestCase):
         self.assertIn("SYMATTR Value 12", text)
         self.assertIn("SYMATTR Value -12", text)
         self.assertTrue(Path(str(result["netlist_path"])).exists())
+
+    def test_netlist_title_line_is_not_parsed_as_element(self) -> None:
+        output_path = self.temp_dir / "title_line_probe.asc"
+        result = build_schematic_from_netlist(
+            workdir=self.temp_dir,
+            netlist_content=(
+                "My Title Line\n"
+                "V1 in 0 1\n"
+                "R1 in 0 1k\n"
+                ".op\n"
+                ".end\n"
+            ),
+            circuit_name="title_line_probe",
+            output_path=str(output_path),
+            library=self.stub,
+        )
+        text = Path(result["asc_path"]).read_text(encoding="utf-8")
+        self.assertEqual(result["components"], 2)
+        self.assertNotIn("SYMATTR InstName My", text)
+        self.assertFalse(any("Unsupported element 'My'" in warning for warning in result["warnings"]))
+
+    def test_netlist_continuation_lines_are_merged_before_parse(self) -> None:
+        output_path = self.temp_dir / "continuation_probe.asc"
+        result = build_schematic_from_netlist(
+            workdir=self.temp_dir,
+            netlist_content=(
+                "* Continuation probe\n"
+                "V1 in 0 PWL(0 0\n"
+                "+ 1u 1\n"
+                "+ 2u 0)\n"
+                "R1 in 0 1k\n"
+                ".op\n"
+                ".end\n"
+            ),
+            circuit_name="continuation_probe",
+            output_path=str(output_path),
+            library=self.stub,
+        )
+        text = Path(result["asc_path"]).read_text(encoding="utf-8")
+        self.assertIn("SYMATTR Value PWL(0 0 1u 1 2u 0)", text)
+        self.assertFalse(any("Unsupported element '+'" in warning for warning in result["warnings"]))
+
+    def test_control_and_conditional_blocks_are_preserved_as_directives(self) -> None:
+        output_path = self.temp_dir / "control_conditional_probe.asc"
+        result = build_schematic_from_netlist(
+            workdir=self.temp_dir,
+            netlist_content=(
+                "Conditional title\n"
+                ".param X=1\n"
+                ".if X\n"
+                "R1 in 0 1k\n"
+                ".else\n"
+                "R2 in 0 2k\n"
+                ".endif\n"
+                ".control\n"
+                "run\n"
+                ".endc\n"
+                "V1 in 0 1\n"
+                ".op\n"
+                ".end\n"
+            ),
+            circuit_name="control_conditional_probe",
+            output_path=str(output_path),
+            library=self.stub,
+        )
+        text = Path(result["asc_path"]).read_text(encoding="utf-8")
+        self.assertEqual(result["components"], 1)
+        self.assertIn("!.if X", text)
+        self.assertIn("!.else", text)
+        self.assertIn("!.endif", text)
+        self.assertIn("!.control", text)
+        self.assertIn("!run", text)
+        self.assertIn("!.endc", text)
+        self.assertNotIn("SYMATTR InstName R1", text)
+        self.assertNotIn("SYMATTR InstName R2", text)
+
+    def test_subckt_internals_not_promoted_to_top_level_components(self) -> None:
+        output_path = self.temp_dir / "subckt_probe.asc"
+        result = build_schematic_from_netlist(
+            workdir=self.temp_dir,
+            netlist_content=(
+                "Subckt probe\n"
+                ".subckt FOO a b\n"
+                "Rcore a b 1k\n"
+                ".ends FOO\n"
+                "V1 in 0 1\n"
+                "XU1 in out FOO\n"
+                "Rload out 0 1k\n"
+                ".op\n"
+                ".end\n"
+            ),
+            circuit_name="subckt_probe",
+            output_path=str(output_path),
+            library=self.stub,
+        )
+        text = Path(result["asc_path"]).read_text(encoding="utf-8")
+        self.assertEqual(result["components"], 3)
+        self.assertIn("SYMATTR InstName XU1", text)
+        self.assertNotIn("SYMATTR InstName Rcore", text)
+        self.assertIn("!Rcore a b 1k", text)
+
+    def test_four_terminal_active_devices_prefer_four_pin_symbols(self) -> None:
+        output_path = self.temp_dir / "four_pin_probe.asc"
+        result = build_schematic_from_netlist(
+            workdir=self.temp_dir,
+            netlist_content=(
+                "4-pin active probe\n"
+                "Q1 c b e s NPNMOD\n"
+                "M1 d g s b NMOS\n"
+                "Vc c 0 5\n"
+                "Vb b 0 0.7\n"
+                "Ve e 0 0\n"
+                "Vs s 0 0\n"
+                "Vd d 0 5\n"
+                "Vg g 0 2\n"
+                ".model NPNMOD NPN(BF=100)\n"
+                ".model NMOS NMOS(VTO=1 KP=1m)\n"
+                ".op\n"
+                ".end\n"
+            ),
+            circuit_name="four_pin_probe",
+            output_path=str(output_path),
+            library=self.multi_stub,
+        )
+        text = Path(result["asc_path"]).read_text(encoding="utf-8")
+        self.assertIn("SYMBOL npn4", text)
+        self.assertTrue("SYMBOL nmos4" in text or "SYMBOL NMOS" in text)
+        self.assertFalse(any("truncating" in warning.lower() for warning in result["warnings"]))
+
+    def test_build_schematic_from_netlist_rejects_non_asc_output(self) -> None:
+        with self.assertRaisesRegex(ValueError, "output_path must end with '.asc'"):
+            build_schematic_from_netlist(
+                workdir=self.temp_dir,
+                netlist_content="* bad output\nV1 in 0 1\n.op\n.end\n",
+                circuit_name="bad_output",
+                output_path=str(self.temp_dir / "bad_output.cir"),
+                library=self.stub,
+            )
 
     def test_sync_regenerates_only_on_change(self) -> None:
         netlist = self.temp_dir / "sync_case.cir"
@@ -322,6 +545,40 @@ class TestSchematicBuilders(unittest.TestCase):
         self.assertEqual(result["poll_count"], 1)
         self.assertEqual(result["updates_count"], 1)
         self.assertTrue(result["updates"][0]["updated"])
+
+    def test_watch_netlist_file_continues_after_poll_error(self) -> None:
+        netlist = self.temp_dir / "watch_error_case.cir"
+        netlist.write_text("* Watch error test\n.end\n", encoding="utf-8")
+
+        call_count = {"value": 0}
+
+        def _sync_side_effect(**_: object) -> dict[str, object]:
+            call_count["value"] += 1
+            if call_count["value"] == 1:
+                raise ValueError("netlist_content cannot be empty")
+            return {
+                "updated": False,
+                "reason": "unchanged",
+                "asc_path": str(self.temp_dir / "watch_error_case.asc"),
+                "warnings": [],
+            }
+
+        with patch("ltspice_mcp.schematic.sync_schematic_from_netlist_file", side_effect=_sync_side_effect):
+            result = watch_schematic_from_netlist_file(
+                workdir=self.temp_dir,
+                netlist_path=netlist,
+                circuit_name="watch_error_case",
+                duration_seconds=0.03,
+                poll_interval_seconds=0.01,
+                max_updates=2,
+                force_initial_refresh=False,
+                library=self.stub,
+            )
+
+        self.assertGreaterEqual(result["poll_count"], 2)
+        self.assertGreaterEqual(result["error_count"], 1)
+        self.assertIn("errors", result)
+        self.assertTrue(any("cannot be empty" in str(entry.get("error", "")) for entry in result["errors"]))
 
     def test_real_symbol_rc_lowpass_capacitor_connectivity(self) -> None:
         try:

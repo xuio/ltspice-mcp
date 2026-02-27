@@ -430,7 +430,7 @@ class TestCloseLtspiceWindow(unittest.TestCase):
         self.assertTrue(payload["verification_mismatch"])
         self.assertEqual(payload["post_verify"]["matched_windows"], 1)
 
-    def test_close_ltspice_window_post_verify_can_upgrade_to_closed(self) -> None:
+    def test_close_ltspice_window_post_verify_requires_closed_window_match(self) -> None:
         with (
             patch("ltspice_mcp.ltspice.platform.system", return_value="Darwin"),
             patch(
@@ -457,8 +457,9 @@ class TestCloseLtspiceWindow(unittest.TestCase):
             ),
         ):
             payload = close_ltspice_window("foo.asc")
-        self.assertTrue(payload["closed"])
-        self.assertTrue(payload["verification_mismatch"])
+        self.assertFalse(payload["closed"])
+        self.assertFalse(payload["verified_closed"])
+        self.assertFalse(payload["verification_mismatch"])
 
 
 if __name__ == "__main__":

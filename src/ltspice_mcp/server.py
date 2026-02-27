@@ -1142,10 +1142,27 @@ def _open_ui_target(
     target: str = "netlist",
 ) -> dict[str, Any]:
     if path is not None:
-        return open_in_ltspice_ui(path)
+        target = path.expanduser().resolve()
+        if not target.exists():
+            raise FileNotFoundError(f"Cannot open missing path in LTspice UI: {target}")
+        if not target.is_file():
+            raise ValueError(f"path must be a file: {target}")
+        _ensure_file_readable(target, field_name="path")
+        event = open_in_ltspice_ui(target)
+        if not bool(event.get("opened")):
+            stderr = str(event.get("stderr") or "").strip()
+            detail = f" ({stderr})" if stderr else ""
+            raise RuntimeError(f"Failed to open LTspice UI target: {target}{detail}")
+        return event
     if run is None:
         raise ValueError("Either run or path must be provided for UI open.")
-    return open_in_ltspice_ui(_target_path_from_run(run, target))
+    target_path = _target_path_from_run(run, target)
+    event = open_in_ltspice_ui(target_path)
+    if not bool(event.get("opened")):
+        stderr = str(event.get("stderr") or "").strip()
+        detail = f" ({stderr})" if stderr else ""
+        raise RuntimeError(f"Failed to open LTspice UI target: {target_path}{detail}")
+    return event
 
 
 def _effective_open_ui(open_ui: bool | None) -> bool:
@@ -2018,14 +2035,7 @@ def _effective_sync_timeout(timeout_seconds: int | None) -> int | None:
     requested = int(timeout_seconds)
     if requested <= 0:
         raise ValueError("timeout_seconds must be > 0.")
-    margin = int(_SYNC_TOOL_TIMEOUT_MARGIN_SECONDS)
-    if margin <= 0:
-        return requested
-    # Keep small explicit timeouts untouched; trim only larger values so sync tools
-    # can return structured payloads before client-side tool-call deadlines.
-    if requested <= margin + 5:
-        return requested
-    return max(1, requested - margin)
+    return requested
 
 
 def _normalize_optional_selector(name: str, value: str | None) -> str | None:
@@ -2689,6 +2699,41 @@ def _parse_meas_statement_tokens(statement: str) -> dict[str, str] | None:
     return {"analysis": analysis, "name": name, "body": body}
 
 
+def _extract_meas_names_from_netlist(netlist_text: str) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for raw_line in netlist_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("*", ";")):
+            continue
+        parsed = _parse_meas_statement_tokens(line)
+        if not parsed:
+            continue
+        name = parsed["name"].strip()
+        lowered = name.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        names.append(name)
+    return names
+
+
+def _strip_meas_statements(netlist_text: str) -> tuple[str, int]:
+    kept_lines: list[str] = []
+    removed_count = 0
+    for raw_line in netlist_text.splitlines():
+        line = raw_line.strip()
+        parsed = _parse_meas_statement_tokens(line) if line else None
+        if parsed is not None:
+            removed_count += 1
+            continue
+        kept_lines.append(raw_line)
+    normalized = "\n".join(kept_lines).rstrip() + "\n"
+    if not any(line.strip().lower() == ".end" for line in normalized.splitlines()):
+        normalized += ".end\n"
+    return normalized, removed_count
+
+
 def _parse_meas_statement_kinds(netlist_text: str) -> dict[str, str]:
     kinds: dict[str, str] = {}
     for raw_line in netlist_text.splitlines():
@@ -3056,6 +3101,12 @@ def _parse_meas_failures_from_text(text: str) -> list[dict[str, Any]]:
     lines = text.splitlines()
     active_measurement: str | None = None
     for index, line in enumerate(lines):
+        candidate_line = line.strip()
+        if candidate_line.lower().startswith((".meas", ".measure")):
+            parsed_stmt = _parse_meas_statement_tokens(candidate_line)
+            if parsed_stmt:
+                active_measurement = parsed_stmt["name"].strip() or active_measurement
+                continue
         match_header = _MEAS_MEASUREMENT_RE.match(line)
         if match_header:
             active_measurement = match_header.group("name").strip() or None
@@ -3159,8 +3210,11 @@ def _write_meas_netlist(
     base_netlist_path: Path,
     statements: list[str],
     suffix: str = "meas",
+    remove_existing_meas: bool = True,
 ) -> Path:
     base_text = _read_netlist_text(base_netlist_path)
+    if remove_existing_meas:
+        base_text, _ = _strip_meas_statements(base_text)
     updated = _append_unique_lines_before_end(base_text, statements)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     output_dir = (_runner.workdir / "generated_netlists" / "measurements" / stamp).resolve()
@@ -4040,6 +4094,10 @@ def _ensure_job_worker() -> None:
                     job["status"] = "running"
                     job["started_at"] = _now_iso()
                     job["run_id"] = pending_run_id
+                    attempts = list(job.get("attempt_run_ids") or [])
+                    if pending_run_id not in attempts:
+                        attempts.append(pending_run_id)
+                    job["attempt_run_ids"] = attempts
                     job["summary"] = "Running simulation."
                     _save_job_state()
                 try:
@@ -5247,8 +5305,13 @@ def _resolve_sidecar_netlist_path(asc_path: Path) -> Path | None:
         return asc_path
     for suffix in (".cir", ".net", ".sp", ".spi"):
         candidate = asc_path.with_suffix(suffix)
-        if candidate.exists():
-            return candidate
+        if not candidate.exists() or not candidate.is_file():
+            continue
+        try:
+            _ensure_file_readable(candidate, field_name="sidecar_path")
+        except Exception:
+            continue
+        return candidate
     return None
 
 
@@ -5298,7 +5361,7 @@ def _resolve_schematic_simulation_target(
             "error": None,
         }
 
-    if is_macos and require_sidecar_on_macos:
+    if is_macos:
         error = (
             "simulateSchematicFile on macOS does not support LTspice batch simulation "
             "directly from .asc files. Create a sidecar netlist next to the schematic "
@@ -5314,7 +5377,11 @@ def _resolve_schematic_simulation_target(
             "candidate_sidecar_paths": candidate_paths,
             "run_target_path": str(resolved),
             "can_batch_simulate": False,
-            "reason": "missing_sidecar_required_on_macos",
+            "reason": (
+                "missing_sidecar_required_on_macos"
+                if require_sidecar_on_macos
+                else "direct_asc_batch_unsupported_on_macos"
+            ),
             "suggestions": [
                 "Create a sidecar netlist with the same basename and a .cir/.net/.sp/.spi extension.",
                 "If schematic was generated from netlist/template tools, use the emitted sidecar path.",
@@ -5576,15 +5643,18 @@ def _plot_preset_domain_warning(*, dataset: RawDataset, preset: str) -> str | No
     )
 
 
-def _validate_schematic_file(path: Path) -> dict[str, Any]:
+def _validate_schematic_file(path: Path, *, library: SymbolLibrary | None = None) -> dict[str, Any]:
     text = read_text_auto(path)
     components = 0
     wires = 0
     flags = 0
     has_ground = False
     directives: list[str] = []
+    symbol_entries: list[tuple[int, str]] = []
+    instname_line: dict[int, str] = {}
+    current_symbol_line: int | None = None
 
-    for raw in text.splitlines():
+    for line_no, raw in enumerate(text.splitlines(), start=1):
         line = raw.strip()
         if not line:
             continue
@@ -5594,6 +5664,13 @@ def _validate_schematic_file(path: Path) -> dict[str, Any]:
         keyword = parts[0].upper()
         if keyword == "SYMBOL":
             components += 1
+            if len(parts) >= 2:
+                symbol_entries.append((line_no, parts[1]))
+            current_symbol_line = line_no
+            continue
+        if keyword == "SYMATTR" and len(parts) >= 3 and parts[1].lower() == "instname":
+            if current_symbol_line is not None:
+                instname_line[current_symbol_line] = " ".join(parts[2:]).strip()
             continue
         if keyword == "WIRE":
             wires += 1
@@ -5617,6 +5694,7 @@ def _validate_schematic_file(path: Path) -> dict[str, Any]:
     issues: list[str] = []
     warnings: list[str] = []
     suggestions: list[str] = []
+    unresolved_symbols: list[str] = []
 
     if components == 0:
         issues.append("No components were found in the schematic.")
@@ -5627,13 +5705,65 @@ def _validate_schematic_file(path: Path) -> dict[str, Any]:
     if not sim_directives:
         issues.append("No simulation directive was found in schematic TEXT commands.")
         suggestions.append("Add a directive such as `.op`, `.tran`, `.ac`, or `.dc`.")
-    unresolved_tokens = sorted(set(_UNRESOLVED_PLACEHOLDER_RE.findall(text)))
+    defined_params: set[str] = set()
+    for directive in directives:
+        lowered = directive.strip().lower()
+        if not lowered.startswith(".param"):
+            continue
+        body = directive.strip()[6:].strip()
+        for token in re.split(r"\s+", body):
+            if "=" not in token:
+                continue
+            key = token.split("=", 1)[0].strip()
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.$-]*", key):
+                defined_params.add(key.lower())
+    unresolved_tokens = sorted(
+        {
+            token
+            for token in set(_UNRESOLVED_PLACEHOLDER_RE.findall(text))
+            if token.strip("{}").strip().lower() not in defined_params
+        }
+    )
     if unresolved_tokens:
         issues.append(
             "Unresolved template placeholders were found in schematic content: "
             + ", ".join(unresolved_tokens)
         )
         suggestions.append("Render template parameters before validating/simulating this schematic.")
+    refs_seen: dict[str, int] = {}
+    duplicate_refs: list[str] = []
+    for symbol_line, reference in sorted(instname_line.items()):
+        if not reference:
+            continue
+        lowered = reference.lower()
+        if lowered in refs_seen:
+            duplicate_refs.append(
+                f"Duplicate InstName '{reference}' at line {symbol_line} "
+                f"(already seen at line {refs_seen[lowered]})."
+            )
+        else:
+            refs_seen[lowered] = symbol_line
+    if duplicate_refs:
+        issues.extend(duplicate_refs)
+        suggestions.append("Ensure each component has a unique InstName designator.")
+    symbol_lib = library
+    if symbol_lib is None:
+        try:
+            symbol_lib = _resolve_symbol_library(None)
+        except Exception:
+            symbol_lib = None
+    if symbol_lib is not None:
+        for line_no, symbol_name in symbol_entries:
+            try:
+                symbol_lib.resolve_entry(symbol_name)
+            except Exception:
+                unresolved_symbols.append(f"{symbol_name}@line{line_no}")
+    if unresolved_symbols:
+        issues.append(
+            "Unresolved symbols were found in schematic content: "
+            + ", ".join(unresolved_symbols)
+        )
+        suggestions.append("Replace unresolved symbols with valid LTspice library entries.")
     if wires == 0:
         warnings.append("No wire segments were found; component pins may be unconnected.")
     if path.suffix.lower() != ".asc":
@@ -5648,6 +5778,7 @@ def _validate_schematic_file(path: Path) -> dict[str, Any]:
         "directives": directives,
         "simulation_directives": sim_directives,
         "unresolved_placeholders": unresolved_tokens,
+        "unresolved_symbols": unresolved_symbols,
         "issues": issues,
         "warnings": warnings,
         "suggestions": suggestions,
@@ -5743,9 +5874,13 @@ def _lint_schematic_file(
                 pin_count = len(library.get(symbol).pins)
             except Exception:
                 unresolved_symbol_count += 1
-                warnings.append(
+                message = (
                     f"Could not resolve symbol '{symbol}' for component '{reference}'; pin-level lint skipped."
                 )
+                if strict:
+                    errors.append(message)
+                else:
+                    warnings.append(message)
                 continue
             connected = 0
             unconnected_pins: list[int] = []
@@ -5976,6 +6111,7 @@ def runMeasAutomation(
     )
     statements = _build_meas_statements(measurements)
     source_netlist: Path
+    source_text_for_scope: str | None = None
     if netlist_content is not None:
         normalized_content = netlist_content.rstrip() + "\n"
         if not any(line.strip().lower() == ".end" for line in normalized_content.splitlines()):
@@ -5988,8 +6124,9 @@ def runMeasAutomation(
             require_analysis=False,
         )
         source_netlist = _runner.write_netlist(netlist_content, circuit_name=circuit_name)
+        source_text_for_scope = normalized_content
     elif normalized_netlist_path is not None:
-        source_netlist, _ = _load_validated_netlist_file(
+        source_netlist, loaded_text = _load_validated_netlist_file(
             normalized_netlist_path,
             field_name="netlist_path",
             allow_asc=False,
@@ -5997,6 +6134,7 @@ def runMeasAutomation(
             require_elements=False,
             require_analysis=False,
         )
+        source_text_for_scope = loaded_text
         staged = _stage_sync_source_netlist(source_path=source_netlist, purpose="meas_automation")
         source_netlist = Path(str(staged["run_path"])).expanduser().resolve()
     elif normalized_asc_path is not None:
@@ -6005,25 +6143,11 @@ def runMeasAutomation(
         if not bool(target.get("can_batch_simulate")):
             raise ValueError(str(target.get("error")))
         source_netlist = Path(str(target["run_target_path"])).expanduser().resolve()
+        source_text_for_scope = _read_netlist_text(source_netlist)
         staged = _stage_sync_source_netlist(source_path=source_netlist, purpose="meas_automation_asc")
         source_netlist = Path(str(staged["run_path"])).expanduser().resolve()
     else:
         raise ValueError("Provide one of netlist_content, netlist_path, or asc_path.")
-
-    meas_netlist = _write_meas_netlist(
-        base_netlist_path=source_netlist,
-        statements=statements,
-        suffix="meas",
-    )
-    run_payload = simulateNetlistFile(
-        netlist_path=str(meas_netlist),
-        ascii_raw=ascii_raw,
-        timeout_seconds=timeout_seconds,
-        show_ui=show_ui,
-        open_raw_after_run=open_raw_after_run,
-    )
-    meas_payload = parseMeasResults(run_id=str(run_payload["run_id"]))
-    run_payload_with_meas = dict(run_payload)
 
     requested_names: list[str] = []
     requested_seen: set[str] = set()
@@ -6036,6 +6160,26 @@ def runMeasAutomation(
             continue
         requested_seen.add(normalized)
         requested_names.append(parsed_name)
+
+    existing_meas_names = _extract_meas_names_from_netlist(source_text_for_scope or _read_netlist_text(source_netlist))
+    existing_lookup = {name.lower() for name in existing_meas_names}
+    colliding_names = sorted({name for name in requested_names if name.lower() in existing_lookup})
+
+    meas_netlist = _write_meas_netlist(
+        base_netlist_path=source_netlist,
+        statements=statements,
+        suffix="meas",
+        remove_existing_meas=True,
+    )
+    run_payload = simulateNetlistFile(
+        netlist_path=str(meas_netlist),
+        ascii_raw=ascii_raw,
+        timeout_seconds=timeout_seconds,
+        show_ui=show_ui,
+        open_raw_after_run=open_raw_after_run,
+    )
+    meas_payload = parseMeasResults(run_id=str(run_payload["run_id"]))
+    run_payload_with_meas = dict(run_payload)
 
     resolved_run = _resolve_run(str(run_payload["run_id"]))
     log_target = resolved_run.log_utf8_path or resolved_run.log_path
@@ -6055,9 +6199,10 @@ def runMeasAutomation(
         failed_requested = [
             failure for failure in failed_measurements if str(failure.get("name", "")).lower() in requested_lookup
         ]
+    all_measurements = dict(meas_payload)
     observed_lookup = {
         str(name).strip().lower()
-        for name in (meas_payload.get("measurements") or {}).keys()
+        for name in (all_measurements.get("measurements") or {}).keys()
         if str(name).strip()
     }
     failed_lookup = {
@@ -6084,6 +6229,12 @@ def runMeasAutomation(
             "One or more requested .meas directives did not produce a numeric result. "
             "Inspect failed_measurements/missing_requested_measurements for details."
         )
+    if colliding_names:
+        wrapper_warnings.append(
+            "Requested .meas names overlap with source netlist .meas names ("
+            + ", ".join(colliding_names)
+            + "). Existing source .meas statements were isolated from this automation run."
+        )
     for entry in failed_requested:
         name = str(entry.get("name", "")).strip() or "unknown"
         reason = str(entry.get("reason", "")).strip()
@@ -6096,7 +6247,40 @@ def runMeasAutomation(
             "Requested measurements missing: " + ", ".join(missing_requested)
         )
 
-    meas_payload = dict(meas_payload)
+    requested_lookup = {name.lower() for name in requested_names}
+    scoped_measurements = {
+        key: value
+        for key, value in (all_measurements.get("measurements") or {}).items()
+        if str(key).strip().lower() in requested_lookup
+    }
+    scoped_measurements_text = {
+        key: value
+        for key, value in (all_measurements.get("measurements_text") or {}).items()
+        if str(key).strip().lower() in requested_lookup
+    }
+    scoped_measurements_display = {
+        key: value
+        for key, value in (all_measurements.get("measurements_display") or {}).items()
+        if str(key).strip().lower() in requested_lookup
+    }
+    scoped_measurements_steps = {
+        key: value
+        for key, value in (all_measurements.get("measurement_steps") or {}).items()
+        if str(key).strip().lower() in requested_lookup
+    }
+    scoped_items = [
+        item
+        for item in (all_measurements.get("items") or [])
+        if isinstance(item, dict)
+        and str(item.get("name", "")).strip().lower() in requested_lookup
+    ]
+    meas_payload = dict(all_measurements)
+    meas_payload["count"] = len(scoped_items)
+    meas_payload["measurements"] = scoped_measurements
+    meas_payload["measurements_text"] = scoped_measurements_text
+    meas_payload["measurements_display"] = scoped_measurements_display
+    meas_payload["measurement_steps"] = scoped_measurements_steps
+    meas_payload["items"] = scoped_items
     meas_payload["requested_measurements"] = requested_names
     meas_payload["failed_measurements"] = failed_requested
     meas_payload["missing_requested_measurements"] = missing_requested
@@ -6113,6 +6297,7 @@ def runMeasAutomation(
         "meas_statements": statements,
         "run": run_payload_with_meas,
         "measurements": meas_payload,
+        "all_measurements": all_measurements,
         "requested_measurements": requested_names,
         "failed_measurements": failed_requested,
         "missing_requested_measurements": missing_requested,
@@ -6556,7 +6741,6 @@ def runSweepStudy(
             step_indices = list(range(dataset.step_count))
             for idx in step_indices:
                 selected = _resolve_step_index(dataset, idx)
-                series = dataset.get_vector(metric_vector, step_index=selected)
                 series = dataset.get_vector(selected_metric_vector, step_index=selected)
                 value = _metric_from_series(series, metric_statistic)
                 metric_values.append(value)
@@ -7100,8 +7284,17 @@ def jobStatus(job_id: str, include_run: bool = True) -> dict[str, Any]:
         else:
             payload = _job_public_payload(job)
     if include_run and payload.get("run_id"):
-        run = _resolve_run(str(payload["run_id"]))
-        payload["run"] = _run_payload(run, include_output=False, log_tail_lines=120)
+        try:
+            run = _resolve_run(str(payload["run_id"]))
+        except Exception:
+            payload["run"] = {
+                "run_id": str(payload["run_id"]),
+                "materialized": False,
+                "status": str(payload.get("status", "unknown")),
+                "message": "Run metadata is not materialized yet for this in-flight job.",
+            }
+        else:
+            payload["run"] = _run_payload(run, include_output=False, log_tail_lines=120)
     return payload
 
 
@@ -7690,7 +7883,22 @@ def generatePlotPresetSettings(
     if vectors is None:
         selected_vectors = _default_vectors_for_plot_preset(dataset, normalized_preset)
     elif isinstance(vectors, str):
-        selected_vectors = [vectors]
+        raw_vectors = vectors.strip()
+        if raw_vectors.startswith("[") and raw_vectors.endswith("]"):
+            try:
+                loaded_vectors = json.loads(raw_vectors)
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(
+                    "vectors JSON array string could not be parsed. "
+                    "Use a list value or valid JSON array string."
+                ) from exc
+            if not isinstance(loaded_vectors, list):
+                raise ValueError("vectors JSON value must decode to a list of vector names.")
+            selected_vectors = [str(item).strip() for item in loaded_vectors if str(item).strip()]
+        elif "," in raw_vectors:
+            selected_vectors = [token.strip() for token in raw_vectors.split(",") if token.strip()]
+        else:
+            selected_vectors = [raw_vectors] if raw_vectors else []
     else:
         selected_vectors = list(vectors)
     if not selected_vectors:
@@ -7744,7 +7952,22 @@ def renderLtspicePlotPresetImage(
     if vectors is None:
         selected_vectors = _default_vectors_for_plot_preset(dataset, normalized_preset)
     elif isinstance(vectors, str):
-        selected_vectors = [vectors]
+        raw_vectors = vectors.strip()
+        if raw_vectors.startswith("[") and raw_vectors.endswith("]"):
+            try:
+                loaded_vectors = json.loads(raw_vectors)
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(
+                    "vectors JSON array string could not be parsed. "
+                    "Use a list value or valid JSON array string."
+                ) from exc
+            if not isinstance(loaded_vectors, list):
+                raise ValueError("vectors JSON value must decode to a list of vector names.")
+            selected_vectors = [str(item).strip() for item in loaded_vectors if str(item).strip()]
+        elif "," in raw_vectors:
+            selected_vectors = [token.strip() for token in raw_vectors.split(",") if token.strip()]
+        else:
+            selected_vectors = [raw_vectors] if raw_vectors else []
     else:
         selected_vectors = list(vectors)
     if not selected_vectors:
@@ -7811,11 +8034,13 @@ def startLtspiceRenderSession(
 ) -> dict[str, Any]:
     """Open an LTspice window once for repeated image rendering."""
     session_id = _new_render_session_id()
-    resolved = Path(path).expanduser().resolve()
-    if not resolved.exists():
-        raise FileNotFoundError(f"Render session path not found: {resolved}")
+    resolved = _resolve_existing_file_path(path, field_name="path", require_readable=True)
     resolved_title = title_hint or resolved.name
     open_event = open_in_ltspice_ui(resolved, background=True)
+    if not bool(open_event.get("opened")):
+        stderr = str(open_event.get("stderr") or "").strip()
+        detail = f" ({stderr})" if stderr else ""
+        raise RuntimeError(f"Failed to open LTspice UI target: {resolved}{detail}")
     _render_sessions[session_id] = {
         "path": str(resolved),
         "title_hint": resolved_title,
@@ -7952,6 +8177,16 @@ def createSchematic(
         sheet_width=sheet_width,
         sheet_height=sheet_height,
     )
+    simulation_target = _resolve_schematic_simulation_target(
+        Path(result["asc_path"]).expanduser().resolve(),
+        require_sidecar_on_macos=True,
+    )
+    result["simulation_target"] = simulation_target
+    result["simulation_ready"] = bool(simulation_target.get("can_batch_simulate"))
+    if not result["simulation_ready"]:
+        result.setdefault("warnings", []).append(
+            str(simulation_target.get("error") or "Schematic requires a sidecar netlist for batch simulation on this platform.")
+        )
 
     should_open = _effective_open_ui(open_ui)
     if should_open:
@@ -8805,15 +9040,31 @@ def autoDebugSchematic(
                 validation = _validate_schematic_file(path)
                 all_actions.extend(preflight_actions)
 
-        run_result = simulateSchematicFile(
-            asc_path=str(path),
-            ascii_raw=ascii_raw,
-            timeout_seconds=timeout_seconds,
-            show_ui=show_ui,
-            open_raw_after_run=open_raw_after_run,
-            validate_first=True,
-            abort_on_validation_error=False,
-        )
+        try:
+            run_result = simulateSchematicFile(
+                asc_path=str(path),
+                ascii_raw=ascii_raw,
+                timeout_seconds=timeout_seconds,
+                show_ui=show_ui,
+                open_raw_after_run=open_raw_after_run,
+                validate_first=True,
+                abort_on_validation_error=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            run_result = {
+                "run_id": None,
+                "succeeded": False,
+                "issues": [str(exc)],
+                "warnings": [],
+                "diagnostics": [
+                    {
+                        "category": "simulation_unavailable",
+                        "severity": "error",
+                        "message": str(exc),
+                    }
+                ],
+                "schematic_path": str(path),
+            }
         final_result = run_result
         diagnostics_messages = [
             str(item.get("message", ""))
@@ -9690,10 +9941,8 @@ def validateLtspiceMeasurements(
     This reruns the source netlist with generated measurement directives and
     compares LTspice's own reported values to the server's computed metrics.
     """
-    if abs_tolerance < 0:
-        raise ValueError("abs_tolerance must be >= 0")
-    if rel_tolerance_pct < 0:
-        raise ValueError("rel_tolerance_pct must be >= 0")
+    safe_abs_tolerance = _require_float("abs_tolerance", abs_tolerance, minimum=0.0, finite=True)
+    safe_rel_tolerance_pct = _require_float("rel_tolerance_pct", rel_tolerance_pct, minimum=0.0, finite=True)
     if not vector.strip():
         raise ValueError("vector must not be empty")
 
@@ -9761,15 +10010,23 @@ def validateLtspiceMeasurements(
             analysis_value=analysis_float,
             measurement_name=measurement_name,
             ltspice_value=ltspice_value,
-            abs_tolerance=float(abs_tolerance),
-            rel_tolerance_pct=float(rel_tolerance_pct),
+            abs_tolerance=float(safe_abs_tolerance),
+            rel_tolerance_pct=float(safe_rel_tolerance_pct),
         )
         comparisons[analysis_key] = comparison
         if not comparison["passed"]:
             failures.append(analysis_key)
+    measurement_execution_succeeded = bool(meas_result.get("requested_measurements_succeeded", True))
+    run_payload = meas_result.get("run") or {}
+    validation_run_succeeded = bool(
+        run_payload.get("overall_succeeded", run_payload.get("succeeded", True))
+    )
+    if not measurement_execution_succeeded:
+        failures.append("ltspice_measurements")
+    overall_passed = len(failures) == 0 and measurement_execution_succeeded and validation_run_succeeded
 
     return {
-        "overall_passed": len(failures) == 0,
+        "overall_passed": overall_passed,
         "failure_count": len(failures),
         "failures": failures,
         "analysis_type": bundle["analysis_type"],
@@ -9786,10 +10043,12 @@ def validateLtspiceMeasurements(
         "comparisons": comparisons,
         "measurement_context": bundle["measurement_context"],
         "measurement_statements": bundle["measurement_statements"],
+        "measurement_execution_succeeded": measurement_execution_succeeded,
+        "validation_run_succeeded": validation_run_succeeded,
         "validation_run": meas_result["run"],
         "validation_netlist_path": meas_result["meas_netlist_path"],
-        "abs_tolerance": float(abs_tolerance),
-        "rel_tolerance_pct": float(rel_tolerance_pct),
+        "abs_tolerance": float(safe_abs_tolerance),
+        "rel_tolerance_pct": float(safe_rel_tolerance_pct),
         **_step_payload(dataset, selected_step),
     }
 

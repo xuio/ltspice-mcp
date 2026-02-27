@@ -28,6 +28,65 @@ class TestSchematicRuntimeTools(unittest.TestCase):
         self.assertFalse(payload["valid"])
         self.assertTrue(any("simulation directive" in issue.lower() for issue in payload["issues"]))
 
+    def test_validate_schematic_allows_defined_param_braces(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_validate_param_braces_test_"))
+        asc_path = temp_dir / "parametric.asc"
+        asc_path.write_text(
+            "Version 4\n"
+            "SHEET 1 880 680\n"
+            "SYMBOL res 120 120 R0\n"
+            "SYMATTR InstName R1\n"
+            "SYMATTR Value {RVAL}\n"
+            "FLAG 120 216 0\n"
+            "TEXT 48 560 Left 2 !.param RVAL=1k\n"
+            "TEXT 48 584 Left 2 !.op\n",
+            encoding="utf-8",
+        )
+
+        payload = server.validateSchematic(str(asc_path))
+        self.assertTrue(payload["valid"])
+        self.assertEqual(payload["unresolved_placeholders"], [])
+
+    def test_validate_schematic_and_lint_fail_on_unresolved_symbols(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_validate_unresolved_symbol_test_"))
+        asc_path = temp_dir / "unknown_symbol.asc"
+        asc_path.write_text(
+            "Version 4\n"
+            "SHEET 1 880 680\n"
+            "SYMBOL notasymbol 120 120 R0\n"
+            "SYMATTR InstName X1\n"
+            "FLAG 120 216 0\n"
+            "TEXT 48 560 Left 2 !.op\n",
+            encoding="utf-8",
+        )
+
+        validate_payload = server.validateSchematic(str(asc_path))
+        self.assertFalse(validate_payload["valid"])
+        self.assertTrue(any("Unresolved symbols" in issue for issue in validate_payload["issues"]))
+
+        lint_payload = server.lintSchematic(str(asc_path), strict=True)
+        self.assertFalse(lint_payload["valid"])
+        self.assertGreaterEqual(int(lint_payload.get("unresolved_symbol_count", 0)), 1)
+
+    def test_validate_schematic_detects_duplicate_instname(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_validate_duplicate_instname_test_"))
+        asc_path = temp_dir / "duplicate_inst.asc"
+        asc_path.write_text(
+            "Version 4\n"
+            "SHEET 1 880 680\n"
+            "SYMBOL res 120 120 R0\n"
+            "SYMATTR InstName R1\n"
+            "SYMBOL res 280 120 R0\n"
+            "SYMATTR InstName R1\n"
+            "FLAG 120 216 0\n"
+            "TEXT 48 560 Left 2 !.op\n",
+            encoding="utf-8",
+        )
+
+        payload = server.validateSchematic(str(asc_path))
+        self.assertFalse(payload["valid"])
+        self.assertTrue(any("Duplicate InstName 'R1'" in issue for issue in payload["issues"]))
+
     def test_simulate_schematic_file_preflight_and_run(self) -> None:
         temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_simulate_schematic_test_"))
         asc_path = temp_dir / "valid.asc"
@@ -153,6 +212,29 @@ class TestSchematicRuntimeTools(unittest.TestCase):
         self.assertEqual(payload["reason"], "missing_sidecar_required_on_macos")
         self.assertIsNone(payload["sidecar_path"])
         self.assertGreaterEqual(len(payload["candidate_sidecar_paths"]), 1)
+
+    def test_resolve_schematic_simulation_target_disallows_direct_asc_on_macos(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="ltspice_resolve_target_direct_asc_test_"))
+        asc_path = temp_dir / "no_sidecar.asc"
+        asc_path.write_text(
+            "Version 4\n"
+            "SHEET 1 880 680\n"
+            "SYMBOL voltage 120 120 R0\n"
+            "SYMATTR InstName V1\n"
+            "SYMATTR Value DC 1\n"
+            "FLAG 120 216 0\n"
+            "TEXT 48 560 Left 2 !.op\n",
+            encoding="utf-8",
+        )
+
+        with patch("ltspice_mcp.server.platform.system", return_value="Darwin"):
+            payload = server.resolveSchematicSimulationTarget(
+                str(asc_path),
+                require_sidecar_on_macos=False,
+            )
+
+        self.assertFalse(payload["can_batch_simulate"])
+        self.assertEqual(payload["reason"], "direct_asc_batch_unsupported_on_macos")
 
 
 if __name__ == "__main__":
